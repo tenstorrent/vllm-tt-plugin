@@ -29,7 +29,7 @@ import queue
 import threading
 import time
 from collections import deque
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
@@ -53,8 +53,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
     NixlPushConnectorWorker,
 )
 from vllm.utils.math_utils import cdiv
+from vllm.v1.kv_cache_interface import KVCacheConfig, is_full_attention_spec
 
+from vllm_tt_plugin.config import get_tt_data_parallel_size
 from vllm_tt_plugin.logger import init_tt_logger
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.request import Request
 
 logger = init_tt_logger(__name__)
 
@@ -131,6 +137,199 @@ class StagingSlots:
     def give_back(self, slots: list[int]) -> None:
         """Return slots taken earlier."""
         self._free.extend(slots)
+
+
+@dataclasses.dataclass(frozen=True)
+class NixlPushChunkJob:
+    """Prompt blocks ``[start_block, end_block)`` of a P request that one
+    prefill step completes.
+
+    P's scheduler lists a step's jobs in its connector metadata
+    (``push_chunk_jobs``).
+
+    Attributes
+    ----------
+    request_id
+        P's request ID.
+    block_ids
+        P's device block IDs of the job's blocks, in prompt order.
+    start_block, end_block
+        Positions of the blocks in the prompt.
+    total_blocks
+        Blocks of the whole prompt. The job that ends there is the last one.
+    """
+
+    request_id: str
+    block_ids: list[int]
+    start_block: int
+    end_block: int
+    total_blocks: int
+
+
+@dataclasses.dataclass
+class _ChunkPushTracker:
+    """A P request with chunked push and the prompt blocks it has jobs for.
+
+    Attributes
+    ----------
+    request
+        The scheduler's request; its ``num_computed_tokens`` is read per step.
+    next_block
+        Prompt blocks already put into jobs.
+    """
+
+    request: "Request"
+    next_block: int = 0
+
+
+class TTNixlPushConnectorScheduler(NixlPushConnectorScheduler):
+    """vLLM's push scheduler that also names the blocks each P step completes.
+
+    With ``enable_chunked_push`` on a producer, each step's metadata gets two
+    fields: ``push_chunk_jobs``, a ``NixlPushChunkJob`` per P request whose
+    prefill in the step completes prompt blocks, and
+    ``push_chunk_preemptions``, the P requests preempted since the previous
+    step. Off, or on a consumer, it is vLLM's push scheduler.
+
+    Raises
+    ------
+    ValueError
+        When ``enable_chunked_push`` is on for a producer whose KV is not one
+        full-attention group, whose prompt tail is left to D (a prefill
+        backoff, for a Mamba state or a multi-module MTP lookahead), or that
+        runs TT lane DP.
+
+    Notes
+    -----
+    Runs on the engine core thread. A request is in ``_chunk_trackers`` from
+    its block allocation (``update_state_after_alloc``, called again when a
+    preempted request is scheduled again) to ``request_finished``.
+    """
+
+    def __init__(self, vllm_config, engine_id: str, kv_cache_config: KVCacheConfig):
+        super().__init__(vllm_config, engine_id, kv_cache_config)
+        transfer_config = vllm_config.kv_transfer_config
+        self._chunked_push = (
+            bool(transfer_config.get_from_extra_config("enable_chunked_push", False))
+            and transfer_config.kv_role == "kv_producer"
+        )
+        self._chunk_trackers: dict[str, _ChunkPushTracker] = {}
+        if self._chunked_push:
+            self._refuse_unsupported_chunked_push(vllm_config, kv_cache_config)
+
+    def update_state_after_alloc(
+        self, request: "Request", blocks, num_external_tokens: int
+    ) -> None:
+        """Start a P request's jobs at block 0, also after a preemption."""
+        super().update_state_after_alloc(request, blocks, num_external_tokens)
+        params = request.kv_transfer_params
+        if self._chunked_push and params and params.get("do_remote_decode"):
+            self._chunk_trackers[request.request_id] = _ChunkPushTracker(request)
+
+    def request_finished(
+        self, request: "Request", block_ids: BlockIds
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Plan no more jobs for the request; vLLM's push scheduler does the rest."""
+        self._chunk_trackers.pop(request.request_id, None)
+        return super().request_finished(request, block_ids)
+
+    def build_connector_meta(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> NixlConnectorMetadata:
+        """vLLM's push metadata, with the step's chunk jobs when chunked push is on."""
+        meta = super().build_connector_meta(scheduler_output)
+        if self._chunked_push:
+            self._build_chunk_jobs(meta, scheduler_output)
+        return meta
+
+    def _build_chunk_jobs(
+        self, meta: NixlConnectorMetadata, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Set ``meta.push_chunk_jobs`` and ``meta.push_chunk_preemptions``.
+
+        vLLM builds a step's metadata before it adds the step's tokens to
+        ``num_computed_tokens``, so the prompt tokens computed once the step
+        has run are the two summed. A job takes the blocks those tokens fill;
+        the prompt's partial last block goes with the job that completes the
+        prompt. Block IDs are read only for a step with a job: ``TTScheduler``
+        can build a release step's metadata after its block state is dropped.
+
+        Raises
+        ------
+        RuntimeError
+            When the step carries no block IDs for a request it has a job for.
+        """
+        meta.push_chunk_preemptions = {
+            req_id
+            for req_id in scheduler_output.preempted_req_ids or ()
+            if req_id in self._chunk_trackers
+        }
+        meta.push_chunk_jobs = []
+        block_size = self.kv_cache_config.transfer_groups[0].kv_cache_spec.block_size
+        for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+            tracker = self._chunk_trackers.get(req_id)
+            if tracker is None:
+                continue
+            prompt = tracker.request.num_prompt_tokens
+            computed = min(tracker.request.num_computed_tokens + num_tokens, prompt)
+            end = (
+                cdiv(computed, block_size)
+                if computed >= prompt
+                else computed // block_size
+            )
+            start = tracker.next_block
+            if end <= start:
+                continue
+            block_state = scheduler_output.kv_connector_block_state
+            block_ids = (
+                None if block_state is None else block_state.get_block_ids(req_id)
+            )
+            if block_ids is None:
+                raise RuntimeError(
+                    f"The step completes blocks {start} to {end - 1} of {req_id} "
+                    "but carries no block IDs for it."
+                )
+            table = self.kv_cache_config.select_transfer_block_ids(block_ids)[0]
+            meta.push_chunk_jobs.append(
+                NixlPushChunkJob(
+                    request_id=req_id,
+                    block_ids=list(table[start:end]),
+                    start_block=start,
+                    end_block=end,
+                    total_blocks=cdiv(prompt, block_size),
+                )
+            )
+            tracker.next_block = end
+
+    def _refuse_unsupported_chunked_push(
+        self, vllm_config, kv_cache_config: KVCacheConfig
+    ) -> None:
+        """Refuse KV that a step's completed blocks do not hold in full.
+
+        Raises
+        ------
+        ValueError
+            With more than one transfer group or one that is not full
+            attention, with a prefill backoff, or with TT lane DP, whose
+            coordinator builds metadata without block state.
+        """
+        groups = kv_cache_config.transfer_groups
+        if len(groups) != 1 or not is_full_attention_spec(groups[0].kv_cache_spec):
+            raise ValueError(
+                "enable_chunked_push needs one full-attention KV cache group; got "
+                f"{[type(group.kv_cache_spec).__name__ for group in groups]}."
+            )
+        backoff = self._prefill_backoff()
+        if backoff > 0:
+            raise ValueError(
+                "enable_chunked_push does not support a prefill backoff (Mamba "
+                f"state, multi-module MTP lookahead); got {backoff} tokens."
+            )
+        lanes = get_tt_data_parallel_size(vllm_config)
+        if lanes > 1:
+            raise ValueError(
+                f"enable_chunked_push does not support TT lane DP; got {lanes} lanes."
+            )
 
 
 class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
@@ -453,7 +652,8 @@ class TTNixlPushConnector(NixlPushConnector):
     Raises
     ------
     ValueError
-        With decode context parallelism, as ``NixlPushConnector`` does.
+        With decode context parallelism, as ``NixlPushConnector`` does, and
+        for a configuration ``TTNixlPushConnectorScheduler`` refuses.
     """
 
     def __init__(self, vllm_config, role: KVConnectorRole, kv_cache_config):
@@ -467,7 +667,7 @@ class TTNixlPushConnector(NixlPushConnector):
         self.connector_scheduler = None
         self.connector_worker = None
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = NixlPushConnectorScheduler(
+            self.connector_scheduler = TTNixlPushConnectorScheduler(
                 vllm_config, self.engine_id, kv_cache_config
             )
         elif role == KVConnectorRole.WORKER:

@@ -8,7 +8,7 @@ reports the transfers each test scripts.
 
 import ctypes
 import threading
-from collections import deque
+from collections import Counter, deque
 from functools import partial
 from types import SimpleNamespace
 
@@ -23,6 +23,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -30,7 +31,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
 )
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
 
 from tests.test_block_scheduler import BLOCK_SIZE, _request
 from tests.test_block_scheduler import _runner_output as _block_runner_output
@@ -41,6 +42,7 @@ from vllm_tt_plugin.async_decode import AsyncTTModelRunnerOutput
 from vllm_tt_plugin.kv_layout import default_kv_layout
 from vllm_tt_plugin.kv_transfer import kv_cache_descriptions
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.nixl_staging import NixlPushChunkJob
 from vllm_tt_plugin.platform import _install_tt_nixl_single_rank_patch
 
 
@@ -777,3 +779,128 @@ def test_a_lane_forward_runs_inside_the_connector_step(
     ]
     assert worker_connector.loads_started == {"parked": [3]}
     assert output.kv_connector_output.finished_recving == {"parked"}
+
+
+# Chunked push: P's scheduler names the blocks each prefill step completes.
+
+CHUNK_TOKENS = 200
+
+
+def _chunked_push_scheduler():
+    """A prefill server's TT scheduler with chunked push, under async scheduling.
+
+    It holds two requests and prefills at most ``CHUNK_TOKENS`` tokens a step.
+    """
+    scheduler = _real_scheduler(
+        output_width=1,
+        max_num_seqs=2,
+        max_model_len=1024,
+        num_blocks=16,
+        async_scheduling=True,
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="TTNixlPushConnector",
+            kv_connector_module_path="vllm_tt_plugin.nixl_staging",
+            kv_role="kv_producer",
+            kv_buffer_device="cpu",
+            kv_connector_extra_config={"enable_chunked_push": True},
+        ),
+    )
+    # The stub model declares no chunked prefill, so the platform turned it off.
+    scheduler.scheduler_config.enable_chunked_prefill = True
+    scheduler.max_num_scheduled_tokens = CHUNK_TOKENS
+    return scheduler
+
+
+def _push_request(prompt_length: int) -> Request:
+    """``B``, a prompt whose KV goes to a decode server, as the proxy sends it."""
+    request = _request(1, request_id="B", prompt_length=prompt_length)
+    request.kv_transfer_params = {"do_remote_decode": True}
+    return request
+
+
+def _serve_behind_a_decode(scheduler, push_request, done) -> list[SchedulerOutput]:
+    """Run the engine loop until ``done()``; return the steps in the order they ran.
+
+    ``A`` decodes from the first iteration, and ``push_request`` arrives at
+    the third, so its first prefill is kept behind A's decode. As in
+    ``EngineCore.step_with_batch_queue`` with two batches in flight, a step's
+    output is committed once the next step has been scheduled. A step samples
+    a token for each request whose prompt is complete.
+    """
+    arrivals = {0: _request(50, request_id="A"), 3: push_request}
+    executed: list[SchedulerOutput] = []
+    in_flight: deque = deque()
+    computed: Counter[str] = Counter()
+    for iteration in range(100):
+        if done():
+            return executed
+        if iteration in arrivals:
+            scheduler.add_request(arrivals[iteration])
+        step = scheduler.schedule()
+        executed.append(step)
+        req_ids = list(step.num_scheduled_tokens)
+        for req_id in req_ids:
+            computed[req_id] += step.num_scheduled_tokens[req_id]
+        output = ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+            sampled_token_ids=[
+                [7] if computed[r] >= scheduler.requests[r].num_prompt_tokens else []
+                for r in req_ids
+            ],
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+        in_flight.appendleft((step, output))
+        if len(in_flight) == 2:
+            scheduler.update_from_output(*in_flight.pop())
+    raise AssertionError("the engine loop did not reach its end condition")
+
+
+def test_jobs_are_built_before_the_scheduler_advances_num_computed_tokens():
+    scheduler = _chunked_push_scheduler()
+    request = _push_request(prompt_length=600)  # Five blocks, the last partial.
+    kept: set[int] = set()
+
+    def done() -> bool:
+        if scheduler._deferred_prefill is not None:
+            kept.add(id(scheduler._deferred_prefill))
+        return request.is_finished()
+
+    executed = _serve_behind_a_decode(scheduler, request, done)
+
+    # Each step's jobs are the blocks completed by the B tokens that step ran.
+    (table,) = scheduler.kv_cache_manager.get_block_ids("B")
+    computed = planned = 0
+    for step in executed:
+        expected = []
+        if "B" in step.num_scheduled_tokens:
+            computed += step.num_scheduled_tokens["B"]
+            end = (
+                cdiv(computed, BLOCK_SIZE)
+                if computed >= 600
+                else computed // BLOCK_SIZE
+            )
+            if end > planned:
+                expected = [NixlPushChunkJob("B", table[planned:end], planned, end, 5)]
+                planned = end
+        assert step.kv_connector_metadata.push_chunk_jobs == expected
+    assert planned == 5
+    # A kept prefill ran: its metadata was built before the release step's.
+    assert any(id(step) in kept for step in executed)
+
+
+def test_chunked_push_is_refused_under_lane_dp():
+    from vllm_tt_plugin.config import store_tt_lane_count
+    from vllm_tt_plugin.lane_scheduler import TTLaneCoordinator
+
+    base = _chunked_push_scheduler()
+    store_tt_lane_count(base.vllm_config, 2)
+
+    with pytest.raises(ValueError, match="lane"):
+        TTLaneCoordinator(
+            base.vllm_config,
+            base.kv_cache_config,
+            base.structured_output_manager,
+            BLOCK_SIZE,
+        )
