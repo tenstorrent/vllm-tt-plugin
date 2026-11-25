@@ -794,10 +794,11 @@ def test_a_lane_forward_runs_inside_the_connector_step(
 CHUNK_TOKENS = 200
 
 
-def _chunked_push_scheduler():
+def _chunked_push_scheduler(chunked_prefill: bool = True):
     """A prefill server's TT scheduler with chunked push, under async scheduling.
 
-    It holds two requests and prefills at most ``CHUNK_TOKENS`` tokens a step.
+    It holds two requests. With ``chunked_prefill`` it prefills at most
+    ``CHUNK_TOKENS`` tokens a step; without, a whole prompt in one step.
     """
     scheduler = _real_scheduler(
         output_width=1,
@@ -813,9 +814,11 @@ def _chunked_push_scheduler():
             kv_connector_extra_config={"enable_chunked_push": True},
         ),
     )
-    # The stub model declares no chunked prefill, so the platform turned it off.
-    scheduler.scheduler_config.enable_chunked_prefill = True
-    scheduler.max_num_scheduled_tokens = CHUNK_TOKENS
+    if chunked_prefill:
+        # The stub model declares no chunked prefill, so the platform turned
+        # it off.
+        scheduler.scheduler_config.enable_chunked_prefill = True
+        scheduler.max_num_scheduled_tokens = CHUNK_TOKENS
     return scheduler
 
 
@@ -896,6 +899,21 @@ def test_jobs_are_built_before_the_scheduler_advances_num_computed_tokens():
     assert planned == 5
     # A kept prefill ran: its metadata was built before the release step's.
     assert any(id(step) in kept for step in executed)
+
+
+def test_a_prompt_prefilled_in_one_step_is_staged_by_one_job():
+    # Without chunked prefill (a model that does not declare it, or
+    # --no-enable-chunked-prefill) the one prefill step completes every block.
+    scheduler = _chunked_push_scheduler(chunked_prefill=False)
+    scheduler.add_request(_push_request(prompt_length=600))
+
+    step = scheduler.schedule()
+
+    (table,) = scheduler.kv_cache_manager.get_block_ids("B")
+    assert step.num_scheduled_tokens == {"B": 600}
+    assert step.kv_connector_metadata.push_chunk_jobs == [
+        NixlPushChunkJob("B", table[:5], start_block=0, end_block=5, total_blocks=5)
+    ]
 
 
 def test_a_step_that_runs_no_forward_copies_nothing(vllm_config, staging_connector):
