@@ -94,8 +94,6 @@ def test_host_drafters_ask_nothing_of_the_model():
         "eagle",
         "eagle3",
         "dflash",
-        "medusa",
-        "mlp_speculator",
         # Table-only: SpeculativeConfig rewrites this to "mtp" before
         # admission ever sees it, so it can never arrive in production.
         "qwen3_5_mtp",

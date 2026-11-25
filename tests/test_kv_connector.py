@@ -217,6 +217,20 @@ def test_a_forward_step_runs_inside_the_connector_step(
     assert output.kv_connector_output.finished_recving == {"parked"}
 
 
+def test_an_async_step_reports_its_connector_output_without_a_readback(
+    vllm_config, worker_connector
+):
+    # vLLM reads the connector output this way when ``get_output`` raised, so
+    # finished transfers are not lost with a failed readback.
+    worker_connector.finished_recving = {"parked"}
+    runner = _runner(vllm_config, worker_connector.calls, async_decode=True)
+
+    assert TTModelRunner.execute_model(runner, _scheduler_output()) is None
+    output = TTModelRunner.sample_tokens(runner, None)
+
+    assert output.get_kv_connector_output().finished_recving == {"parked"}
+
+
 def test_a_step_without_a_connector_reports_no_connector_output(vllm_config):
     runner = _runner(vllm_config, [], async_decode=False)
 

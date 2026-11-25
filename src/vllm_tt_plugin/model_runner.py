@@ -98,6 +98,7 @@ from vllm_tt_plugin.spec_decode import (
 from vllm_tt_plugin.stage_outputs import TTStageFrame, set_tt_stage_outputs
 from vllm_tt_plugin.structured_output import (
     capture_structured_decode_request_ids,
+    grammar_mask_stride,
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
     scheduled_structured_output_request_ids,
@@ -2099,7 +2100,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
     def _spec_grammar_rows_per_request(
         self, scheduler_output: SchedulerOutput
     ) -> dict[str, int] | None:
-        """How many grammar bitmask rows each scheduled request owns this step.
+        """How many grammar bitmask rows vLLM fills for each request this step.
 
         One per scheduled draft position plus one for the bonus. Every
         scheduled request is counted, not only one build's rows, because the
@@ -2667,9 +2668,8 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             # unpadded for prefill, padded for decode
             batch_length = input_tokens.shape[0]
             # `structured_output_request_ids` comes from GrammarOutput as a list
-            # of request IDs (bitmask rows are in this order). TT does not support
-            # speculative decoding in this path, so we assume a single bitmask row
-            # per request.
+            # of request IDs (bitmask blocks are in this order). This path reads
+            # one row per request, the first of its block.
             structured_output_request_ids = (
                 grammar_output.structured_output_request_ids
                 if grammar_output is not None
@@ -2681,6 +2681,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 row_req_ids=row_req_ids,
                 batch_length=batch_length,
                 expected_structured_output_request_ids=structured_output_req_ids,
+                mask_stride=grammar_mask_stride(self._num_speculative_tokens),
             )
 
         if is_prompt:
@@ -3377,7 +3378,9 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                     if model_input.spec_mode is not None
                     else None
                 ),
+                mask_stride=grammar_mask_stride(self._num_speculative_tokens),
             )
+        # A launch that does not speculate: one row per structured request.
         return reorder_grammar_bitmask_for_tt_batch(
             bitmask=bitmask,
             structured_output_request_ids=grammar_output.structured_output_request_ids,
@@ -4586,7 +4589,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                         )
                     logprobs_per_dp.append(
                         build_device_logprobs(
-                            tt_log_probs=tt_log_probs,
+                            logprobs=tt_log_probs,
                             sampled_token_ids=next_token_ids.reshape(sz),
                             rows=rows,
                             max_num_logprobs=rank_max_num_logprobs or 0,

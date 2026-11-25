@@ -35,6 +35,7 @@ from vllm_tt_plugin.model_input import (
 from vllm_tt_plugin.spec_decode import ACCEPT_MODE_LOGITS
 from vllm_tt_plugin.structured_output import (
     capture_structured_decode_request_ids,
+    grammar_mask_stride,
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
     scheduled_structured_output_request_ids,
@@ -1366,6 +1367,7 @@ class TTLaneInputBatch(InputBatch):
         grammar_output: "GrammarOutput | None",
         batch_length: int,
         expected_structured_output_request_ids: Collection[str] | None = None,
+        mask_stride: int = 1,
     ) -> torch.Tensor | None:
         """Reorder the scheduler grammar bitmask into a full slot-batch tensor.
 
@@ -1384,6 +1386,7 @@ class TTLaneInputBatch(InputBatch):
             expected_structured_output_request_ids=(
                 expected_structured_output_request_ids
             ),
+            mask_stride=mask_stride,
         )
 
     # ------------------------------------------------------------------
@@ -1473,7 +1476,11 @@ class TTLaneInputBatch(InputBatch):
         rows_all = list(range(total))
         tt_sampling_params = lane_batch.slot_sampling_params(rows_all)
 
-        bitmask = lane_batch.slot_grammar_bitmask(grammar_output, total)
+        bitmask = lane_batch.slot_grammar_bitmask(
+            grammar_output,
+            total,
+            mask_stride=grammar_mask_stride(runner._num_speculative_tokens),
+        )
         scheduled_structured_req_ids = scheduled_structured_output_request_ids(
             runner.requests,
             scheduler_output,
@@ -1626,7 +1633,9 @@ class TTLaneInputBatch(InputBatch):
         batch_size_per_dp = list(plan.batch_size_per_dp)
 
         bitmask = lane_batch.slot_grammar_bitmask(
-            grammar_output, lane_batch.max_num_reqs
+            grammar_output,
+            lane_batch.max_num_reqs,
+            mask_stride=grammar_mask_stride(runner._num_speculative_tokens),
         )
         scheduled_structured_req_ids = scheduled_structured_output_request_ids(
             runner.requests,
@@ -1883,7 +1892,7 @@ class TTLaneInputBatch(InputBatch):
             return None
         assert tt_log_probs is not None, "model should return logprobs when requested"
         return build_device_logprobs(
-            tt_log_probs=tt_log_probs,
+            logprobs=tt_log_probs,
             sampled_token_ids=sampled.reshape(n),
             rows=sel,
             max_num_logprobs=model_input.max_num_logprobs[0] or 0,
