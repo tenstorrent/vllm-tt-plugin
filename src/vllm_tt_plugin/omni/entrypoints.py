@@ -51,4 +51,14 @@ def register() -> None:
         "models.demos.audio.qwen3_asr.tt.generator_vllm:"
         "Qwen3ASRForcedAlignerForTokenClassification",
     )
+    # Stage 1 with speaker data, chosen by the forced-aligner config `architecture:`.
+    for arch in ("TTQwen3ForcedAlignerDiarizer", "Qwen3ForcedAlignerDiarizer"):
+        OmniModelRegistry.register_model(
+            arch,
+            "models.demos.audio.qwen3_asr.tt.generator_vllm:Qwen3ForcedAlignerDiarizer",
+        )
     register_tt_pipelines()
+
+    from vllm_tt_plugin.omni.diarization import install as install_diarization
+
+    install_diarization()

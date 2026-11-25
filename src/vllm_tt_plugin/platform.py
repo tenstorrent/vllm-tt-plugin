@@ -1621,6 +1621,13 @@ def register_tt_models(register_test_models=False) -> None:
         "models.demos.audio.qwen3_asr.tt.generator_vllm:"
         "Qwen3ASRForcedAlignerForTokenClassification",
     )
+    # No upstream class has this name; vLLM validates it before the TT prefix is added.
+    for arch in ("TTQwen3ForcedAlignerDiarizer", "Qwen3ForcedAlignerDiarizer"):
+        _register_model_if_missing(
+            ModelRegistry,
+            arch,
+            "models.demos.audio.qwen3_asr.tt.generator_vllm:Qwen3ForcedAlignerDiarizer",
+        )
 
     # Mistral - Text only
     _register_model_if_missing(

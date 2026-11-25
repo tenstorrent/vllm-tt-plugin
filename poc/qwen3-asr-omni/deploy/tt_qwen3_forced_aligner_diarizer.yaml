@@ -1,0 +1,13 @@
+# Qwen3-ForcedAligner-0.6B with pyannote speaker data as stage 1, for response_format=diarized_json:
+#   --forced-aligner-config poc/qwen3-asr-omni/deploy/tt_qwen3_forced_aligner_diarizer.yaml
+#   --forced-aligner-device 1
+# Word timestamps as tt_qwen3_forced_aligner.yaml; diarized requests also get pyannote segmentation
+# (host) and WeSpeaker embeddings on the same device. Needs the gated pyannote/segmentation-3.0.
+forced_aligner:
+  model: Qwen/Qwen3-ForcedAligner-0.6B
+  runner: pooling
+  architecture: Qwen3ForcedAlignerDiarizer
+  pooling_task: token_classify
+  dtype: bfloat16
+  max_model_len: 4096
+  trust_remote_code: true
