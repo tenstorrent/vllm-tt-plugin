@@ -58,15 +58,15 @@ class TestStagingSlots:
 
 @pytest.mark.parametrize(
     ("num_blocks", "expected"),
-    [(10_000, 2 * 2 * 4), (10, 10)],
-    ids=["two_longest_requests", "capped_at_the_pool"],
+    [(10_000, 4 * 2 * 4), (10, 10)],
+    ids=["four_longest_requests", "capped_at_the_pool"],
 )
 def test_slot_count(num_blocks, expected):
     config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=250),
         cache_config=SimpleNamespace(block_size=64),
     )
-    # 250 tokens are 4 blocks per group; two groups, two requests.
+    # 250 tokens are 4 blocks per group; two groups, four requests.
     assert nixl_staging.staging_slot_count(config, num_blocks, 2) == expected
 
 

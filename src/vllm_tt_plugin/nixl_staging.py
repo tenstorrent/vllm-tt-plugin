@@ -73,8 +73,14 @@ logger = init_tt_logger(__name__)
 
 CONNECTOR_NAME = "TTNixlPushConnector"
 
-# A request in flight on each side while the next one is being staged.
-_REQUESTS_PER_POOL = 2
+# Longest requests the pool holds at once. P, with chunked push, holds a
+# request's slots from its first prefill step until its write ends; D, behind
+# a proxy that sends both legs at once, holds them from the start of P's
+# prefill. One request being written, one waiting for its write and one
+# starting its prefill need three; the fourth is headroom. A request that finds
+# too few free slots is not refused: P copies it whole once matched, and D's
+# registration waits for slots.
+_REQUESTS_PER_POOL = 4
 
 
 def register_kv_connectors() -> None:
@@ -86,7 +92,7 @@ def register_kv_connectors() -> None:
 
 
 def staging_slot_count(vllm_config, num_blocks: int, num_groups: int) -> int:
-    """Number of staging slots: room for two longest requests, at most the pool.
+    """Number of staging slots: room for four longest requests, at most the pool.
 
     One request crosses in one NIXL write, which cannot be split, so the pool
     must hold the longest request whole.
@@ -97,7 +103,9 @@ def staging_slot_count(vllm_config, num_blocks: int, num_groups: int) -> int:
         The engine's ``VllmConfig``; ``max_model_len`` and ``block_size`` set
         the longest request in blocks.
     num_blocks
-        Blocks in the KV pool; more slots than blocks are never useful.
+        Blocks in the KV pool; more slots than blocks are not useful, since a
+        request holds its slots while it holds, or is prefilling into, as many
+        blocks.
     num_groups
         KV cache groups; a request takes blocks in each.
     """

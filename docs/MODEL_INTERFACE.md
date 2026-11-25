@@ -103,7 +103,7 @@ attention layer, `model.layers.<idx>.self_attn`, all with the default spec.
 
 `TTNixlPushConnector` (vLLM's `NixlPushConnector` with a TT worker) sizes the
 CPU buffer for the requests in flight instead of the whole KV pool: room for
-two requests of `max_model_len` tokens, at most the pool. D hands P staging
+four requests of `max_model_len` tokens, at most the pool. D hands P staging
 slot numbers instead of block IDs and copies the slots into its chips once
 P's write lands; P copies only the blocks D registered, once the two are
 matched. A D request whose KV does not arrive within
