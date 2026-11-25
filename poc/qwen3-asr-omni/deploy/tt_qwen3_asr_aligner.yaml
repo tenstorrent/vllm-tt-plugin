@@ -13,6 +13,10 @@ stages:
     trust_remote_code: true
     enable_prefix_caching: false
     async_scheduling: false
+    # Sample on device: host sampling reads back every step's logits (C=1: 44.6 vs 57.6 tok/s).
+    additional_config:
+      tt:
+        sample_on_device_mode: all
     default_sampling_params:
       temperature: 0.0
       max_tokens: 1024
