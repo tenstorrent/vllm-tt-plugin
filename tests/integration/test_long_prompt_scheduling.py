@@ -37,7 +37,9 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -48,7 +50,11 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
-from vllm_tt_plugin.partial_prefill_limit import SHORT_FIRST_MAX_STEPS
+from vllm_tt_plugin.partial_prefill_limit import (
+    SHORT_FIRST_MAX_STEPS,
+    HeldPrefills,
+    PartialPrefillLimit,
+)
 from vllm_tt_plugin.platform import _validate_long_prompt_scheduling
 from vllm_tt_plugin.scheduler import (
     TTScheduler,
@@ -319,6 +325,27 @@ class TestPartialPrefillLimit:
             f"short-{SHORT_FIRST_MAX_STEPS}": SHORT,
         }
 
+    def test_decode_interleave_still_sees_the_held_prompt(self):
+        # "b" is held from every prefill pass but stays pending prefill work,
+        # so the decode interleave keeps alternating with "a"'s chunks.
+        scheduler = _scheduler(
+            {
+                "max_concurrent_partial_prefills": 1,
+                "decode_interleave_enabled": True,
+                "decode_interleave_prefill_steps": 1,
+            }
+        )
+        scheduler.add_request(_request("decode", SHORT))
+        _step(scheduler)
+        _step(scheduler)
+        scheduler.add_request(_request("a", LONG))
+        scheduler.add_request(_request("b", LONG))
+
+        steps = [dict(_step(scheduler).num_scheduled_tokens) for _ in range(4)]
+
+        assert steps == [{"a": 128}, {"decode": 1}, {"a": 128}, {"decode": 1}]
+        assert _waiting(scheduler) == ["b"]
+
     def test_a_kept_prefill_holds_only_what_its_pass_scheduled(self):
         # Under async scheduling a prefill that follows an uncommitted decode
         # is kept in _deferred_prefill while an empty step lets the engine
@@ -343,6 +370,168 @@ class TestPartialPrefillLimit:
         kept = scheduler.schedule()
         assert kept.num_scheduled_tokens == {"a": 128}
         assert _waiting(scheduler) == ["b"]
+
+
+# Chunk of the fake base pass below.
+CHUNK = 4096
+
+
+class _FakeRequest:
+    """A request for the fake base pass, equal only to itself like vLLM's
+    ``Request``."""
+
+    def __init__(self, request_id: str, prompt: int, computed: int = 0) -> None:
+        self.request_id = request_id
+        self.num_prompt_tokens = self.num_tokens = prompt
+        self.num_computed_tokens = computed
+        self.is_prefill_chunk = 0 < computed < prompt
+        self.num_output_placeholders = 0
+        self.mm_features = []
+        self.has_encoder_inputs = False
+
+
+def _bare(limit: int, waiting=(), running=()) -> TTScheduler:
+    """A ``TTScheduler`` built without ``__init__``, with the state
+    ``_schedule_prefill_only`` reads, the threshold at ``CHUNK`` and no
+    prefix cache."""
+    scheduler = TTScheduler.__new__(TTScheduler)
+    scheduler.policy = SchedulingPolicy.FCFS
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    for request in waiting:
+        scheduler.waiting.add_request(request)
+    scheduler.running = list(running)
+    scheduler.max_num_running_reqs = scheduler.max_num_active_reqs = 8
+    scheduler._num_hidden_decodes = 0
+    scheduler._held_prefills = HeldPrefills()
+    scheduler._partial_prefill_limit = PartialPrefillLimit(limit)
+    scheduler._prefill_chunk_cap_table = ()
+    scheduler._multimodal_prefill_block_size = 0
+    scheduler.max_num_scheduled_tokens = 525312
+    scheduler.scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=525312, long_prefill_token_threshold=CHUNK
+    )
+    scheduler.kv_cache_manager = SimpleNamespace(
+        prefix_cache_lookup_enabled=lambda request: False
+    )
+    return scheduler
+
+
+def _fake_base_pass(monkeypatch, advanced: list[list[str]], pass_body=None) -> None:
+    """Replace vLLM's ``schedule`` with a pass that gives every visible
+    running request and every waiting request it admits one ``CHUNK``, as
+    vLLM's pass does under the threshold, and logs the request ids it
+    advanced. ``pass_body`` replaces that pass."""
+
+    def chunk_each(self, throttle_prefills=False):
+        step = [r.request_id for r in self.running]
+        for request in self.running:
+            request.num_computed_tokens = min(
+                request.num_tokens, request.num_computed_tokens + CHUNK
+            )
+        while self.waiting and len(self.running) < self.max_num_running_reqs:
+            request = self.waiting.pop_request()
+            request.num_computed_tokens = min(request.num_tokens, CHUNK)
+            step.append(request.request_id)
+            self.running.append(request)
+        for request in self.running:
+            request.is_prefill_chunk = request.num_computed_tokens < request.num_tokens
+        advanced.append(step)
+        return SchedulerOutput.make_empty()
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", pass_body or chunk_each)
+
+
+class TestHidingAroundTheBasePass:
+    """``_schedule_prefill_only`` hides the held requests from one base pass
+    and puts them back in their places, with a fake base pass."""
+
+    def test_long_prompts_run_one_at_a_time_after_waiting_short_ones(self, monkeypatch):
+        longs = [_FakeRequest(f"L{i}", 3 * CHUNK + 100) for i in range(3)]
+        scheduler = _bare(1, waiting=[longs[0], _FakeRequest("s0", 100), *longs[1:]])
+        advanced = []
+        _fake_base_pass(monkeypatch, advanced)
+        for step in range(9):
+            scheduler._schedule_prefill_only()
+            if step == 0:
+                scheduler.waiting.add_request(_FakeRequest("s1", 200))
+
+        # The short prompts go first, each in the step after it arrives.
+        assert advanced[:2] == [["s0"], ["s1"]]
+        # L0 needs four chunks and advances alone while it needs more than
+        # one; its last chunk fits one, so L1 starts beside it.
+        assert advanced[2:] == [
+            ["L0"],
+            ["L0"],
+            ["L0"],
+            ["L0", "L1"],
+            ["L1"],
+            ["L1"],
+            ["L1", "L2"],
+        ]
+
+    def test_running_partial_prefills_come_first_then_waiting_ones(self, monkeypatch):
+        running = [_FakeRequest(f"R{i}", 10 * CHUNK, CHUNK) for i in range(3)]
+        waiting = [_FakeRequest("W0", 9 * CHUNK), _FakeRequest("w", 50)]
+        scheduler = _bare(2, waiting=waiting, running=running)
+        advanced = []
+        _fake_base_pass(monkeypatch, advanced)
+
+        scheduler._schedule_prefill_only()
+
+        assert advanced == [["R0", "R1", "w"]]
+        # The held R2 is back after R0 and R1, ahead of the admitted w.
+        assert [r.request_id for r in scheduler.running] == ["R0", "R1", "R2", "w"]
+        assert [r.request_id for r in scheduler.waiting] == ["W0"]
+
+    def test_waiting_requests_take_the_places_left(self, monkeypatch):
+        running = [_FakeRequest("R0", 10 * CHUNK, CHUNK)]
+        waiting = [_FakeRequest("W0", 9 * CHUNK), _FakeRequest("W1", 9 * CHUNK)]
+        scheduler = _bare(2, waiting=waiting, running=running)
+        advanced = []
+        _fake_base_pass(monkeypatch, advanced)
+
+        scheduler._schedule_prefill_only()
+
+        assert advanced == [["R0", "W0"]]
+        assert [r.request_id for r in scheduler.waiting] == ["W1"]
+
+    def test_a_held_partial_prefill_is_not_preempted(self, monkeypatch):
+        a = _FakeRequest("A", 10 * CHUNK, 3 * CHUNK)
+        b = _FakeRequest("B", 10 * CHUNK, 3 * CHUNK)
+        scheduler = _bare(1, running=[a, b])
+        visible = []
+
+        def preempt_the_last(self, throttle_prefills=False):
+            # KV pressure: vLLM preempts the last visible running request.
+            visible.append([r.request_id for r in self.running])
+            self.waiting.prepend_request(self.running.pop())
+            return SchedulerOutput.make_empty()
+
+        _fake_base_pass(monkeypatch, [], preempt_the_last)
+
+        scheduler._schedule_prefill_only()
+
+        assert visible == [["A"]]
+        assert scheduler.running == [b] and b.num_computed_tokens == 3 * CHUNK
+        assert list(scheduler.waiting) == [a]
+
+    def test_a_request_preempted_in_the_pass_stays_ahead_of_held_ones(
+        self, monkeypatch
+    ):
+        scheduler = _bare(
+            1, waiting=[_FakeRequest("L", 100_000), _FakeRequest("s1", 100)]
+        )
+
+        def admit_one_and_preempt(self, throttle_prefills=False):
+            self.waiting.pop_request()
+            self.waiting.prepend_request(_FakeRequest("P", 50))
+            return SchedulerOutput.make_empty()
+
+        _fake_base_pass(monkeypatch, [], admit_one_and_preempt)
+
+        scheduler._schedule_prefill_only()
+
+        assert [r.request_id for r in scheduler.waiting] == ["P", "L"]
 
 
 class TestHybridCacheHitEstimate:
@@ -506,6 +695,10 @@ class TestChunkHook:
         # ends at 320 and is rounded down to 256.
         hook = _hook(self.TABLE)
         assert hook._mamba_block_aligned_split(_prompt(4000, 64), 900) == 192
+
+    def test_the_last_chunk_is_capped_too(self):
+        hook = _hook(((0, 1024),))
+        assert hook._mamba_block_aligned_split(_prompt(5000, 3072), 1928) == 1024
 
     def test_a_last_chunk_under_the_cap_is_left_alone(self):
         hook = _hook(self.TABLE)
