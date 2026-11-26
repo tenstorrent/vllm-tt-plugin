@@ -41,6 +41,7 @@ keyword arguments below, not a `TTModelInput` object. Source:
 | `tokens` | CPU integer tensor `[B, T]`, containing token history from position 0 through the largest scheduled chunk end. |
 | `start_pos` | One absolute chunk start per row. Front-packed prefill supplies a NumPy array; lane-DP supplies a torch tensor. |
 | `prompt_lens` | One exclusive chunk end per row, supplied as a NumPy array. `prompt_lens[i]` is not the chunk length. |
+| `next_token_ids` | Only for a model declaring `prefill_next_token_ids` ([MODEL_CAPABILITIES.md](MODEL_CAPABILITIES.md)): int64 tensor `[B]`, row i's token at `prompt_lens[i]` for an intermediate chunk, -1 for a chunk that ends the scheduled sequence. |
 | `page_table`, `kv_cache` | Block addresses and the object returned by the adapter's KV allocator. |
 | `enable_trace` | True when `tt.trace_mode="all"`. |
 | `empty_slots` | When supplied, one destination device-state slot per submitted row. Preserve state belonging to other slots. |

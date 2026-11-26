@@ -60,6 +60,33 @@ SEED_NONE_SENTINEL = -1
 LOGPROBS_NONE_SENTINEL = -2
 
 
+def prefill_next_token_ids(
+    token_ids: torch.Tensor,
+    rows: Sequence[int] | np.ndarray,
+    prompt_lens: np.ndarray,
+    intermediate_prefill_mask: torch.Tensor,
+) -> torch.Tensor:
+    """The ``next_token_ids`` of a prefill step, int64, one per row.
+
+    Row ``i`` holds the token at position ``prompt_lens[i]`` when its chunk is
+    intermediate, the first token of the request's next chunk, and -1 when the
+    chunk ends the scheduled sequence. A model that fills a drafter cache
+    during prefill needs that token for the chunk's last position: an MTP or
+    EAGLE position ``p`` takes the token at ``p + 1``, which is how vLLM's own
+    drafters treat a partial prefill. The ``tokens`` a prefill receives stop
+    at the step's largest chunk end, so a lone intermediate row's next token
+    is not among them. ``token_ids`` is the persistent batch's token buffer,
+    ``rows`` the step's rows in it.
+    """
+    rows_t = torch.as_tensor(np.asarray(rows, dtype=np.int64).reshape(-1))
+    ends = torch.as_tensor(np.asarray(prompt_lens, dtype=np.int64).reshape(-1))
+    inter = torch.as_tensor(intermediate_prefill_mask, dtype=torch.bool).reshape(-1)
+    out = torch.full((int(rows_t.numel()),), -1, dtype=torch.int64)
+    if bool(inter.any()):
+        out[inter] = token_ids[rows_t[inter], ends[inter]].to(torch.int64)
+    return out
+
+
 def log_prefill_chunks(
     input_batch,
     req_indices,
@@ -1625,6 +1652,16 @@ class TTLaneInputBatch(InputBatch):
         )
         max_prefill = int(prompt_lens.max())
         input_tokens = lane_batch.token_ids_cpu_tensor[rows_np, :max_prefill]
+        next_token_ids = (
+            prefill_next_token_ids(
+                lane_batch.token_ids_cpu_tensor,
+                rows_np,
+                prompt_lens,
+                intermediate_prefill_mask,
+            )
+            if runner.supports_prefill_next_token_ids
+            else None
+        )
 
         block_tables_per_group = lane_batch.slot_block_tables(
             rows, zero_gaps=False, total=0, width=runner.max_num_blocks_per_req
@@ -1705,6 +1742,7 @@ class TTLaneInputBatch(InputBatch):
                 else None
             ),
             intermediate_prefill_mask=intermediate_prefill_mask,
+            prefill_next_token_ids=next_token_ids,
             defer_device_sampling=False,
             structured_output_req_ids=structured_output_req_ids,
             grammar_row_req_ids=tuple(

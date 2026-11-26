@@ -193,6 +193,7 @@ def test_prefill_never_asks_for_stage_outputs():
         stage_inputs=None,
         perform_device_sampling=False,
         prefill_empty_slots=[0],
+        prefill_next_token_ids=None,
     )
 
     TTModelRunner.submit_prefill(runner, model_input, [1])

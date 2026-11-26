@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import inspect
 import sys
-from collections.abc import Callable
+import weakref
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from enum import Enum
 from typing import TYPE_CHECKING, cast
@@ -34,6 +36,7 @@ from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 
 logger = init_tt_logger(__name__)
 
@@ -239,19 +242,23 @@ class TTDecodeInterleavePolicy:
 
 
 def _effective_prefill_step_limit(scheduler_config) -> tuple[int, str]:
-    """The most tokens one scheduling step can hand a single new request, named.
+    """The most tokens one scheduling step can hand a single request, named.
 
-    Resolved exactly as vLLM's ``Scheduler.__init__`` resolves its per-step
-    token budget: ``max_num_scheduled_tokens`` when it is set, otherwise
-    ``max_num_batched_tokens``. A positive ``long_prefill_token_threshold``
-    then caps that limit. Returns ``(limit, name_of_the_binding_cap)``; the
-    limit is ``sys.maxsize`` when nothing is configured.
+    Resolved as vLLM's ``Scheduler.schedule`` caps one request: by its token
+    budget, ``max_num_scheduled_tokens`` when it is set and otherwise
+    ``max_num_batched_tokens``, and by its input budget,
+    ``max_num_batched_tokens``, which a larger ``max_num_scheduled_tokens``
+    does not lift. A positive ``long_prefill_token_threshold`` then caps that
+    limit. Returns ``(limit, name_of_the_binding_cap)``; the limit is
+    ``sys.maxsize`` when nothing is configured.
     """
     scheduled = getattr(scheduler_config, "max_num_scheduled_tokens", None)
+    batched = int(getattr(scheduler_config, "max_num_batched_tokens", 0) or 0)
     if scheduled is not None:
         limit, name = int(scheduled), "max_num_scheduled_tokens"
+        if 0 < batched < limit:
+            limit, name = batched, "max_num_batched_tokens"
     else:
-        batched = int(getattr(scheduler_config, "max_num_batched_tokens", 0) or 0)
         limit, name = (
             (batched, "max_num_batched_tokens")
             if batched > 0
@@ -271,9 +278,10 @@ def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
 
     ``_align_prefill_chunk_end`` defers a new request whose chunk falls short
     of the grid; that only converges if a later step can offer a larger chunk.
-    The binding cap is the one vLLM schedules with (``max_num_scheduled_tokens``
-    when set, else ``max_num_batched_tokens``), further capped by a positive
-    ``long_prefill_token_threshold``.
+    The binding cap is the one vLLM schedules a request with
+    (``_effective_prefill_step_limit``): the smaller of
+    ``max_num_scheduled_tokens``, when set, and ``max_num_batched_tokens``,
+    further capped by a positive ``long_prefill_token_threshold``.
     """
     limit, name = _effective_prefill_step_limit(scheduler_config)
     if limit < align:
@@ -364,6 +372,30 @@ def _carry_cleanup(earlier: SchedulerOutput, later: SchedulerOutput) -> None:
         ) | earlier.preempted_req_ids
 
 
+# A model's bound ``confirm_prefix_cache_hit(token_ids, mm_items,
+# num_computed_tokens)``: ``mm_items`` holds ``(identifier, offset, length,
+# modality)`` per multimodal item, and the answer is the number of cached
+# tokens the model serves (docs/MODEL_CAPABILITIES.md).
+PrefixHitConfirmer = Callable[
+    [Sequence[int], list[tuple[str, int, int, str]], int], int
+]
+
+# The loaded model's prefix-hit confirmer (its bound ``confirm_prefix_cache_hit``),
+# published by ``TTWorker.load_model`` for the scheduler of its process: the
+# engine core constructs its scheduler after the executor loaded the model, in
+# the same process (a model that confirms hits is admitted only with the
+# uniproc executor). None for a model without ``confirms_prefix_cache_hits``,
+# and None again from ``TTWorker.shutdown``, so this module does not keep the
+# model alive past the close of its mesh.
+_published_confirmer: PrefixHitConfirmer | None = None
+
+
+def publish_prefix_hit_confirmer(confirmer: PrefixHitConfirmer | None) -> None:
+    """Record the loaded model's confirmer for the schedulers of this process."""
+    global _published_confirmer
+    _published_confirmer = confirmer
+
+
 class TTScheduler(AsyncScheduler):
     """Scheduler for the TT (Tenstorrent) platform.
 
@@ -429,6 +461,7 @@ class TTScheduler(AsyncScheduler):
                 "TT backend does not return auxiliary model outputs; remove "
                 "--enable-return-routed-experts."
             )
+        self._take_published_prefix_hit_confirmer()
         self._forced_mode = TTSchedulingMode.DEFAULT
         # Read only in DEFAULT mode. A lane coordinator sets a forced mode
         # before every one of its lanes' schedule() calls and owns the one
@@ -448,6 +481,10 @@ class TTScheduler(AsyncScheduler):
         # its SchedulerOutput in update_from_output so _update_request_with_output
         # sees the decision that produced THIS output (not a later schedule).
         self._committing_block_step_decisions: dict[str, bool] = {}
+        # On a speculating launch, the drafts scheduled for the step whose
+        # output is being committed (_count_commit_past_scheduled_drafts reads
+        # them); None otherwise.
+        self._committing_spec_drafts: dict[str, list[int]] | None = None
         # Set by TTLaneCoordinator on its lanes; see make_stats.
         self.stats_made_by_coordinator = False
         # Request id that owns the adaptive model's SINGLE speculative
@@ -534,6 +571,86 @@ class TTScheduler(AsyncScheduler):
                 "Block-output models must run with prefix caching disabled; "
                 "TTPlatform validation disables it"
             )
+
+    def _take_published_prefix_hit_confirmer(self) -> None:
+        """Route the KV cache manager's hit lookup through the model's confirmer.
+
+        A model that owns its prefix cache (device state per slot) confirms
+        vLLM's longest hit before the scheduler commits it, so
+        ``num_computed_tokens`` never exceeds what the device can serve and
+        ``NewRequestData`` strips only the mm payload the model has resident.
+        """
+        confirmer = _published_confirmer
+        if confirmer is None:
+            self._prefix_hit_confirmer_ref = None
+            return
+        # Held weakly. EngineCore shuts the executor down before the scheduler,
+        # so a strong reference here would keep the model, and every device
+        # tensor it owns, alive past TTWorker.shutdown's close of the mesh. A
+        # confirmer that is not a bound method holds no model instance.
+        self._prefix_hit_confirmer_ref = (
+            weakref.WeakMethod(confirmer)
+            if inspect.ismethod(confirmer)
+            else lambda: confirmer
+        )
+        manager = self.kv_cache_manager
+        self._orig_get_computed_blocks = manager.get_computed_blocks
+        manager.get_computed_blocks = self._confirmed_computed_blocks
+        logger.info(
+            "Prefix-cache hits are confirmed by the model before they are scheduled"
+        )
+
+    def _confirmed_computed_blocks(
+        self, request: Request, max_cache_hit_length: int | None = None
+    ) -> "tuple[KVCacheBlocks, int, int]":
+        """``get_computed_blocks`` trimmed to the hit the model confirms.
+
+        vLLM's longest block-hash hit is proposed to the model as
+        ``confirm(token_ids, mm_items, num_new_computed_tokens)``; the model
+        answers the number of cached tokens it will serve (0 = none), taken at
+        most as the proposal and floored to the scheduler's block size (the KV
+        cache manager carries none), and the computed blocks are cut to it. The
+        shared-prefix boundary pin is dropped with a trimmed hit.
+
+        ``token_ids`` is ``request.all_token_ids``, vLLM's read-only view of
+        the sequence the hit was hashed over, handed over without a copy.
+        ``max_cache_hit_length``, vLLM's bound on the hit (``num_tokens - 1``
+        when None), goes to the lookup unchanged. The hit reaches up to that
+        bound, so for a request resumed from preemption it runs past the prompt
+        into the request's output.
+        """
+        blocks, num_new, boundary = self._orig_get_computed_blocks(
+            request, max_cache_hit_length
+        )
+        if num_new <= 0:
+            return blocks, num_new, boundary
+        confirm = self._prefix_hit_confirmer_ref()
+        if confirm is None:
+            raise RuntimeError(
+                "the model that confirms prefix-cache hits was released "
+                "(TTWorker.shutdown) while its scheduler still schedules: "
+                f"request {request.request_id} proposed a {num_new}-token hit"
+            )
+        mm_items = [
+            (
+                f.identifier,
+                int(f.mm_position.offset),
+                int(f.mm_position.length),
+                f.modality,
+            )
+            for f in request.mm_features
+        ]
+        honoured = int(confirm(request.all_token_ids, mm_items, num_new))
+        if honoured < 0:
+            raise ValueError(
+                f"confirm_prefix_cache_hit answered {honoured} cached tokens for the "
+                f"{num_new}-token hit of request {request.request_id}"
+            )
+        honoured = min(honoured, num_new) // self.block_size * self.block_size
+        if honoured == num_new:
+            return blocks, num_new, boundary
+        trimmed = self.kv_cache_manager.truncate_computed_blocks(blocks, honoured)
+        return trimmed, honoured, 0
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -871,9 +988,10 @@ class TTScheduler(AsyncScheduler):
         """Round a *partial* prefill chunk down so it ends on the alignment grid.
 
         Chunks that finish the prompt, decode steps and multimodal prompts are
-        left alone. A new request whose aligned chunk would be empty waits for
-        the next step; a running request that cannot reach the grid ends its
-        chunk on a KV block instead, and waits a step if that is empty too.
+        left alone. A request whose aligned chunk would be empty waits for the
+        next step: only this step's leftover budget can stop it, because a
+        full step reaches the grid from any start (``__init__`` validates the
+        per-step cap to be at least the alignment).
         """
         align = getattr(self, "_prefill_chunk_alignment", 0)
         if align <= 1 or num_new_tokens <= 0:
@@ -889,19 +1007,22 @@ class TTScheduler(AsyncScheduler):
             return num_new_tokens
         aligned_end = end // align * align
         if aligned_end <= start:
-            if start != 0:
-                # The next chunk resumes where this one ends, and the model
-                # takes a resume offset only on a KV block boundary. A running
-                # request whose chunk cannot reach the grid still ends on a
-                # block, or waits for the next step's budget.
-                block = self.block_size
-                return max(end // block * block - start, 0)
-            # A new request waits only when this step's leftover budget is what
-            # stopped it. If a full step could not reach the grid either (a
-            # permanent cap below the alignment), it must still make progress.
-            return (
-                0 if num_new_tokens < self._full_step_prefill_cap() else num_new_tokens
-            )
+            cap = self._full_step_prefill_cap()
+            if num_new_tokens >= cap:
+                # A chunk of at least the alignment always crosses a grid
+                # point, and the cap was validated to be at least the
+                # alignment, so a full step never lands here.
+                raise RuntimeError(
+                    f"a full {num_new_tokens}-token prefill step (per-step cap "
+                    f"{cap}) from position {start} misses the {align}-token "
+                    "alignment grid; _validate_prefill_chunk_alignment admits "
+                    "no cap below the alignment"
+                )
+            # This step's leftover budget is what stopped the request: it
+            # waits for a step whose budget reaches the grid. A chunk that ends
+            # short of the grid would make the next chunk start off it, which a
+            # model aligning its prefill state to the grid cannot resume.
+            return 0
         return aligned_end - start
 
     def _full_step_prefill_cap(self) -> int:
@@ -1557,16 +1678,21 @@ class TTScheduler(AsyncScheduler):
         """Bind this step's block-step decisions before the base loop commits
         its outputs, so ``_update_request_with_output`` reads the decision that
         produced THIS output rather than a later schedule's overwrite, and
-        consume only the output frames this scheduled step reserved. A
-        committed step is no longer the held step (``_schedule_release_step``)."""
+        consume only the output frames this scheduled step reserved. On a
+        speculating launch the step's scheduled drafts are bound the same way,
+        for ``_count_commit_past_scheduled_drafts``. A committed step is no
+        longer the held step (``_schedule_release_step``)."""
         if self._is_block_output_model:
             self._committing_block_step_decisions = get_tt_block_step_decisions(
                 scheduler_output
             )
+        if self.num_spec_tokens:
+            self._committing_spec_drafts = scheduler_output.scheduled_spec_decode_tokens
         try:
             return super().update_from_output(scheduler_output, model_runner_output)
         finally:
             self._committing_block_step_decisions = {}
+            self._committing_spec_drafts = None
             self.tt_release_output_frames(scheduler_output)
             if scheduler_output is getattr(self, "_unreleased_step", None):
                 self._unreleased_step = None
@@ -1586,11 +1712,69 @@ class TTScheduler(AsyncScheduler):
             else:
                 pending[req_id] = count - 1
 
+    def _count_commit_past_scheduled_drafts(
+        self, request: Request, new_token_ids: list[int], is_stale: bool
+    ) -> None:
+        """Reconcile a commit past the drafts, or refuse it under a queued step.
+
+        Schedule time advanced ``num_computed_tokens`` and
+        ``num_output_placeholders`` by the step's 1 + d tokens. vLLM reconciles
+        both with the commit only for a row it scheduled drafts for (d >= 1),
+        by subtracting ``num_rejected = d - (len(new_token_ids) -
+        num_sampled_tokens_per_step)``, which is negative, and so advances
+        them, when the row commits past its drafts. A ``fused_sample`` verify
+        may commit several tokens on a row scheduled none, where vLLM applies
+        nothing: the request would hold c new tokens against counts advanced by
+        one, so the placeholder count would underflow and the next step would
+        schedule the c - 1 tokens again as new input. The same reconciliation
+        is applied here, under vLLM's guards, just before the tokens are
+        appended.
+
+        Either correction is right only while no later step of the request is
+        scheduled. A step scheduled before this commit started from this
+        step's scheduled positions, so after a commit past the drafts it would
+        start behind the request, and the runner would read the gap as prompt
+        and prefill it. Only asynchronous scheduling schedules a step before
+        the previous one's output, and ``TTPlatform`` refuses ``fused_sample``
+        there, so such a commit is refused here rather than reconciled.
+
+        Raises
+        ------
+        RuntimeError
+            If the row committed past its drafts while a later step of the
+            request was already scheduled.
+        """
+        drafts = self._committing_spec_drafts
+        if drafts is None or is_stale:
+            return
+        num_drafts = len(drafts.get(request.request_id) or ())
+        num_accepted = len(new_token_ids) - self.num_sampled_tokens_per_step
+        if num_accepted <= num_drafts:
+            return
+        # update_from_output has already taken this step's tokens off the
+        # count, so what remains belongs to steps scheduled after it.
+        if request.num_in_flight_tokens > 0:
+            raise RuntimeError(
+                f"request {request.request_id} committed {len(new_token_ids)} "
+                f"tokens on a step that scheduled {num_drafts} drafts, while "
+                f"{request.num_in_flight_tokens} tokens of a later step were "
+                "already scheduled from the positions before this commit. "
+                "Only a fused_sample verify commits past its drafts, and "
+                "TTPlatform serves it with synchronous scheduling only"
+            )
+        if num_drafts:
+            return
+        if request.num_computed_tokens > 0:
+            request.num_computed_tokens += num_accepted
+        if request.num_output_placeholders > 0:
+            request.num_output_placeholders += num_accepted
+
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
     ) -> tuple[list[int], bool]:
         """Commit one block and reconcile its full physical reservation."""
         if not self._is_block_output_model:
+            self._count_commit_past_scheduled_drafts(request, new_token_ids, is_stale)
             return super()._update_request_with_output(
                 request, new_token_ids, is_stale=is_stale
             )
