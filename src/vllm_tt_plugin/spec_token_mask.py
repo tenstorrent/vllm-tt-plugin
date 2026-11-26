@@ -36,14 +36,20 @@ and a row of -1 words constrains nothing.
 from __future__ import annotations
 
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 
-from vllm_tt_plugin.spec_admission import SUPPORTS_SPEC_DEVICE_MASK
+from vllm_tt_plugin.spec_admission import (
+    SUPPORTS_CHAINED_SPEC_VERIFY,
+    SUPPORTS_SPEC_DEVICE_MASK,
+)
 from vllm_tt_plugin.spec_decode import ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_FUSED_SAMPLE
+
+if TYPE_CHECKING:
+    from vllm_tt_plugin.model_input import TTModelInput
 
 WORD_BITS = 32
 
@@ -336,6 +342,48 @@ def spec_masks_on_device(runner: Any) -> bool:
     )
 
 
+def chains_token_masks(runner: Any) -> bool:
+    """Whether a token-masked verify of ``runner`` may chain.
+
+    The model declares ``supports_chained_spec_verify`` and
+    ``supports_spec_device_mask``: ``decode_forward`` then queues a chained
+    verify's chain program and forward, and ``sample_deferred_decode`` its
+    masked draws and the device work that depends on them, so a row whose mask
+    is built at ``sample_tokens`` continues the unread verify before it
+    (docs/SPEC_DECODE_CONTRACT.md, section 4j).
+    """
+    capabilities = getattr(getattr(runner, "model", None), "model_capabilities", None)
+    return bool(
+        spec_masks_on_device(runner)
+        and (capabilities or {}).get(SUPPORTS_CHAINED_SPEC_VERIFY, False) is True
+    )
+
+
+def fill_token_masked_successor(runner: Any, filled: TTModelInput) -> TTModelInput:
+    """A chained verify's input once its predecessor's commit filled its rows.
+
+    For a token-masked chained verify (``defer_device_sampling``) the rows are
+    known only now: the static part of its mask is built from them and the
+    output its predecessor committed (``step_static_token_mask``), and the
+    drafts of its structured rows become the runner's grammar draft handoff,
+    which ``take_draft_token_ids`` returns so the scheduler validates them
+    and computes the bitmask of every drafted column. Any other input is
+    returned as it is.
+    """
+    if not filled.defer_device_sampling:
+        return filled
+    row_req_ids = list(filled.row_req_ids or ())
+    runner._grammar_draft_handoff = runner._structured_drafts(
+        row_req_ids, filled.draft_token_ids, filled.num_valid_drafts
+    )
+    return replace(
+        filled,
+        spec_token_mask=step_static_token_mask(
+            runner, row_req_ids, filled.draft_token_ids, filled.num_valid_drafts
+        ),
+    )
+
+
 def step_static_token_mask(
     runner: Any,
     row_req_ids: Sequence[str],
@@ -392,8 +440,10 @@ def step_static_token_mask(
 __all__ = [
     "MaskRowControls",
     "SpecMaskCache",
+    "chains_token_masks",
     "clear_ids_",
     "compose_token_mask",
+    "fill_token_masked_successor",
     "mask_may_allow_nothing",
     "mask_words",
     "pack_allowed_ids",

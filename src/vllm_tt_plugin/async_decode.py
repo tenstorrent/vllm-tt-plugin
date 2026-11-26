@@ -1693,7 +1693,9 @@ class TTAsyncDecodeController:
             device_sampling_params = type(sampling_params)(**sampling_param_dict)
             if deferred_device_sampling:
                 kwargs["defer_device_sampling"] = True
-            else:
+            if not deferred_device_sampling or spec_predecessor is not None:
+                # A chained token-masked verify also takes them now: its chain
+                # program derives each drawing row's seeds on the device.
                 kwargs["sampling_params"] = device_sampling_params
             if model_input.prompt_tokens is not None:
                 assert model_input.output_tokens is not None

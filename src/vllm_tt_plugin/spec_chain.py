@@ -52,6 +52,7 @@ from vllm_tt_plugin.spec_admission import (
     SUPPORTS_PREFILL_OVER_PENDING_SPEC,
 )
 from vllm_tt_plugin.spec_decode import ACCEPT_MODE_ARGMAX_IDS, PLACEHOLDER_TOKEN_ID
+from vllm_tt_plugin.spec_token_mask import chains_token_masks
 from vllm_tt_plugin.structured_output import has_structured_outputs
 
 if TYPE_CHECKING:
@@ -111,9 +112,14 @@ def plan_chain(
         or scheduler_output_has_prefill_work(scheduler_output)
     ):
         return None, "lifecycle"
-    if scheduler_output.pending_structured_output_tokens or has_structured_outputs(
-        runner.requests, scheduler_output, None
-    ):
+    structured = scheduler_output.pending_structured_output_tokens or (
+        has_structured_outputs(runner.requests, scheduler_output, None)
+    )
+    # A model chaining token-masked verifies takes a structured row's mask at
+    # sample_tokens, after vLLM applied this step's predecessor; the row must
+    # still be certifiable under the mask below.
+    masks = chains_token_masks(runner)
+    if structured and not masks:
         return None, "grammar"
     previous_rows = list(previous.row_req_ids or ())
     batch = runner.input_batch
@@ -137,7 +143,7 @@ def plan_chain(
         )
     )
     max_model_len = int(runner.model_config.max_model_len)
-    device_sampled = None
+    device_sampled = masked = None
     for req_id in rows:
         if scheduler_output.num_scheduled_tokens[req_id] != 1 + num_drafts:
             return None, "width"
@@ -151,10 +157,18 @@ def plan_chain(
                 device_sampled = _samples_on_device(
                     runner, scheduler_output, previous, rows
                 )
-            if not device_sampled or not runner._request_is_argmax_certifiable(
-                req_id, device_sampled=True
+                masked = masks and _masks_on_device(
+                    runner, scheduler_output, previous, rows
+                )
+            if not (device_sampled or masked) or not (
+                runner._request_is_argmax_certifiable(
+                    req_id, device_sampled=True, masked=bool(masked)
+                )
             ):
-                return None, "sampling"
+                params = runner.requests[req_id].sampling_params
+                return None, (
+                    "grammar" if params.structured_outputs is not None else "sampling"
+                )
         length = int(batch.num_tokens[batch.req_id_to_index[req_id]])
         if length + 2 * (1 + num_drafts) > max_model_len:
             return None, "max_model_len"
@@ -230,23 +244,42 @@ def _samples_on_device(
     )
 
 
+def _masks_on_device(
+    runner: Any,
+    scheduler_output: SchedulerOutput,
+    previous: TTModelInput,
+    rows: list[str],
+) -> bool:
+    """Whether the step about to be built verifies under a device token mask
+    (``TTModelRunner._decode_mask_sampled``) over an unread verify that sampled
+    on the device, so its rows' ids are draws in both."""
+    if not previous.perform_device_sampling:
+        return False
+    batch = runner.input_batch
+    return bool(
+        runner._decode_mask_sampled(
+            scheduler_output, [batch.req_id_to_index[r] for r in rows]
+        )
+    )
+
+
 def check_chained_rows_certifiable(
-    runner: Any, row_req_ids: list[str], device_sampled: bool
+    runner: Any, row_req_ids: list[str], device_sampled: bool, masked: bool = False
 ) -> None:
     """Raise unless the id walk of the step being built certifies every
-    chained row under the step's own device-sampling decision
-    (``TTModelRunner._decode_device_sampled``), which the submission uses;
-    ``plan_chain`` decided over the persistent batch before
-    ``_update_states``."""
+    chained row under the step's own device-sampling and token-mask decisions
+    (``TTModelRunner._decode_device_sampled``, ``_decode_mask_sampled``), which
+    the submission uses; ``plan_chain`` decided over the persistent batch
+    before ``_update_states``."""
     uncertified = [
         r
         for r in row_req_ids
-        if not runner._request_is_argmax_certifiable(r, device_sampled)
+        if not runner._request_is_argmax_certifiable(r, device_sampled, masked)
     ]
     if uncertified:
         raise RuntimeError(
             f"chained verify rows {uncertified} are not certifiable by the id "
-            f"walk of a step with device_sampled={device_sampled}"
+            f"walk of a step with device_sampled={device_sampled}, masked={masked}"
         )
 
 

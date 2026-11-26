@@ -1337,12 +1337,30 @@ walk rules out.
 **Paths.** Under asynchronous scheduling the verify is registered as a
 pending step at `execute_model` and sampled, with its read started, at
 `sample_tokens` (`AsyncTTSpecDecodeOutput.sample_deferred`), before anything
-resolves it. `plan_chain` drains a step with these rows as before
-(`"grammar"`, or `"sampling"` for the three other controls), and a chained
-step never defers its sampling. Synchronously the step is sampled and read at
+resolves it. Synchronously the step is sampled and read at
 `sample_tokens` (`TTModelRunner._sample_token_masked_verify`). The runner
 counts verifies by accept mode, and the token-masked ones, on the
 `TT submissions` cadence (`TT verifies by accept mode`).
+
+**Chaining.** A model that also declares `supports_chained_spec_verify`
+chains these rows (`spec_token_mask.chains_token_masks`): a chained verify may
+then defer its sampling. `execute_model` submits it with `spec_predecessor`,
+`defer_device_sampling=True` and the step's `sampling_params` (its chain
+program derives each drawing row's seeds on the device), and the model queues
+the chain program and the verify forward only. `complete_chain` reads, commits
+and proposes the predecessor, which fills the chained rows; the runner then
+builds the static part of the mask from them
+(`spec_token_mask.fill_token_masked_successor`) and hands the structured rows'
+drafts to the scheduler through `take_draft_token_ids`. vLLM computes the
+step's bitmask only after it applied the predecessor (the order
+`tests/spec/test_spec_grammar_step_order.py` pins), and `sample_tokens` hands
+the model the mask; the model then queues the masked draws and the device work
+that depends on them: the acceptance the next chained verify reads, and the
+drafter. The model must keep every row it draws at submission drawing at
+sample time, and the valid drafts the chain program counted. `plan_chain`
+stops draining `"grammar"` for such rows, and `"sampling"` for the other three
+controls; a row whose mask can allow no token still drains. Without either
+capability `plan_chain` drains such a step as before.
 
 ## 5. One request, from prefill to release
 
