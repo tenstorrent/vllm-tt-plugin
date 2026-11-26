@@ -21,8 +21,6 @@ from typing import TYPE_CHECKING, Any, get_args
 
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.spec_decode import (
-    ACCEPT_MODE_ARGMAX_IDS,
-    ACCEPT_MODE_LOGITS,
     DRAFTER_STATE_PAGED,
     HIDDEN_HANDOFF_ROUNDTRIP,
     HIDDEN_HANDOFFS,
@@ -39,15 +37,6 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 logger = init_tt_logger(__name__)
-
-# Accept modes the runner can drive today. A plan offering none of these is
-# refused; a plan offering more keeps its extra modes and is still admitted,
-# so declaring a real capability never makes a model less admissible.
-#
-# ``argmax_ids`` certifies greedy rows only. ``logits`` certifies every row the
-# platform admits on a speculating launch, by rejection sampling on the host,
-# so a logits-only plan is runnable too. ``fused_sample`` has no runner path.
-_RUNNABLE_ACCEPT_MODES = (ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_LOGITS)
 
 # Upstream custom_class is a user-provided proposer extension that needs no
 # separate draft checkpoint configuration. The TT runner uses that category
@@ -288,12 +277,6 @@ def resolve_speculative_plan(
             f"{model_class.__name__}.spec_plan declares drafter_state "
             f"{DRAFTER_STATE_PAGED!r}, which needs a scheduler-owned drafter "
             "cache the TT backend does not yet allocate"
-        )
-    if not any(mode in outcome.accept_modes for mode in _RUNNABLE_ACCEPT_MODES):
-        raise ValueError(
-            f"{model_class.__name__}.spec_plan offers accept modes "
-            f"{list(outcome.accept_modes)}, none of which the runner can "
-            f"drive; it drives {list(_RUNNABLE_ACCEPT_MODES)}"
         )
 
     # An ordinary decode returns no VerifyOutput, so it produces no hidden

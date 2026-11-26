@@ -27,9 +27,11 @@ def reset_tt_platform_class_state():
     import vllm.v1.engine.core as engine_core
     import vllm.v1.engine.core_client as core_client
     import vllm.v1.engine.input_processor as input_processor
+    from vllm.distributed.kv_transfer import kv_transfer_state
     from vllm.entrypoints.launchers.utils import server_utils
     from vllm.v1.structured_output import backend_xgrammar
 
+    import vllm_tt_plugin.scheduler as tt_scheduler
     from vllm_tt_plugin.platform import TTPlatform
 
     saved_lifespan = server_utils.lifespan
@@ -39,6 +41,7 @@ def reset_tt_platform_class_state():
         if (module := sys.modules.get(name)) is not None and hasattr(module, "lifespan")
     }
     saved_empty_cache = torch.accelerator.empty_cache
+    saved_sync_engine_id = kv_transfer_state._sync_engine_id_across_tp
 
     unset = object()
     saved = {
@@ -81,6 +84,9 @@ def reset_tt_platform_class_state():
             "_tt_original_dp_reset_prefix_cache_async",
         )
     }
+    # The worker publishes the loaded model's prefix-hit confirmer as a module
+    # global that every scheduler constructed afterwards takes.
+    saved_published_confirmer = tt_scheduler._published_confirmer
 
     yield
 
@@ -105,6 +111,7 @@ def reset_tt_platform_class_state():
             elif getattr(module.lifespan, "_tt_lifespan_gc_patch", False):
                 module.lifespan = saved_lifespan
     torch.accelerator.empty_cache = saved_empty_cache
+    kv_transfer_state._sync_engine_id_across_tp = saved_sync_engine_id
 
     engine_core.EngineCore.reset_prefix_cache = saved_reset_prefix_cache
     engine_core.EngineCore.pause_scheduler = saved_pause_scheduler
@@ -117,6 +124,7 @@ def reset_tt_platform_class_state():
         engine_core.__dict__.pop("_tt_original_pause_scheduler", None)
     else:
         engine_core._tt_original_pause_scheduler = saved_original_pause_scheduler
+    tt_scheduler._published_confirmer = saved_published_confirmer
 
     async_llm.AsyncLLM._add_streaming_input_request = saved_add_streaming_input_request
     if saved_original_add_streaming_input_request is unset:
@@ -195,6 +203,7 @@ def vllm_config() -> SimpleNamespace:
         ),
         speculative_config=None,
         lora_config=None,
+        kv_transfer_config=None,
         cache_config=SimpleNamespace(enable_prefix_caching=False),
         structured_outputs_config=SimpleNamespace(disable_any_whitespace=False),
     )

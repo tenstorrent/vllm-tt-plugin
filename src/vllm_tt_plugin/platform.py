@@ -42,9 +42,12 @@ from vllm_tt_plugin.config import (
     tt_requests_cannot_resume,
     uses_tt_lane_coordinator,
     validate_and_store_tt_supports_multimodal_prefill_resume,
+    validate_and_store_tt_supports_prefill_next_token_ids,
     validate_and_store_tt_supports_prefill_resume_inside_kv_block,
     validate_and_store_tt_supports_stage_inputs,
+    validate_tt_kv_transfer_config,
     validate_tt_lane_config,
+    validate_tt_prefix_hit_confirmation,
     validate_tt_scheduler_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
@@ -54,7 +57,7 @@ from vllm_tt_plugin.spec_admission import (
     validate_chained_spec_verify,
     validate_prefill_over_pending_spec,
 )
-from vllm_tt_plugin.spec_decode import ACCEPT_MODE_LOGITS
+from vllm_tt_plugin.spec_decode import ACCEPT_MODE_FUSED_SAMPLE, ACCEPT_MODE_LOGITS
 from vllm_tt_plugin.utils.dp_discovery import (
     StandardDPAssignmentT,
     run_standard_dp_visible_device_group_discovery,
@@ -824,6 +827,30 @@ def _install_torch_accelerator_cleanup_patch() -> None:
 
     empty_cache._tt_availability_guard = True
     torch.accelerator.empty_cache = empty_cache
+
+
+def _install_tt_kv_engine_id_sync_patch() -> None:
+    """Skip the KV connector's engine-ID broadcast when there is one rank.
+
+    The broadcast goes to the other tensor-parallel ranks through a
+    ``torch.distributed`` group that TT never creates.
+    """
+    from vllm.distributed.kv_transfer import kv_transfer_state
+
+    original = getattr(kv_transfer_state, "_sync_engine_id_across_tp", None)
+    if original is None:
+        raise RuntimeError(
+            "vLLM no longer defines kv_transfer_state._sync_engine_id_across_tp; "
+            "update or remove _install_tt_kv_engine_id_sync_patch."
+        )
+
+    @wraps(original)
+    def patched_sync_engine_id(vllm_config):
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        return original(vllm_config) if tp_size != 1 or pp_size != 1 else None
+
+    kv_transfer_state._sync_engine_id_across_tp = patched_sync_engine_id
 
 
 def _install_diffusion_gemma_architecture_patch() -> None:
@@ -1635,6 +1662,14 @@ def register_tt_models(register_test_models=False) -> None:
         "models.demos.qwen3_vl.tt.generator_vllm:Qwen3VLForConditionalGeneration",
     )
 
+    # Qwen3-ForcedAligner - word timestamps (pooling, token_classify)
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTQwen3ASRForcedAlignerForTokenClassification",
+        "models.demos.audio.qwen3_asr.tt.generator_vllm:"
+        "Qwen3ASRForcedAlignerForTokenClassification",
+    )
+
     # Mistral - Text only
     _register_model_if_missing(
         ModelRegistry,
@@ -1709,6 +1744,18 @@ def register_tt_models(register_test_models=False) -> None:
         ModelRegistry, "Kolibri1ForCausalLM", _kolibri1_target
     )
     _register_model_if_missing(ModelRegistry, "TTKolibri1ForCausalLM", _kolibri1_target)
+
+    # GLM-5.3-Flash (tt-metal models/demos/glm53_flash): the persistent-stack
+    # adapter over the 32 chips of a Blackhole Galaxy. The checkpoint's
+    # architecture is Glm5NextForConditionalGeneration (transformers >= 5.16,
+    # model_type glm5_next). vLLM registers the bare Glm5Next names itself and
+    # resolves the checkpoint's before the platform prefixes it, so the
+    # TT-prefixed names are the ones that select the tt-metal adapter.
+    _glm53_target = (
+        "models.demos.glm53_flash.tt.generator_vllm_stack:GLM53StackForCausalLM"
+    )
+    for arch in ("TTGlm5NextForConditionalGeneration", "TTGlm5NextForCausalLM"):
+        _register_model_if_missing(ModelRegistry, arch, _glm53_target)
 
     # DiffusionGemma registers above the builtin-map switch: one complete
     # 256-token canvas per model step. Upstream owns the bare
@@ -2306,6 +2353,9 @@ class TTPlatform(Platform):
             vllm_config,
             supports_device_grammar,
         )
+        validate_and_store_tt_supports_prefill_next_token_ids(
+            vllm_config, model_capabilities, model_class
+        )
         if is_diffusion_gemma and not is_block_output_model:
             raise ValueError(
                 "DiffusionGemma must declare output_tokens_per_step > 1 "
@@ -2537,6 +2587,8 @@ class TTPlatform(Platform):
 
         _install_tt_input_processor_patch()
         _install_tt_dp_prefix_cache_routing_patch()
+        if vllm_config.kv_transfer_config is not None:
+            _install_tt_kv_engine_id_sync_patch()
         if is_block_output_model:
             _install_block_output_streaming_input_patch()
 
@@ -2664,6 +2716,28 @@ class TTPlatform(Platform):
                     "Rust frontend bypasses the TT request validation; unset "
                     "VLLM_USE_RUST_FRONTEND or drop the speculative flags"
                 )
+            # The runner asks for fused_sample whenever a plan offers it, and
+            # such a verify may commit more tokens than the drafts it was sent.
+            # Asynchronous scheduling schedules the next step from this step's
+            # scheduled positions before the commit is known, so that queued
+            # step would start behind the request and the runner would read
+            # the gap as prompt to prefill. Until the queued positions are
+            # reconciled, fused_sample is served synchronously only.
+            if (
+                vllm_config.scheduler_config.async_scheduling
+                and ACCEPT_MODE_FUSED_SAMPLE in spec_plan.accept_modes
+            ):
+                raise ValueError(
+                    f"{model_class.__name__}.spec_plan offers the "
+                    f"{ACCEPT_MODE_FUSED_SAMPLE!r} accept mode, which TT serves "
+                    "with synchronous scheduling only: a fused_sample verify "
+                    "may commit past the drafts it was sent, and asynchronous "
+                    "scheduling has already scheduled the next step from the "
+                    "positions before that commit. Launch with "
+                    "--no-async-scheduling, or leave fused_sample out of "
+                    "accept_modes when "
+                    "vllm_config.scheduler_config.async_scheduling is set"
+                )
             requested_k = vllm_config.speculative_config.num_speculative_tokens
             if spec_plan.effective_k != requested_k:
                 # Published back, because vLLM's own scheduler budgets its
@@ -2682,6 +2756,7 @@ class TTPlatform(Platform):
                 )
         store_tt_spec_plan(vllm_config, spec_plan)
 
+        validate_tt_kv_transfer_config(vllm_config)
         is_lane_mode = uses_tt_lane_coordinator(vllm_config)
         if (
             getattr(model_config, "is_moe", False)
@@ -2704,6 +2779,10 @@ class TTPlatform(Platform):
         )
         resolve_tt_supports_stage_outputs(
             vllm_config, model_capabilities, model_class, is_lane_mode
+        )
+        # After lane conversion, which pins the executor backend it checks.
+        validate_tt_prefix_hit_confirmation(
+            vllm_config, model_capabilities, model_class
         )
         validate_tt_scheduler_config(vllm_config)
         if tt_requests_cannot_resume(vllm_config):

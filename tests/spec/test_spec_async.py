@@ -57,13 +57,14 @@ from vllm_tt_plugin.scheduler import (
     get_tt_forced_reset_discard_counts,
     set_tt_forced_reset_discard_counts,
 )
-from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
+from vllm_tt_plugin.spec_decode import ACCEPT_MODE_FUSED_SAMPLE, PLACEHOLDER_TOKEN_ID
 
 from .deterministic_target import (
     TARGET_VOCAB_SIZE,
     DeterministicTarget,
     continuation,
 )
+from .fake_spec_model import make_fake_spec_model
 
 # The output-equality suite's own draft cases and unspeculated reference arm.
 # Imported rather than restated so that both execution paths answer to one
@@ -1832,6 +1833,57 @@ def test_the_runner_verifies_its_own_proposal_when_the_scheduler_sends_none():
     # Handed over once: the entry is consumed by the step that verified it, so
     # a later step cannot replay a spent proposal.
     assert "a" not in runner._proposed_draft_token_ids
+
+
+def test_a_fused_sample_commit_past_the_drafts_crosses_the_deferral():
+    """``fused_sample`` through the asynchronous step, the model drafting.
+
+    The stand-in walks acceptance itself and commits two of its own tokens past
+    the walk, as a model chaining device steps per call does: the draftless
+    first step commits three tokens, and the second, verifying one draft of the
+    proposal the first commit published, commits the whole ``1+K`` block. Each
+    commit is published at resolve, applied at the drain, and its count is
+    what the next verify is handed.
+
+    Each step here is built after the previous commit is known. A served
+    asynchronous launch schedules the next step before that, which a commit
+    past the drafts leaves stale, so ``TTPlatform`` serves ``fused_sample``
+    synchronously only (``test_spec_kv_lookahead``'s queued-step test). This
+    pins the runner's deferral mechanics alone.
+    """
+    model = make_fake_spec_model(
+        accept_modes=(ACCEPT_MODE_FUSED_SAMPLE,), fused_extra_tokens=2
+    )()
+    runner = _runner(model)
+    runner._spec_accept_modes = (ACCEPT_MODE_FUSED_SAMPLE,)
+    runner._spec_drafts_from_model = True
+    runner._spec_method = "custom_class"
+    _admit(runner, ("a", 11))
+    last, _ = _tail(runner, "a")
+    before = int(runner.input_batch.num_tokens[0])
+
+    first = _submit_step(runner, "a", drafts=_reservation(runner, "a"))
+    first_output = first.get_output()
+    # Published, not yet applied: the commit waits for the engine thread.
+    assert int(runner.input_batch.num_tokens[0]) == before
+    _drain(runner, "a")
+    assert int(runner.input_batch.num_tokens[0]) == before + 3
+    # A one-position reservation: one draft of the published proposal.
+    second = _submit_step(runner, "a", drafts={"a": [PLACEHOLDER_TOKEN_ID]})
+    second_output = second.get_output()
+    _drain(runner, "a")
+
+    committed = first_output.sampled_token_ids[0] + second_output.sampled_token_ids[0]
+    assert len(first_output.sampled_token_ids[0]) == 3
+    assert len(second_output.sampled_token_ids[0]) == DRAFT_LEN + 1
+    assert committed == [(last + 1 + i) % TARGET_VOCAB_SIZE for i in range(7)]
+    assert runner.requests["a"].output_token_ids == committed
+    assert [call["spec_mode"] for call in model.verify_calls] == [
+        ACCEPT_MODE_FUSED_SAMPLE
+    ] * 2
+    assert [int(call["num_valid_drafts"][0]) for call in model.verify_calls] == [0, 1]
+    assert int(model.verify_calls[1]["accepted_counts"][0]) == 3
+    assert runner._req_accepted_counts["a"] == DRAFT_LEN + 1
 
 
 def test_a_placeholder_is_never_verified_as_a_draft():

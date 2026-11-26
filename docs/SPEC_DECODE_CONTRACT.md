@@ -26,10 +26,17 @@ serve speculative decoding within the following execution limits:
   proposing on device through `propose_draft_tokens`. Every other method vLLM
   knows is refused at configuration time rather than admitted to draft
   nothing.
-- two accept modes, **`argmax_ids`** and **`logits`**, chosen per step from
-  what the model declares (section 4h). A plan must offer at least one of
-  them; `fused_sample` has no runner path. An ordinary narrow decode does not
-  send `spec_mode`.
+- three accept modes, **`argmax_ids`**, **`logits`** and **`fused_sample`**,
+  chosen per step from what the model declares (section 4h). A plan must
+  offer at least one of them. `fused_sample` stands in for `argmax_ids` on a
+  model that offers it: it certifies the same rows, and the runner takes the
+  device's committed ids as the walk's result, so a model may commit more
+  tokens per call than the drafts it was sent (several device steps per
+  call), at most the block's `1 + effective_k` columns. Section 4f states
+  the KV the scheduler reserves for such a call, what a commit past the
+  drafts does to vLLM's counters, and why such a plan is served with
+  synchronous scheduling only. An ordinary narrow decode does not send
+  `spec_mode`.
 - **speculation for every admitted request, on a model serving `logits`.** The
   runner rejection-samples each verify row on the host against the target
   distribution under the row's own temperature, top-k, top-p, presence,
@@ -88,9 +95,8 @@ exception does not raise: on a model that does not serve `logits` but declares
 and keep every step they are part of an ordinary decode, which uses the
 selected model's normal sampling path (section 4d). Separately, `TTPlatform`
 can disable async scheduling when `supports_async_decode` is absent (section
-4c). `fused_sample`, use of `DraftOutput.draft_scores` and a scheduler-owned
-paged drafter cache each need their own execution path before the matching
-refusal can go.
+4c). Use of `DraftOutput.draft_scores` and a scheduler-owned paged drafter
+cache each need their own execution path before the matching refusal can go.
 
 The plugin's `logits` path is validated against tt-metal's
 `DummySpecDecodeModel` (host tests in `tests/spec/`, server tests in
@@ -228,9 +234,18 @@ when it cannot. It must not raise, and it must not return anything else.
 model that can serve less returns a lower value and a model that can serve
 nothing returns `SpecReject`. `drafter_state` must not be `paged`, which needs
 a scheduler-owned drafter cache the plugin does not yet allocate.
-`accept_modes` must include `argmax_ids` or `logits`, the return formats the
-runner executes. A model may also declare `fused_sample`, but that declaration
-enables no execution path. Declaring `logits` enables sampled speculation for
+`accept_modes` must include `argmax_ids`, `logits` or `fused_sample`, the
+return formats the runner executes. A `fused_sample` verify returns
+`accepted_token_ids` `[B, 1+K]` (each row's committed prefix, its tail padded
+with `PLACEHOLDER_TOKEN_ID`; every submitted row, each committing at least its
+column 0, a padding row included, and at least one and at most `1+K` columns)
+and `accepted_counts` `[B]` in `[1, 1+K]`, which must agree;
+the runner refuses an answer that breaks any of these, and commits the
+prefixes as they are, under the certification rules
+of `argmax_ids`. The runner reads both on the host as soon as `decode_forward`
+returns, before any `read_decode_output`, so they are host tensors even on a
+`read_from_device=False` call: the commit is complete when the verify
+returns. Declaring `logits` enables sampled speculation for
 every request admission lets through (section 4h); declaring both lets a greedy
 step keep the smaller `argmax_ids` readback. A non-empty `k_by_rows` must reach
 `max_num_seqs`: its last `max_rows` must be at least `max_num_seqs`, so that
@@ -531,6 +546,10 @@ these checks in this order:
 3. `TTPlatform` also requires `supports_spec_decode` and an admissible
    `SpecPlan`. Both async declarations are necessary for the combined path,
    but do not replace the other admission checks.
+4. `TTPlatform` refuses a `SpecPlan` that offers `fused_sample` while async
+   scheduling is enabled, whatever else the plan offers (section 4f). The
+   model can leave `fused_sample` out of `accept_modes` when
+   `vllm_config.scheduler_config.async_scheduling` is set.
 
 `_install_tt_async_spec_method_patch` admits `custom_class` through the upstream
 async method check before platform validation. TT plugin bootstrap installs
@@ -925,6 +944,49 @@ is no capability key for a proposal write extent and `SpecPlan` has no field
 for one. An adapter in that position raises it with the plugin owner before it
 is admitted, because nothing detects the overrun at run time.
 
+**A `fused_sample` call that commits past its drafts.** On a `custom_class`
+launch the reservation is `effective_k + 1` positions past the step's own
+`1 + d` tokens, where `d` is the drafts the scheduler scheduled for the row
+(its `num_valid_drafts`). With column 0 at position `p`, the allocation ends at
+position `p + d + effective_k + 1`. A call that chains device steps writes K/V
+for every chained verify block and for the drafts its last step proposes, and
+every one of those writes must land at or below that position; nothing checks
+it at run time. Committing at most the block's `1 + effective_k` tokens and
+then proposing at most `d` drafts is enough. The GLM-5.3-Flash stack adapter
+with `GLM53_SPEC_STEPS_PER_CALL=M` fits that way: its drafter offers its `K`
+device drafts, so `d = K`, while its `effective_k` is `M (K + 1) - 1`, and its
+chain of at most `M` steps writes through `p + effective_k + K`, one position
+short of the end. It also shortens the chain where the row's page table stops.
+An `ngram` launch reserves nothing past the step's own `1 + d` tokens, so there
+a `fused_sample` verify may commit at most `1 + d` tokens.
+
+**Synchronous scheduling only.** Asynchronous scheduling schedules a
+request's next step before the previous step's output arrives, from the
+positions that step scheduled. After a commit past the drafts, that queued
+step would start behind the request, and the runner would read the gap as
+prompt and prefill it. `TTPlatform` therefore refuses a plan that offers
+`fused_sample` on an asynchronous launch (section 4c), and
+`TTScheduler._count_commit_past_scheduled_drafts` raises if such a commit
+ever arrives while a later step of the request is scheduled.
+
+**What vLLM's counters show for such a commit.** At schedule time vLLM
+advances `num_computed_tokens`, and through `AsyncScheduler`
+`num_output_placeholders`, by the step's `1 + d` tokens. In
+`update_from_output` it subtracts `num_rejected = d - (c - 1)` from both for a
+row that committed `c` tokens. When `c > d + 1` that is negative, so both
+advance by the whole commit and `num_computed_tokens` ends at
+`num_tokens - 1`, as after any decode. vLLM does this only for a row it
+scheduled drafts for. A row with `d = 0` that commits `c > 1` gets the same
+adjustment from `TTScheduler._count_commit_past_scheduled_drafts`; without it
+the request would hold `c` new tokens against counts advanced by one, and the
+next step would schedule `c - 1` of them again as new input. vLLM's
+speculative-decoding metrics are not corrected: they record `c - 1` accepted
+tokens against `d` drafted ones, so the acceptance rate can read above 100 %
+and per-position acceptance counts land on positions that were never drafted.
+A row with `d = 0` records nothing. `c - 1` never exceeds `effective_k`, the
+bound vLLM asserts. Judge such a model by its committed tokens per step, not by
+vLLM's acceptance rate.
+
 ## 4g. Lifecycle hooks the runner calls on any model that defines them
 
 Three model methods sit outside the per-step contract above but bear on any
@@ -966,9 +1028,11 @@ closed and must not touch the device.
 
 **When the runner asks for it.** `TTModelRunner._spec_mode_for_step` chooses
 per verify step from `SpecPlan.accept_modes` and the step's live rows. A model
-offering only `logits` is always asked for `logits`. A model offering both is
-asked for `argmax_ids` while every live row is certifiable by id equality, and
-for `logits` as soon as one live row is not:
+offering only `logits` is always asked for `logits`. A model offering `logits`
+and an id mode (`argmax_ids`, or `fused_sample`, which certifies the same rows
+and is asked for in its place when offered) is asked for the id mode while
+every live row is certifiable by id equality, and for `logits` as soon as one
+live row is not:
 `TTModelRunner._request_is_argmax_certifiable` is false for a non-zero
 temperature, a penalty, logprobs (including `logprobs=0`), structured output,
 `allowed_token_ids`, `bad_words`, and a `min_tokens` the output has not

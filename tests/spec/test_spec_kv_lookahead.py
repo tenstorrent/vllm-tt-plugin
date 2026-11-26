@@ -26,6 +26,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import torch
 from vllm.config import (
     CacheConfig,
@@ -56,6 +57,7 @@ from vllm_tt_plugin.spec_admission import (
 )
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_FUSED_SAMPLE,
     DRAFTER_STATE_INTERNAL,
     SpecPlan,
 )
@@ -105,24 +107,32 @@ def _stub_model_resolution():
         yield
 
 
-def _plan() -> SpecPlan:
+def _plan(accept_modes: tuple[str, ...]) -> SpecPlan:
     return SpecPlan(
         effective_k=NUM_SPEC_TOKENS,
         lanes_per_request=1,
         extra_bytes_per_seq=0,
         extra_bytes_per_token=0,
-        accept_modes=(ACCEPT_MODE_ARGMAX_IDS,),
+        accept_modes=accept_modes,
         drafter_state=DRAFTER_STATE_INTERNAL,
         supports_narrow_decode=False,
     )
 
 
-def _scheduler(*, admitted: bool) -> TTScheduler:
+def _scheduler(
+    *,
+    admitted: bool,
+    async_budget: int | None = None,
+    accept_modes: tuple[str, ...] = (ACCEPT_MODE_ARGMAX_IDS,),
+) -> TTScheduler:
     """A real TTScheduler over a real KVCacheManager.
 
     ``admitted`` selects only whether a plan is published. The speculative
     flags are identical either way, so a difference in what the allocator
     reserves is attributable to the plan and to nothing else.
+    ``async_budget`` turns on asynchronous scheduling with that per-step token
+    budget, set after the platform hook, which clears asynchronous scheduling
+    for a model that does not declare it.
     """
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -165,7 +175,13 @@ def _scheduler(*, admitted: bool) -> TTScheduler:
         target_parallel_config=config.parallel_config,
     )
     if admitted:
-        store_tt_spec_plan(config, _plan())
+        store_tt_spec_plan(config, _plan(accept_modes))
+    if async_budget is not None:
+        config.scheduler_config.async_scheduling = True
+        config.scheduler_config.enable_chunked_prefill = True
+        config.scheduler_config.max_num_batched_tokens = async_budget
+        # No prefill alignment grid, which a budget this small cannot reach.
+        config.additional_config.setdefault("tt", {})["prefill_chunk_alignment"] = 0
     num_blocks = MAX_MODEL_LEN // BLOCK_SIZE + 2
     cache_config.num_gpu_blocks = num_blocks
     kv_cache_config = KVCacheConfig(
@@ -314,3 +330,94 @@ def test_without_an_admitted_plan_the_crossing_block_is_absent():
         computed + 1 + NUM_SPEC_TOKENS
     )
     assert _allocated_blocks(scheduler, request) == [1]
+
+
+# --- a fused_sample commit past the drafts the step scheduled ---------------
+
+
+@pytest.mark.parametrize("num_drafts", [1, 0])
+def test_a_commit_past_the_scheduled_drafts_keeps_the_counts_whole(num_drafts):
+    """A ``fused_sample`` verify may commit more than a row's ``1 + d`` tokens
+    (several device steps per call). Schedule time advanced
+    ``num_computed_tokens`` and the placeholders by ``1 + d``. vLLM corrects
+    both by ``num_rejected = d - (c - 1)``, negative here, for a row with
+    drafts; ``TTScheduler`` applies the same correction to a row without. Either
+    way the request ends one token short of computed, as after any decode, and
+    the next step schedules one token rather than the commit again."""
+    scheduler = _scheduler(admitted=True)
+    request = _prefilled(scheduler, 20)
+    request.spec_token_ids = DRAFT_IDS[:num_drafts]
+    step = scheduler.schedule()
+    assert step.num_scheduled_tokens == {request.request_id: 1 + num_drafts}
+    drafts = step.scheduled_spec_decode_tokens.get(request.request_id, [])
+    assert drafts == DRAFT_IDS[:num_drafts]
+
+    committed = [901, 902, 903, 904]  # c = 4, past 1 + d
+    outputs = scheduler.update_from_output(
+        step,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[list(committed)],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    assert list(request.output_token_ids) == [7, *committed]
+    assert request.num_computed_tokens == request.num_tokens - 1
+    assert request.num_output_placeholders == 0
+    # vLLM's speculative counters are left as vLLM computes them: 3 accepted
+    # against 1 drafted reads as 300 % acceptance (SPEC_DECODE_CONTRACT.md
+    # section 4f), and a draftless row records nothing.
+    stats = next(iter(outputs.values())).scheduler_stats.spec_decoding_stats
+    if num_drafts:
+        assert (stats.num_draft_tokens, stats.num_accepted_tokens) == (1, 3)
+    else:
+        assert stats is None
+
+    following = scheduler.schedule()
+    assert following.num_scheduled_tokens == {request.request_id: 1}
+
+
+@pytest.mark.parametrize("committed", [[8, 9], [8, 9, 10, 11]])
+def test_a_commit_past_the_drafts_under_a_queued_step_is_refused(committed):
+    """Asynchronous scheduling schedules step B before step A's output.
+
+    A budget of two tokens trims A to its anchor and one of the five draft
+    placeholders, and B is scheduled from A's scheduled positions: at 3, after
+    the one-token prompt, the first output token and A's draft. A commit
+    within A's ``1 + d`` tokens, which every ``argmax_ids`` or ``logits``
+    verify is, leaves B one token short of the request, as after any decode. A
+    ``fused_sample`` commit of four tokens would leave B two positions behind
+    it, and the runner would prefill the gap with speculation reset, so the
+    commit is refused while B is queued. ``TTPlatform`` refuses
+    ``fused_sample`` with asynchronous scheduling, so a launch never gets here
+    (``test_spec_platform_integration``)."""
+    scheduler = _scheduler(
+        admitted=True, async_budget=2, accept_modes=(ACCEPT_MODE_FUSED_SAMPLE,)
+    )
+    request = _prefilled(scheduler, 1)
+    step_a = scheduler.schedule()
+    assert step_a.num_scheduled_tokens == {request.request_id: 2}
+    assert step_a.scheduled_spec_decode_tokens == {request.request_id: [-1]}
+    step_b = scheduler.schedule()
+    assert step_b.num_scheduled_tokens == {request.request_id: 2}
+    assert step_b.scheduled_cached_reqs.num_computed_tokens == [3]
+
+    output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[list(committed)],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    if len(committed) == 2:
+        scheduler.update_from_output(step_a, output)
+        assert list(request.output_token_ids) == [7, *committed]
+        assert request.num_tokens - 1 == 3  # where B was scheduled from
+        return
+    with pytest.raises(RuntimeError, match="already scheduled"):
+        scheduler.update_from_output(step_a, output)

@@ -6,7 +6,8 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -14,7 +15,9 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 import regex as re
 import torch
 import ttnn
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.distributed.kv_transfer import has_kv_transfer_group
+from vllm.forward_context import set_forward_context
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils.math_utils import cdiv, round_up
@@ -27,12 +30,14 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     DraftTokenIds,
+    KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
 )
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
@@ -51,6 +56,7 @@ from vllm_tt_plugin.config import (
     get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
     get_tt_supports_device_grammar,
+    get_tt_supports_prefill_next_token_ids,
     get_tt_supports_stage_inputs,
     get_tt_supports_stage_outputs,
     is_tt_adaptive_block_output_model,
@@ -68,6 +74,7 @@ from vllm_tt_plugin.input_batch import (
     clone_torch_generator,
     drop_unbounded_top_k_top_p,
     log_prefill_chunks,
+    prefill_next_token_ids,
 )
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
@@ -83,6 +90,7 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.pooling import execute_pooling_step, supported_pooling_tasks
 from vllm_tt_plugin.spec_accept import accept_sampled_drafts, spec_sampling_inputs
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_chain import (
@@ -95,6 +103,7 @@ from vllm_tt_plugin.spec_chain import (
 )
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_FUSED_SAMPLE,
     ACCEPT_MODE_LOGITS,
     PLACEHOLDER_TOKEN_ID,
     SPEC_REQUIREMENT_DEVICE_PROPOSE,
@@ -302,7 +311,7 @@ def _notify_model_slot_moves(runner, moves: dict[int, int]) -> None:
 _SUPPORTED_MM_MODALITIES = frozenset({"image", "video", "audio"})
 
 
-class TTModelRunner:
+class TTModelRunner(KVConnectorModelRunnerMixin):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -314,6 +323,8 @@ class TTModelRunner:
         """Set up runner state from the config; ``load_model`` loads the model."""
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
+        # runner="pooling": each request is one prefill whose output is pooled.
+        self.runs_pooling = getattr(self.model_config, "runner_type", None) == "pooling"
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.load_config = vllm_config.load_config
@@ -373,6 +384,11 @@ class TTModelRunner:
         self.trace_mode = trace_mode
         self.enable_model_warmup = enable_model_warmup
         self.supports_stage_inputs = get_tt_supports_stage_inputs(vllm_config)
+        # MODEL_CAPABILITIES.md: a prefill also hands the model each
+        # intermediate row's next prompt token.
+        self.supports_prefill_next_token_ids = get_tt_supports_prefill_next_token_ids(
+            vllm_config
+        )
         self.supports_stage_outputs = get_tt_supports_stage_outputs(vllm_config)
         self.supports_device_grammar = is_tt_device_grammar_preload_eligible(
             vllm_config,
@@ -594,9 +610,11 @@ class TTModelRunner:
 
     def load_model(self) -> None:
         loader = TTModelLoader(self.load_config)
-        self.model = loader.load_model(
-            vllm_config=self.vllm_config, model_config=self.model_config
-        )
+        # As upstream's loader: a model reads the config when it builds its pooler.
+        with set_current_vllm_config(self.vllm_config):
+            self.model = loader.load_model(
+                vllm_config=self.vllm_config, model_config=self.model_config
+            )
         if self.supports_device_grammar:
             activate = getattr(self.model, "enable_device_grammar", None)
             if callable(activate):
@@ -642,8 +660,7 @@ class TTModelRunner:
         return ["generate"]
 
     def get_supported_pooling_tasks(self) -> list[PoolingTask]:
-        # TT backend does not support pooling/embedding tasks yet.
-        return []
+        return supported_pooling_tasks(self.model)
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         tasks = list[SupportedTask]()
@@ -1429,8 +1446,42 @@ class TTModelRunner:
             for req_id, slot in self._req_state_slot.items()
             if req_id not in prefilling and req_id in self.requests
         }
+        # A request mid-prefill keeps the slot recorded for it: a stateful
+        # model (recurrent carries, per-slot chunk cursors) continues from the
+        # state its earlier chunks wrote, and the record follows that state
+        # through any decode gather in between (_decode_state_slot_remap moves
+        # every slot's owner). Reserve those first so a request joining the
+        # batch at a lower row cannot take a continuing request's slot.
+        kept = {
+            req_id: slot
+            for req_id, slot in self._req_state_slot.items()
+            if req_id in prefilling
+        }
+        kept_slots = list(kept.values())
+        # Checked over every live request's record rather than ``held``, a set
+        # that collapses two off-batch holders recorded at one slot into one
+        # entry and would hand the third request a slot as if nothing were
+        # wrong.
+        live_slots = [
+            slot
+            for req_id, slot in self._req_state_slot.items()
+            if req_id in prefilling or req_id in self.requests
+        ]
+        shared = sorted({s for s in live_slots if live_slots.count(s) > 1})
+        if shared:
+            # The map records one live request per slot; two requests on one
+            # slot means it has stopped describing the device, and handing
+            # either a different slot continues it from state it never wrote.
+            raise RuntimeError(
+                f"device state slots {shared} are recorded for more than one live "
+                f"request: prefilling={row_req_ids}, map={self._req_state_slot}"
+            )
+        held.update(kept_slots)
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
+            if req_id in kept:
+                slots.append(kept[req_id])
+                continue
             if row not in held:
                 slot = row
             else:
@@ -1730,15 +1781,28 @@ class TTModelRunner:
         it is not a ``logits`` verify (``_decode_device_sampled``).
         """
         modes = getattr(self, "_spec_accept_modes", ()) or (ACCEPT_MODE_ARGMAX_IDS,)
+        # ``fused_sample`` certifies exactly the rows ``argmax_ids`` does (the
+        # device commits under the same greedy / spec_ids_are_sampled rules),
+        # so it stands in for ``argmax_ids`` wherever that would be chosen, and
+        # a model offering it has asked for it: the device's commit may span
+        # more tokens than the drafts the runner sent.
+        id_mode = (
+            ACCEPT_MODE_FUSED_SAMPLE
+            if ACCEPT_MODE_FUSED_SAMPLE in modes
+            else ACCEPT_MODE_ARGMAX_IDS
+        )
         if ACCEPT_MODE_LOGITS not in modes:
-            return ACCEPT_MODE_ARGMAX_IDS
-        if ACCEPT_MODE_ARGMAX_IDS not in modes:
+            return id_mode
+        if (
+            ACCEPT_MODE_ARGMAX_IDS not in modes
+            and ACCEPT_MODE_FUSED_SAMPLE not in modes
+        ):
             return ACCEPT_MODE_LOGITS
         if all(
             self._request_is_argmax_certifiable(req_id, device_sampled)
             for req_id in row_req_ids
         ):
-            return ACCEPT_MODE_ARGMAX_IDS
+            return id_mode
         return ACCEPT_MODE_LOGITS
 
     def _request_is_argmax_certifiable(
@@ -2604,6 +2668,7 @@ class TTModelRunner:
         )
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
+        next_token_ids: torch.Tensor | None = None
         num_valid_drafts: torch.Tensor | None = None
         accepted_counts: torch.Tensor | None = None
         spec_drafts: torch.Tensor | None = None
@@ -2643,6 +2708,13 @@ class TTModelRunner:
             input_tokens = input_batch.token_ids_cpu_tensor[
                 req_indices, :max_prefill_tokens
             ]
+            if self.supports_prefill_next_token_ids:
+                next_token_ids = prefill_next_token_ids(
+                    input_batch.token_ids_cpu_tensor,
+                    req_indices,
+                    prompt_lens,
+                    intermediate_prefill_mask,
+                )
             decode_layout_changed = False
             self._reset_spec_state_for_prefill(row_req_ids)
             device_sampled = None  # a prefill step decides at its submission
@@ -2976,6 +3048,7 @@ class TTModelRunner:
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
+            prefill_next_token_ids=next_token_ids,
             defer_device_sampling=defer_device_sampling,
             structured_output_req_ids=structured_output_req_ids,
             grammar_row_req_ids=tuple(row_req_ids)
@@ -3457,6 +3530,8 @@ class TTModelRunner:
         DP reaches this entrypoint once per rank, each over its own mesh.
         """
         TTModelRunner._raise_if_device_grammar_poisoned(self)
+        if getattr(self, "runs_pooling", False):
+            return execute_pooling_step(self.model, scheduler_output)
 
         # Single-process lane-DP: the lane scheduler attaches a per-step plan to
         # the scheduler output. When present, the step runs over the merged lane
@@ -3492,6 +3567,12 @@ class TTModelRunner:
             else self.build_model_input(scheduler_output, None, chain=chain)
         )
         if model_input is None:
+            if has_kv_transfer_group():
+                # The KV connector can do loads and saves even
+                # when there is no model input to run this step.
+                return TTModelRunner.kv_connector_no_forward(
+                    scheduler_output, self.vllm_config
+                )
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         is_decode = model_input.prompt_lens is None
@@ -3515,10 +3596,12 @@ class TTModelRunner:
             steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
                 model_input
             )
-            wrapper = self.async_decode.submit_async_decode(
-                model_input,
-                steady_decode_fast_path=steady_decode_fast_path,
-            )
+            with TTModelRunner._kv_connector_step(self, scheduler_output) as kv_out:
+                wrapper = self.async_decode.submit_async_decode(
+                    model_input,
+                    steady_decode_fast_path=steady_decode_fast_path,
+                )
+            wrapper.kv_connector_output = kv_out
             if chain is not None:
                 self.async_decode.complete_chain(chain, wrapper, scheduler_output)
             self._pending_samples.append(
@@ -3533,9 +3616,36 @@ class TTModelRunner:
 
         # Prefill and deferred device sampling submit their forward here;
         # ``sample_tokens`` receives the grammar and chooses readback timing.
-        fwd = self._forward_with_model_input(model_input)
-        self._pending_samples.append(partial(self._finish_front_packed_sync, fwd=fwd))
+        with TTModelRunner._kv_connector_step(self, scheduler_output) as kv_out:
+            fwd = self._forward_with_model_input(model_input)
+        self._pending_samples.append(
+            partial(self._finish_front_packed_sync, fwd=fwd, kv_out=kv_out)
+        )
         return None
+
+    @contextmanager
+    def _kv_connector_step(
+        self, scheduler_output: SchedulerOutput
+    ) -> Generator[KVConnectorOutput | None, None, None]:
+        """Run the KV connector around one prefill or decode forward.
+
+        * Entering the context block starts the connector's KV loads.
+        * Leaving it waits for the connector's KV saves and records which
+          transfers finished in a ``KVConnectorOutput``.
+
+        Yields that ``KVConnectorOutput`` or ``None`` when no connector is configured.
+
+        NOTE: An async decode is still running on device when the block exits,
+        so the KV it writes is not saved.
+        """
+        if not has_kv_transfer_group():
+            yield None
+            return
+        with (
+            set_forward_context(None, self.vllm_config),
+            TTModelRunner.maybe_get_kv_connector_output(scheduler_output) as kv_out,
+        ):
+            yield kv_out
 
     def _reorder_grammar_bitmask(
         self,
@@ -3749,6 +3859,53 @@ class TTModelRunner:
 
         if model_input.spec_mode == ACCEPT_MODE_LOGITS:
             return self._walk_sampled_acceptance(model_input, tt_out)
+        if model_input.spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+            # The device accepted already: its committed ids are the walk's
+            # result, counted to the first placeholder (fused_sample_ids checked
+            # them against the model's counts at the unwrap). The commit may run
+            # past the drafts the runner sent -- a model running several
+            # device steps per call -- up to the block's 1+K columns, which
+            # the scheduler's lookahead reservation (effective_k + 1) covers.
+            from vllm_tt_plugin.async_decode import (
+                fused_sample_counts,
+                refuse_empty_fused_rows,
+            )
+
+            ids = torch.as_tensor(tt_out).to(torch.int64)
+            if model_input.max_num_logprobs[0] is not None:
+                raise RuntimeError(
+                    "a fused_sample verify carries a row that asked for "
+                    "logprobs, which ids cannot answer; _spec_mode_for_step "
+                    "asks for logits for such a row"
+                )
+            # Both dimensions against the submitted block: the commit and the
+            # prefixes index the walk by the submitted row layout, so a
+            # missing row would shift every row after it.
+            rows, width = (int(size) for size in model_input.input_tokens.shape)
+            if (
+                ids.dim() != 2
+                or int(ids.shape[0]) != rows
+                or not 1 <= int(ids.shape[1]) <= width
+            ):
+                raise ValueError(
+                    f"a fused_sample verify returns [{rows}, 1..{width}]: one row "
+                    "per submitted row, each committing at least one and at most "
+                    f"the block's {width} columns; got {tuple(ids.shape)}"
+                )
+            counts = fused_sample_counts(ids)
+            # Checked here too: on the asynchronous path the walk reads what
+            # the model's read_decode_output returned, after the unwrap's check.
+            refuse_empty_fused_rows(counts)
+            # Laid out as the argmax walk lays it out: [B, 1+K] at the block's
+            # width, each row's committed prefix followed by placeholders.
+            committed = torch.full(
+                (int(ids.shape[0]), width), PLACEHOLDER_TOKEN_ID, dtype=torch.int64
+            )
+            cols = torch.arange(int(ids.shape[1])).unsqueeze(0)
+            committed[:, : int(ids.shape[1])] = torch.where(
+                cols < counts.unsqueeze(1), ids, committed[:, : int(ids.shape[1])]
+            )
+            return SpecWalk(committed.to(torch.int32), counts.to(torch.int32))
         if model_input.spec_mode != ACCEPT_MODE_ARGMAX_IDS:
             raise NotImplementedError(
                 f"the runner drives no accept walk for spec_mode "
@@ -4098,11 +4255,15 @@ class TTModelRunner:
         return committed_by_req
 
     def _finish_front_packed_sync(
-        self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None
+        self,
+        grammar_output: GrammarOutput | None,
+        *,
+        fwd: _SyncForward | None,
+        kv_out: KVConnectorOutput | None = None,
     ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
         deferred = bool(fwd is not None and fwd.model_input.defer_device_sampling)
         try:
-            return TTModelRunner._finish_front_packed_sync_impl(
+            output = TTModelRunner._finish_front_packed_sync_impl(
                 self,
                 grammar_output,
                 fwd=fwd,
@@ -4111,6 +4272,9 @@ class TTModelRunner:
             if deferred:
                 self._poison_device_grammar()
             raise
+        if kv_out is not None:
+            output.kv_connector_output = kv_out
+        return output
 
     def _finish_front_packed_sync_impl(
         self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None
@@ -4442,6 +4606,8 @@ class TTModelRunner:
                     empty_slots.append(dp_rank * stride + i)
         if empty_slots is not None:
             kwargs["empty_slots"] = list(empty_slots)
+        if model_input.prefill_next_token_ids is not None:
+            kwargs["next_token_ids"] = model_input.prefill_next_token_ids
 
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)

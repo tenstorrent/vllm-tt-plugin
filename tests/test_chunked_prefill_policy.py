@@ -89,15 +89,17 @@ def test_llm_class_default_budget_is_kept():
 
 
 @pytest.mark.parametrize(
-    ("max_num_scheduled_tokens", "expected", "limit_source"),
+    ("max_num_scheduled_tokens", "expected", "limit"),
     [
-        (None, None, "max_num_batched_tokens"),
-        (2048, 16384, "max_num_scheduled_tokens"),
-        (32768, 32768, "max_num_scheduled_tokens"),
+        (None, None, (16384, "max_num_batched_tokens")),
+        (2048, 16384, (16384, "max_num_scheduled_tokens")),
+        # vLLM also caps a request at max_num_batched_tokens, so a larger
+        # max_num_scheduled_tokens does not raise the per-request limit.
+        (32768, 32768, (16384, "max_num_batched_tokens")),
     ],
 )
 def test_undeclared_model_loses_chunked_prefill_and_gets_a_full_prompt_budget(
-    max_num_scheduled_tokens, expected, limit_source
+    max_num_scheduled_tokens, expected, limit
 ):
     config = _vllm_config(max_num_scheduled_tokens=max_num_scheduled_tokens)
 
@@ -107,10 +109,7 @@ def test_undeclared_model_loses_chunked_prefill_and_gets_a_full_prompt_budget(
     assert config.scheduler_config.max_num_batched_tokens == 16384
     assert config.scheduler_config.max_num_scheduled_tokens == expected
     assert config.scheduler_config.long_prefill_token_threshold == 0
-    assert _effective_prefill_step_limit(config.scheduler_config) == (
-        expected or 16384,
-        limit_source,
-    )
+    assert _effective_prefill_step_limit(config.scheduler_config) == limit
 
 
 def test_model_without_any_capabilities_loses_chunked_prefill():
