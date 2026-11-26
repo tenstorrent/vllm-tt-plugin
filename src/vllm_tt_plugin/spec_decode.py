@@ -25,7 +25,7 @@ the fields a verify return must carry for it.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     import torch
@@ -384,6 +384,78 @@ class DraftOutput:
     draft_scores: "torch.Tensor | None" = None
 
 
+class SpecLogprobs(NamedTuple):
+    """The logprobs payload of an ``argmax_ids`` verify, per row and column.
+
+    A model declaring ``supports_spec_device_logprobs`` returns one for every
+    ``argmax_ids`` verify it is sent ``spec_num_logprobs`` with. Column ``t``
+    of row ``r`` describes the token ``argmax_ids[r, t]``, which is the token
+    the id walk commits at that column, so the payload covers every committed
+    token whatever count the walk reaches. All values are raw: the verify's
+    own logits, before temperature, top-k, top-p and penalties (vLLM
+    ``logprobs_mode`` ``raw_logprobs``).
+
+    A named tuple, so a deferred read can return it as the second element of
+    ``(ids, payload)`` and the runner's host-output checks accept it.
+
+    Attributes
+    ----------
+    sampled_logprobs : torch.Tensor
+        ``[B, 1+K]`` float32, the natural-log probability of
+        ``argmax_ids[r, t]`` under the whole vocabulary.
+    selected_token_ranks : torch.Tensor
+        ``[B, 1+K]`` int32, the number of vocabulary tokens whose logit is at
+        or above that token's own, ties included.
+    top_logprobs : torch.Tensor
+        ``[B, 1+K, N]`` float32, the ``N >= MAX_SPEC_DEVICE_LOGPROBS``
+        largest logprobs of the column, in descending order.
+    top_token_ids : torch.Tensor
+        ``[B, 1+K, N]`` int32, the token ids of ``top_logprobs``.
+    """
+
+    sampled_logprobs: "torch.Tensor"
+    selected_token_ranks: "torch.Tensor"
+    top_logprobs: "torch.Tensor"
+    top_token_ids: "torch.Tensor"
+
+
+# The most top logprobs a SpecLogprobs payload answers, and so the largest
+# request ``logprobs`` an argmax_ids verify serves: OpenAI's limit.
+MAX_SPEC_DEVICE_LOGPROBS = 20
+
+
+def check_spec_logprobs(payload: object, rows: int, width: int) -> SpecLogprobs:
+    """Return ``payload`` when it is a ``SpecLogprobs`` of a ``[rows, width]``
+    block, else raise ``ValueError`` naming what differs.
+
+    Checked where the walk reads it rather than trusted, because a payload of
+    another block shape would attach one row's logprobs to another row's
+    tokens without any later error.
+    """
+    if not isinstance(payload, SpecLogprobs):
+        raise ValueError(
+            "an argmax_ids verify sent spec_num_logprobs returns a SpecLogprobs "
+            f"payload with its ids, got {type(payload).__name__}"
+        )
+    shapes = {name: tuple(value.shape) for name, value in payload._asdict().items()}
+    per_column = (shapes["sampled_logprobs"], shapes["selected_token_ranks"])
+    top = (shapes["top_logprobs"], shapes["top_token_ids"])
+    if (
+        any(shape != (rows, width) for shape in per_column)
+        or top[0] != top[1]
+        or len(top[0]) != 3
+        or top[0][:2] != (rows, width)
+        or top[0][2] < MAX_SPEC_DEVICE_LOGPROBS
+    ):
+        raise ValueError(
+            f"a SpecLogprobs payload of a [{rows}, {width}] verify block has "
+            f"[{rows}, {width}] sampled_logprobs and selected_token_ranks and "
+            f"[{rows}, {width}, N >= {MAX_SPEC_DEVICE_LOGPROBS}] top_logprobs "
+            f"and top_token_ids; got {shapes}"
+        )
+    return payload
+
+
 @dataclass(frozen=True)
 class VerifyOutput:
     """What one verify call returns, and the mode that says which fields apply.
@@ -391,6 +463,11 @@ class VerifyOutput:
     The mode-to-field pairing is enforced rather than documented because a
     return that carries the wrong field for its mode fails later, inside the
     accept walk, where the cause is no longer visible.
+
+    ``logprobs`` is the ``SpecLogprobs`` payload of an ``argmax_ids`` verify
+    that was sent ``spec_num_logprobs`` and returns host ids. A verify that
+    returns its ids unread (``read_from_device=False``) leaves it ``None`` and
+    returns the payload from its read instead, as ``(ids, payload)``.
     """
 
     spec_mode: str
@@ -409,6 +486,8 @@ class VerifyOutput:
     # handed back to propose_draft_tokens uninterpreted. None when the model
     # retains it on device.
     hidden: HiddenHandle = None
+    # The SpecLogprobs payload of a host argmax_ids answer to spec_num_logprobs.
+    logprobs: SpecLogprobs | None = None
 
     def __post_init__(self) -> None:
         required = MODE_REQUIRED_FIELDS.get(self.spec_mode)
@@ -614,10 +693,13 @@ __all__ = [
     "MODE_REQUIRED_FIELDS",
     "PLACEHOLDER_TOKEN_ID",
     "HiddenHandle",
+    "MAX_SPEC_DEVICE_LOGPROBS",
+    "SpecLogprobs",
     "SpecPlan",
     "SpecReject",
     "VerifyOutput",
     "accept_greedy_drafts",
+    "check_spec_logprobs",
     "check_spec_side_tensors",
     "normalize_declared_values",
 ]

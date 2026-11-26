@@ -78,8 +78,10 @@ from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     DRAFTER_STATE_INTERNAL,
+    MAX_SPEC_DEVICE_LOGPROBS,
     PLACEHOLDER_TOKEN_ID,
     DraftOutput,
+    SpecLogprobs,
     SpecPlan,
     VerifyOutput,
 )
@@ -149,12 +151,38 @@ def _draw(prefix: list[int], device_seed: int) -> int:
     return FIRST_ID + (token - FIRST_ID + 1 + device_seed % 7) % (VOCAB - FIRST_ID)
 
 
-class _Answer:
-    """A verify's deferred ``argmax_ids``: the ids, and how often the host read them."""
+def _device_logprob(prefix: list[int], token: int) -> float:
+    """The raw logprob the device reports for ``token`` after ``prefix``
+    (``supports_spec_device_logprobs``): a function of both, so a published
+    logprob is checkable against the token history alone. Never 0, which
+    is what the host sampler reports on this harness's one-hot logits."""
+    return -float(1 + (7 * sum(prefix[-4:]) + 3 * len(prefix) + token) % 61) / 8.0
 
-    def __init__(self, ids: torch.Tensor, record: SimpleNamespace):
+
+def _device_rank(prefix: list[int], token: int) -> int:
+    return 1 + (len(prefix) + token) % 5
+
+
+def _device_top(prefix: list[int]) -> tuple[list[int], list[float]]:
+    """The top ``MAX_SPEC_DEVICE_LOGPROBS`` ids and logprobs after ``prefix``."""
+    first = (sum(prefix[-3:]) + len(prefix)) % VOCAB
+    ids = [(first + i) % VOCAB for i in range(MAX_SPEC_DEVICE_LOGPROBS)]
+    return ids, [-0.25 * i - (len(prefix) % 3) for i in range(MAX_SPEC_DEVICE_LOGPROBS)]
+
+
+class _Answer:
+    """A verify's deferred ``argmax_ids``: the ids, and how often the host read
+    them; with ``payload`` the ``SpecLogprobs`` the read returns with them."""
+
+    def __init__(
+        self,
+        ids: torch.Tensor,
+        record: SimpleNamespace,
+        payload: SpecLogprobs | None = None,
+    ):
         self.ids = ids
         self.record = record
+        self.payload = payload
         self.reads = 0
 
 
@@ -402,6 +430,8 @@ class _LedgerDevice:
             sampled=[self._draws(row, sampling) for row in range(len(live))],
             chained=predecessor is not None,
             followed=False,
+            # row -> the token history before each verified column's token.
+            prefixes={},
         )
         self.records.append(record)
         for row, req_id in enumerate(live):
@@ -463,8 +493,42 @@ class _LedgerDevice:
         self._run_rows(mamba_state, rows)
         self.steps.append(record)
         return VerifyOutput(
-            spec_mode=ACCEPT_MODE_ARGMAX_IDS, argmax_ids=_Answer(ids, record)
+            spec_mode=ACCEPT_MODE_ARGMAX_IDS,
+            argmax_ids=_Answer(ids, record, self._payload(live, record, kwargs)),
         )
+
+    def _payload(self, live, record, kwargs) -> SpecLogprobs | None:
+        """The ``SpecLogprobs`` of a verify sent ``spec_num_logprobs``, which
+        the runner sends exactly when this device declares
+        ``supports_spec_device_logprobs`` and a live row asks for logprobs."""
+        asked = [self.h.requests[r].sampling_params.logprobs for r in live]
+        sent = kwargs.get("spec_num_logprobs")
+        declared = self.model_capabilities.get("supports_spec_device_logprobs")
+        if not declared or all(n is None for n in asked):
+            assert sent is None, sent
+            return None
+        rows = int(record.ids.shape[0])
+        expected = [-2 if n is None else n for n in asked] + [-2] * (rows - len(live))
+        assert sent.dtype == torch.int32 and sent.tolist() == expected, (
+            sent,
+            expected,
+        )
+        n = MAX_SPEC_DEVICE_LOGPROBS
+        payload = SpecLogprobs(
+            torch.zeros(rows, T),
+            torch.zeros(rows, T, dtype=torch.int32),
+            torch.zeros(rows, T, n),
+            torch.zeros(rows, T, n, dtype=torch.int32),
+        )
+        for row, prefixes in record.prefixes.items():
+            for t, prefix in enumerate(prefixes):
+                token = int(record.ids[row, t])
+                payload.sampled_logprobs[row, t] = _device_logprob(prefix, token)
+                payload.selected_token_ranks[row, t] = _device_rank(prefix, token)
+                top_ids, top_logprobs = _device_top(prefix)
+                payload.top_token_ids[row, t] = torch.tensor(top_ids)
+                payload.top_logprobs[row, t] = torch.tensor(top_logprobs)
+        return payload
 
     def _verify_row(self, row, req_id, p0, block, starts, ids, record, rows, sampling):
         truth = self.truth[req_id]
@@ -476,6 +540,7 @@ class _LedgerDevice:
                 if t <= nv
                 else PLACEHOLDER_TOKEN_ID
             )
+        record.prefixes[row] = [prefix + block[: t + 1] for t in range(nv + 1)]
         count = 1
         while count <= nv and block[count] == int(ids[row, count - 1]):
             count += 1
@@ -509,6 +574,8 @@ class _LedgerDevice:
         if not isinstance(tt_out, _Answer):
             raise AssertionError(f"nothing deferred to read: {type(tt_out).__name__}")
         tt_out.reads += 1
+        if tt_out.payload is not None:
+            return tt_out.ids, tt_out.payload
         return tt_out.ids
 
     def propose_draft_tokens(
@@ -553,6 +620,7 @@ class _AsyncHarness:
         device_sampling: bool = False,
         sampled_ids: bool = False,
         prefill_over_pending: bool = False,
+        device_logprobs: bool = False,
     ):
         cfg = _vllm_config(mode)
         cfg.model_config.max_model_len = MAX_MODEL_LEN
@@ -608,6 +676,8 @@ class _AsyncHarness:
                 max_device_top_k=MAX_DEVICE_TOP_K,
                 supports_device_penalties=False,
             )
+        if device_logprobs:
+            self.device.model_capabilities["supports_spec_device_logprobs"] = True
         if prefill_over_pending:
             # As TTPlatform stores the validated declaration for the scheduler.
             self.device.model_capabilities["supports_prefill_over_pending_spec"] = True
@@ -1457,3 +1527,165 @@ def test_a_sampled_device_count_unequal_to_the_walk_raises_before_its_step_is_se
     for req_id, request in h.requests.items():
         tokens = list(request.output_token_ids)
         assert tokens == reference.outputs[req_id][: len(tokens)], req_id
+
+
+def _collect_logprobs(h: _AsyncHarness) -> dict[str, list[tuple]]:
+    """Wrap the harness's update to collect, per request, each published
+    token with its logprob row: ``(prefix, token, ids, logprobs, rank)``,
+    ``prefix`` the request's token history before the token."""
+    published: dict[str, list[tuple]] = {}
+    update = h._update
+
+    def collect(scheduler_output, output):
+        resolved = output.get_output() if hasattr(output, "get_output") else output
+        lists = resolved.logprobs
+        for index, req_id in enumerate(resolved.req_ids):
+            tokens = resolved.sampled_token_ids[index]
+            request = h.requests[req_id]
+            if lists is None or request.sampling_params.logprobs is None:
+                continue
+            rows = lists.slice_request(index, len(tokens))
+            history = list(request.all_token_ids)
+            for j, token in enumerate(tokens):
+                published.setdefault(req_id, []).append(
+                    (
+                        history + list(tokens[:j]),
+                        int(token),
+                        [int(i) for i in rows.logprob_token_ids[j]],
+                        [float(v) for v in rows.logprobs[j]],
+                        int(rows.sampled_token_ranks[j]),
+                    )
+                )
+        update(scheduler_output, resolved)
+
+    h._update = collect
+    return published
+
+
+@pytest.mark.parametrize("mode", ["none", "align"])
+def test_a_verify_payload_serves_logprobs_rows_and_they_chain(mode):
+    """On a device declaring ``supports_spec_device_logprobs`` a request with
+    logprobs 0 to 20 is certifiable by the id walk: greedy, and sampled on a
+    device-sampled step, which a verify stays on although this one-device
+    launch keeps the device sampler's own logprobs on the host. Its steps are
+    ``argmax_ids`` verifies sent ``spec_num_logprobs`` (the device checks the
+    rows it was sent), they chain like any other row, and every token a verify
+    commits is published with the payload's logprob, rank and top ids at its
+    column. Ordinary decodes (prompt ends, declined drafts) sample those rows
+    on the host, whose logits give logprob 0."""
+    h = _AsyncHarness(
+        SAMPLED_BLOCKS,
+        mode=mode,
+        asynchronous=True,
+        chained=True,
+        sampled_ids=True,
+        device_logprobs=True,
+    )
+    h.add("g0", 1019, max_tokens=24)
+    h.add("l0", 1022, max_tokens=24, logprobs=0)
+    h.add("l5", 2045, max_tokens=24, logprobs=5)
+    h.add("s3", 900, max_tokens=24, temperature=0.8, top_k=5, seed=7, logprobs=3)
+    h.add("s20", 1500, max_tokens=24, temperature=1.0, top_k=5, logprobs=20)
+    h.device.decline = lambda req_id, truth: len(truth) % 7 == 3
+    published = _collect_logprobs(h)
+    h.run()
+
+    controller = h.runner.async_decode
+    assert controller._chain_drains["sampling"] == 0
+    chained = {
+        req_id
+        for record in h.device.records
+        if record.chained
+        for req_id in record.rows
+    }
+    assert {"l0", "l5", "s3", "s20"} <= chained
+    for req_id, asked in (("l0", 0), ("l5", 5), ("s3", 3), ("s20", 20)):
+        # The runner publishes a verify's whole commit; vLLM cuts it at
+        # max_tokens afterwards.
+        entries = published[req_id]
+        assert len(entries) >= 24, req_id
+        from_device = 0
+        for prefix, token, ids, logprobs, rank in entries:
+            assert ids[0] == token, (req_id, ids)
+            assert len(ids) >= asked + 1, (req_id, ids)
+            if logprobs[0] == 0.0:
+                continue  # the host sampler's, on an ordinary decode
+            from_device += 1
+            assert logprobs[0] == pytest.approx(_device_logprob(prefix, token))
+            assert rank == _device_rank(prefix, token)
+            top_ids, top_logprobs = _device_top(prefix)
+            n = len(ids) - 1
+            assert ids[1:] == top_ids[:n], req_id
+            assert logprobs[1:] == pytest.approx(top_logprobs[:n]), req_id
+        assert from_device >= 16, (req_id, from_device)
+    reference = _AsyncHarness(
+        SAMPLED_BLOCKS, mode=mode, asynchronous=False, sampled_ids=True
+    )
+    reference.add("g0", 1019, max_tokens=24)
+    reference.add("l0", 1022, max_tokens=24)
+    reference.add("l5", 2045, max_tokens=24)
+    reference.run()
+    for req_id in ("g0", "l0", "l5"):
+        assert h.outputs[req_id] == reference.outputs[req_id], req_id
+
+
+@pytest.mark.parametrize(
+    "logprobs, extra",
+    [
+        # More than the payload holds.
+        (21, {}),
+        # Every token of the vocabulary.
+        (-1, {}),
+    ],
+)
+def test_a_logprobs_request_the_payload_cannot_serve_stays_uncertifiable(
+    logprobs, extra
+):
+    """A request whose logprobs the payload does not hold is not certifiable
+    by the id walk even on a device declaring the capability: on this launch,
+    which offers ``argmax_ids`` only, it is offered no drafts and its steps
+    are ordinary decodes sampled on the host."""
+    h = _AsyncHarness(
+        SAMPLED_BLOCKS,
+        mode="none",
+        asynchronous=True,
+        chained=True,
+        sampled_ids=True,
+        device_logprobs=True,
+    )
+    h.add("g0", 1019, max_tokens=16)
+    h.add("x", 800, max_tokens=12, logprobs=logprobs, **extra)
+    verified: list[list[str]] = []
+    verify = h.device._verify
+
+    def record_verify(live, tokens, start_pos, mamba_state, kwargs):
+        verified.append(list(live))
+        return verify(live, tokens, start_pos, mamba_state, kwargs)
+
+    h.device._verify = record_verify
+    h.run()
+    assert not any("x" in rows for rows in verified)
+    assert len(h.outputs["x"]) == 12
+
+
+def test_a_host_sampled_verify_returns_the_payload_of_its_greedy_rows():
+    """On a launch that samples nothing on the device a greedy logprobs row
+    is still certifiable: its verify samples on the host and its read
+    returns ``(ids, payload)``, from which the walk publishes the logprobs."""
+    h = _AsyncHarness(48, mode="none", asynchronous=True, chained=True)
+    h.device.model_capabilities["supports_spec_device_logprobs"] = True
+    h.add("g0", 1019, max_tokens=16)
+    h.add("l2", 1022, max_tokens=16, logprobs=2)
+    published = _collect_logprobs(h)
+    h.run()
+
+    assert h.runner.sample_on_device_mode is None
+    assert any("l2" in r.rows for r in h.device.records if r.chained)
+    from_device = [
+        (prefix, token, logprobs[0])
+        for prefix, token, _ids, logprobs, _rank in published["l2"]
+        if logprobs[0] != 0.0
+    ]
+    assert len(from_device) >= 10
+    for prefix, token, value in from_device:
+        assert value == pytest.approx(_device_logprob(prefix, token))

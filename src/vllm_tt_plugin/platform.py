@@ -56,6 +56,7 @@ from vllm_tt_plugin.spec_admission import (
     resolve_speculative_plan,
     validate_chained_spec_verify,
     validate_prefill_over_pending_spec,
+    validate_spec_device_logprobs,
 )
 from vllm_tt_plugin.spec_decode import ACCEPT_MODE_FUSED_SAMPLE, ACCEPT_MODE_LOGITS
 from vllm_tt_plugin.utils.dp_discovery import (
@@ -2639,6 +2640,7 @@ class TTPlatform(Platform):
             vllm_config.scheduler_config.async_scheduling = False
 
         validate_chained_spec_verify(model_capabilities, model_class.__name__)
+        validate_spec_device_logprobs(model_capabilities, model_class.__name__)
         store_tt_prefill_over_pending_spec(
             vllm_config,
             validate_prefill_over_pending_spec(

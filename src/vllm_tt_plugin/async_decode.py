@@ -20,11 +20,12 @@ from vllm.v1.outputs import (
 
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 from vllm_tt_plugin.logger import init_tt_logger
-from vllm_tt_plugin.model_input import TTCompactedHostLogits
+from vllm_tt_plugin.model_input import TTCompactedHostLogits, spec_verify_num_logprobs
 from vllm_tt_plugin.scheduler import (
     get_tt_forced_reset_discard_counts,
     scheduler_output_has_prefill_work,
 )
+from vllm_tt_plugin.spec_admission import SUPPORTS_SPEC_DEVICE_LOGPROBS
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_FUSED_SAMPLE,
@@ -108,8 +109,11 @@ def fused_sample_ids(verify: VerifyOutput) -> torch.Tensor:
     return ids
 
 
-def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch.Tensor:
+def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> Any:
     """The one tensor a verify's mode returns, unwrapped from ``VerifyOutput``.
+
+    An ``argmax_ids`` answer that carries ``VerifyOutput.logprobs`` unwraps to
+    ``(argmax_ids, logprobs)``, the form a deferred verify's read returns.
 
     A step that sent ``spec_mode`` asked the model to verify a candidate
     block, and a ``VerifyOutput`` is the only answer to that question. A model
@@ -143,6 +147,10 @@ def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch
             "in the mode it was asked for"
         )
     if spec_mode == ACCEPT_MODE_ARGMAX_IDS:
+        # Host ids with their logprobs payload travel as the ``(ids, payload)``
+        # pair a deferred verify's read returns, so one split serves both.
+        if tt_out.logprobs is not None:
+            return (tt_out.argmax_ids, tt_out.logprobs)
         return tt_out.argmax_ids
     if spec_mode == ACCEPT_MODE_LOGITS:
         return tt_out.logits
@@ -1308,7 +1316,9 @@ class TTAsyncDecodeController:
                 context=context,
                 completion_time_ns=time.perf_counter_ns(),
             )
-        walk = self.runner.walk_spec_acceptance(model_input, finalized.tt_out)
+        walk = self.runner.walk_spec_acceptance(
+            model_input, finalized.tt_out, finalized.tt_log_probs
+        )
         prefixes = self.runner.spec_committed_prefixes(
             model_input, walk.committed, walk.counts
         )
@@ -1627,6 +1637,15 @@ class TTAsyncDecodeController:
         spec_predecessor = getattr(model_input, "spec_predecessor", None)
         if spec_predecessor is not None:
             kwargs["spec_predecessor"] = spec_predecessor
+        # An argmax_ids verify carries a live row that asks for logprobs only
+        # on a model declaring supports_spec_device_logprobs: on any other,
+        # such a row makes the step a logits verify.
+        if (getattr(runner.model, "model_capabilities", None) or {}).get(
+            SUPPORTS_SPEC_DEVICE_LOGPROBS, False
+        ) is True:
+            spec_num_logprobs = spec_verify_num_logprobs(model_input)
+            if spec_num_logprobs is not None:
+                kwargs["spec_num_logprobs"] = spec_num_logprobs
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (
@@ -1999,7 +2018,11 @@ class TTAsyncDecodeController:
 
         tt_log_probs = None
         assert isinstance(submission.sampling_params.enable_log_probs, torch.Tensor)
-        if (
+        if submission.verify_output is not None and isinstance(tt_out, tuple):
+            # An argmax_ids verify's ids with its SpecLogprobs payload, on a
+            # device-sampled step or not.
+            tt_out, tt_log_probs = tt_out
+        elif (
             submission.perform_device_sampling
             and submission.sampling_params.enable_log_probs.any()
         ):

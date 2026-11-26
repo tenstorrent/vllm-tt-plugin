@@ -121,6 +121,7 @@ launches without `speculative_config`.
 | `spec_ids_are_sampled` | `False` | On a device-sampled step an `argmax_ids` verify returns the device sampler's draws: for a drafted row one draw per candidate column under the row's own temperature, top-k, top-p and seed, for an undrafted row the plain decode's own draw. The id walk is then exact rejection sampling against the drafts, so a sampled request is speculable on such a step (a penalised one stays plain: the draws carry no penalty history). On a model that serves both modes the device draws take precedence over the host `logits` walk on a device-sampled step: `_spec_mode_for_step` picks `argmax_ids` where it picked `logits` before (section 4d, rule 2). Greedy rows stay the target argmax; a host-sampled step certifies nothing it did not before. |
 | `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
 | `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. |
+| `supports_spec_device_logprobs` | `False` | An `argmax_ids` verify sent `spec_num_logprobs` returns a `SpecLogprobs` payload with its ids, so a request with `logprobs` 0 to 20 stays on `argmax_ids` verifies and chains: see section 4j. |
 
 A model never names a vLLM speculative method. The plugin owns the mapping from
 a method name to the requirements that method places on the model, so a new
@@ -373,6 +374,7 @@ third shape, and section 4d explains which steps take which.
 | `accepted_counts` | `[B]` int32 | `[B]` int32 while a live row has an unresolved commit, otherwise absent |
 | `spec_mode` | present | absent |
 | `sampling_params` | present only on an `argmax_ids` verify of a launch that samples on device; absent on a `logits` verify | present when the step samples on device |
+| `spec_num_logprobs` | `[B]` int32, present only on an `argmax_ids` verify of a model declaring `supports_spec_device_logprobs` whose live rows ask for logprobs (section 4j) | absent |
 | return | `VerifyOutput` in the requested `spec_mode`: `argmax_ids` `[B, 1+K]` or `logits` `[B, 1+K, V]` | whatever this model's decode already returns |
 
 `TTModelInput.draft_token_ids` is a separate `[B, K]` tensor retained by the
@@ -1242,8 +1244,9 @@ sampled request is built over it.
 **Precedence over `logits`.** On a model serving both accept modes, a
 device-sampled step verifies in `argmax_ids` where section 4h chose `logits`
 for a sampled row before; the host `logits` walk remains the mode for the
-controls the device draws do not carry (penalties, logprobs, grammars, token
-filters) and for host-sampled steps.
+controls the device draws do not carry (penalties, logprobs the verify does
+not return under section 4j, grammars, token filters) and for host-sampled
+steps.
 
 **Chained verifies.** On a model that also declares
 `supports_chained_spec_verify`, a sampled row chains like a greedy row when
@@ -1265,6 +1268,62 @@ a host-sampled step that verify would commit the target argmax, and the
 runner cannot promise every step samples on the device. The capability lifts
 the temperature rule for draft publication and the per-step mode, not for
 admission.
+
+## 4j. Logprobs from an `argmax_ids` verify: `supports_spec_device_logprobs`
+
+Approved by the submitter on 2026-11-26. Default `False`; a model without the
+declaration is served exactly as the sections above state.
+
+**What the model returns.** A model declaring the capability is sent
+`spec_num_logprobs` on every `argmax_ids` verify, chained or not, whose live
+rows ask for logprobs: int32 `[B]`, each live row's request `logprobs` (0 for
+the committed token alone), and `-2` for a live row that asks for none and
+for every padding row. It returns with the verify's ids a `SpecLogprobs`
+payload (`vllm_tt_plugin.spec_decode`), for every row and column `t` of the
+block:
+
+| Field | Shape | Meaning |
+| --- | --- | --- |
+| `sampled_logprobs` | `[B, 1+K]` float32 | Raw natural-log probability of `argmax_ids[row, t]` over the whole vocabulary: the verify's own logits, before temperature, top-k, top-p and penalties (vLLM `logprobs_mode` `raw_logprobs`). |
+| `selected_token_ranks` | `[B, 1+K]` int32 | Number of vocabulary tokens whose logit is at or above that token's own, ties included. |
+| `top_logprobs` | `[B, 1+K, N]` float32 | The `N >= MAX_SPEC_DEVICE_LOGPROBS` (20) largest raw logprobs of the column, descending. |
+| `top_token_ids` | `[B, 1+K, N]` int32 | Their token ids. |
+
+A verify returned unread (`read_from_device=False`) returns the pair
+`(ids, payload)` from `process_decode_output_host` (or its read); one that
+returns host ids sets `VerifyOutput.logprobs`. On a device-sampled step
+`argmax_ids[row, t]` is a sampled row's draw (section 4i), so the payload
+describes the draw.
+
+**Which requests it serves.** `TTModelRunner._spec_serves_logprobs`: a request
+with `logprobs` in `[0, 20]`, no `logprob_token_ids`, on a launch whose
+`logprobs_mode` is `raw_logprobs` and whose plan offers no `fused_sample`.
+Such a request is certifiable by the id walk
+(`_request_is_argmax_certifiable`): a greedy one on any step, a sampled one
+on a device-sampled step of a model declaring `spec_ids_are_sampled`. So
+`_spec_mode_for_step` keeps `argmax_ids` for a step that carries it, the
+proposer offers it drafts, and `spec_chain.plan_chain` chains it instead of
+draining with reason `sampling`. Any other logprobs request keeps the
+`logits` verify of section 4h.
+
+**Device sampling.** `check_perform_device_sampling` keeps a step on the host
+when a row asks for logprobs the device sampler cannot return (a device count
+other than 8 or 32, or top-K logprobs on a model without them). Those rules
+describe the device sampler's own logprobs. For a step that may be an
+`argmax_ids` verify, whose logprobs come from the payload, they do not apply
+when the payload serves every logprobs row of the step
+(`spec_verify=True`); a step that is then built as an ordinary decode
+(section 4d) decides again with them.
+
+**The walk.** The id walk commits `argmax_ids[row, t]` at every committed
+column `t`, so the payload covers every committed token for any accepted
+count. `TTModelRunner._spec_payload_logprobs` checks the payload's shapes
+(`check_spec_logprobs`) and publishes, for each live row's committed columns
+in row order, the token, its logprob and rank, and the first `n` top ids and
+logprobs, `n` the largest `logprobs` of the step's live rows, through
+`build_device_logprobs`; `spec_committed_logprobs` then cuts them to the
+published prefixes as for a `logits` verify. A verify sent
+`spec_num_logprobs` that returns no payload raises.
 
 ## 5. One request, from prefill to release
 

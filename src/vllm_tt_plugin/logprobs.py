@@ -58,7 +58,11 @@ def build_device_logprobs(
         one sampled logprob and its model-reported rank per row. Rank is the
         number of vocabulary scores at or above the sampled score, ties
         included. The attribute form takes precedence over tuple handling,
-        so a named tuple can carry reported ranks.
+        so a named tuple can carry reported ranks. When that object also has
+        ``top_logprobs`` and ``top_token_ids`` tensors of shape ``[B, N]``,
+        each row's ``N`` largest logprobs in descending order and their ids
+        (``spec_decode.SpecLogprobs``, flattened to one row per token), the
+        first ``max_num_logprobs`` of them follow the sampled token.
     sampled_token_ids : torch.Tensor
         Host integer IDs of shape ``[R]`` or ``[R, 1]``, already selected and
         aligned with ``rows``. These IDs are not indexed again.
@@ -67,16 +71,25 @@ def build_device_logprobs(
         dimension. Their order determines the output row order.
     max_num_logprobs : int
         Number of top candidates to include for a top-K payload; see
-        ``build_logprobs_from_topk``. Ignored for sampled-logprob payloads.
+        ``build_logprobs_from_topk``, or for a ranked payload that carries
+        top candidates. Ignored for the other sampled-logprob payloads.
 
     Returns
     -------
     LogprobsTensors
         Top-K packing follows ``build_logprobs_from_topk``. Sampled-logprob
         payloads produce int32 token IDs ``[R, 1]``, float32 natural-log
-        probabilities ``[R, 1]``, and int32 ranks ``[R]``. A bare tensor has
-        unknown rank ``-1``; reported ranks are preserved. The token-ID tensor
-        can share storage with ``sampled_token_ids`` when it is already int32.
+        probabilities ``[R, 1]``, and int32 ranks ``[R]``; a ranked payload
+        with top candidates widens the first two to ``[R, 1 + N]`` for
+        ``N = max_num_logprobs``. A bare tensor has unknown rank ``-1``;
+        reported ranks are preserved. The token-ID tensor can share storage
+        with ``sampled_token_ids`` when it is already int32.
+
+    Raises
+    ------
+    ValueError
+        A ranked payload with top candidates carries fewer than
+        ``max_num_logprobs`` of them.
 
     Examples
     --------
@@ -109,14 +122,29 @@ def build_device_logprobs(
         logprobs, "selected_token_ranks", None
     )
     if reported_ranks is not None:
+        token_ids = sampled_token_ids.reshape(num_rows, 1).to(torch.int32)
+        values = (
+            cast(RankedLogprobs, logprobs)
+            .sampled_logprobs[rows]
+            .reshape(num_rows, 1)
+            .to(torch.float32)
+        )
+        top_logprobs = getattr(logprobs, "top_logprobs", None)
+        if top_logprobs is not None and max_num_logprobs > 0:
+            if max_num_logprobs > top_logprobs.shape[-1]:
+                raise ValueError(
+                    f"max_num_logprobs={max_num_logprobs} exceeds the "
+                    f"{top_logprobs.shape[-1]} top logprobs the payload carries"
+                )
+            top_ids = logprobs.top_token_ids[rows, :max_num_logprobs]
+            token_ids = torch.cat([token_ids, top_ids.to(torch.int32)], dim=1)
+            values = torch.cat(
+                [values, top_logprobs[rows, :max_num_logprobs].to(torch.float32)],
+                dim=1,
+            )
         return LogprobsTensors(
-            logprob_token_ids=sampled_token_ids.reshape(num_rows, 1).to(torch.int32),
-            logprobs=(
-                cast(RankedLogprobs, logprobs)
-                .sampled_logprobs[rows]
-                .reshape(num_rows, 1)
-                .to(torch.float32)
-            ),
+            logprob_token_ids=token_ids,
+            logprobs=values,
             selected_token_ranks=reported_ranks[rows].reshape(num_rows).to(torch.int32),
         )
 
