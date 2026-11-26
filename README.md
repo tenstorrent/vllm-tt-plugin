@@ -686,7 +686,9 @@ The registration environment variables, in the order they are consulted:
 `TT_MODEL_CLASS_OVERRIDES`, `EXTRA_MODELS_DIR`, then the built-in map
 (`TT_VLLM_BUILTIN_MODELS=0` disables it). `TT_LLAMA_TEXT_VER`,
 `TT_QWEN3_TEXT_VER` and `TT_QWEN35_TEXT_VER` select a version WITHIN a built-in
-family and are unrelated to the above.
+family and are unrelated to the above. `TT_LLAMA_TEXT_VER` and
+`TT_QWEN3_TEXT_VER` default to `ttt_compat` and no longer accept
+`tt_transformers`; unset them or set `ttt_compat` instead.
 
 ## Speculative Decoding
 
