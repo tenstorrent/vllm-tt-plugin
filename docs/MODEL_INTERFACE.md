@@ -59,7 +59,8 @@ buffer.
 
 The copy moves each chip's share of each block as one region with
 `ttnn.copy_device_to_host_regions` and `ttnn.copy_host_to_device_regions`,
-straight between the chip and its place in the buffer, one call per layer part.
+straight between the chip and its place in the buffer, one call per layer part
+with the layer's buffer and byte offsets into it.
 Both come with
 [tt-metal#67057](https://github.com/tenstorrent/tt-metal/pull/67057). A launch
 whose connector has a CPU buffer (`"kv_buffer_device": "cpu"`) is refused at

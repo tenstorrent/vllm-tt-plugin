@@ -117,18 +117,18 @@ def make_copy_blocks(layout: KVLayout) -> CopyBlocksOp:
                 part,
                 device_ids,
                 host_ids,
-                host.ctypes.data + offset,
+                offset,
                 layout.block_bytes(name),
                 to_host,
             )
             blocking = i == len(parts) - 1
             if to_host:
                 ttnn.copy_device_to_host_regions(
-                    part.tensor, regions, blocking=blocking
+                    part.tensor, host, regions, blocking=blocking
                 )
             else:
                 ttnn.copy_host_to_device_regions(
-                    part.tensor, regions, blocking=blocking
+                    part.tensor, host, regions, blocking=blocking
                 )
 
     return copy_blocks
@@ -179,16 +179,18 @@ def _part_regions(
     part: KVPart,
     device_ids: list[int],
     host_ids: list[int],
-    host_base: int,
+    host_offset: int,
     host_block_bytes: int,
     to_host: bool,
 ) -> np.ndarray:
-    """Rows of ``(chip, offset on the chip, bytes, host address)`` for one part.
+    """Rows of ``(chip, chip offset, bytes, host buffer offset)`` for one part.
 
     Shard ``i`` of device block ``d`` is at byte ``d * block_bytes`` of each
-    chip holding it, and at ``host_base + h * host_block_bytes + i *
-    block_bytes`` for host block ``h``. A copy to the host reads each shard
-    from its first chip; a copy to the device writes it to every chip.
+    chip holding it, and at byte ``host_offset + h * host_block_bytes + i *
+    block_bytes`` of the layer's host buffer for host block ``h``, where
+    ``host_offset`` is the part's start in a host block. A copy to the host
+    reads each shard from its first chip; a copy to the device writes it to
+    every chip.
 
     Returns
     -------
@@ -210,7 +212,7 @@ def _part_regions(
     regions[:, 1] = np.tile(device, len(targets)) * part.block_bytes
     regions[:, 2] = part.block_bytes
     regions[:, 3] = (
-        host_base
+        host_offset
         + np.tile(host, len(targets)) * host_block_bytes
         + np.repeat(offsets, len(device))
     )
