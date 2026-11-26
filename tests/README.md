@@ -15,7 +15,7 @@ area is reorganized.
 | [support/logprobs.py](support/logprobs.py) | Ranked-payload test data shared by those two modules |
 | [unit/test_kv_layout.py](unit/test_kv_layout.py) | Default and model-declared KV transfer layouts, and the caches the default refuses |
 | [unit/test_kv_dram.py](unit/test_kv_dram.py) | KV in DRAM banks: each region read back from simulated banks, a 1-chip server in parts against a 2-chip server, and the KV that NIXL cannot address |
-| [support/kv_cache.py](support/kv_cache.py) | A fake paged KV cache, shared by the KV tests |
+| [support/kv_cache.py](support/kv_cache.py) | A fake paged KV cache and the cluster facts around it (cards, DRAM bank tables), shared by the KV tests |
 | [tt/test_logprobs.py](tt/test_logprobs.py) | Logprobs returned by a live server on TT hardware |
 
 Engineering and test-design rules live in

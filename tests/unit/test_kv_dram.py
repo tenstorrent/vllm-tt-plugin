@@ -9,75 +9,30 @@ its NIXL address and compare it with the pages the rule put there.
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import NamedTuple
 
 import numpy as np
 import pytest
 import ttnn
 
-from tests.support.kv_cache import TILE_BYTES, FakeKVCache
+from tests.support.kv_cache import (
+    BANK_SIZE,
+    BANKS,
+    TILE_BYTES,
+    Cluster,
+    FakeKVCache,
+    fake_cluster,
+)
 from vllm_tt_plugin.kv_dram import DramRegion, kv_dram_layout
 from vllm_tt_plugin.kv_layout import KVLayout, KVPart
 
-BANKS = 8
-BANK_SIZE = 0xFF000000  # A Blackhole bank, as ttnn's bank table reports it.
 BLOCKS = 4
 LAYER = "model.layers.0.self_attn"
-
-
-class Cluster(NamedTuple):
-    """The cluster facts ``kv_dram_layout`` reads from ttnn, faked.
-
-    Attributes
-    ----------
-    cards
-        N of ``/dev/tenstorrent/N`` by ttnn device ID: the cluster descriptor's
-        ``chips_with_mmio``.
-    banks
-        By ttnn device ID, what ``ttnn.cluster.get_dram_bank_table`` returns.
-    """
-
-    cards: dict[int, int]
-    banks: dict[int, list[dict[str, int]]]
 
 
 @pytest.fixture
 def cluster(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Cluster:
     """Devices 0 to 3 on cards 10 to 13, each with 8 banks at distinct bases."""
-    cluster = Cluster(
-        cards={device: 10 + device for device in range(4)},
-        banks={
-            device: [
-                {
-                    "bank_id": bank,
-                    "noc_x": 0,
-                    "noc_y": 0,
-                    "base_addr": 0x40 * bank,
-                    "bank_size": BANK_SIZE,
-                }
-                for bank in range(BANKS)
-            ]
-            for device in range(4)
-        },
-    )
-
-    def descriptor() -> str:
-        path = tmp_path / "cluster_descriptor.yaml"
-        path.write_text(
-            "chips_with_mmio:\n"
-            + "".join(f"  - {d}: {card}\n" for d, card in cluster.cards.items())
-        )
-        return str(path)
-
-    monkeypatch.setattr(ttnn.cluster, "serialize_cluster_descriptor", descriptor)
-    # A released ttnn may lack the bank table, so it is set, not replaced.
-    monkeypatch.setattr(
-        ttnn.cluster,
-        "get_dram_bank_table",
-        lambda device_id: cluster.banks[device_id],
-        raising=False,
-    )
-    return cluster
+    return fake_cluster(monkeypatch, tmp_path)
 
 
 class Dram:

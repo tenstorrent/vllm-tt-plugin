@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 """``TTPlatform.check_and_update_config`` run inside a real ``VllmConfig``."""
 
+import pytest
 from vllm.config import (
     CacheConfig,
     DeviceConfig,
@@ -10,8 +11,13 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
+from vllm.config.kv_transfer import KVTransferConfig
 
-from tests.test_block_scheduler import LOCAL_MODEL_CONFIG, _stub_model_resolution
+from tests.test_block_scheduler import (
+    LOCAL_MODEL_CONFIG,
+    _ResumingStubModel,
+    _stub_model_resolution,
+)
 
 
 def test_the_tt_class_decides_multimodal_input_support(monkeypatch):
@@ -47,3 +53,51 @@ def test_the_tt_class_decides_multimodal_input_support(monkeypatch):
 
     assert config.model_config.hf_config.architectures == ["TTQwen2ForCausalLM"]
     assert config.model_config.supports_multimodal_inputs is False
+
+
+def _kv_transfer_launch(kv_transfer_config: KVTransferConfig) -> VllmConfig:
+    """A launch with ``--kv-transfer-config`` of a model that resumes prefills."""
+    model_config = ModelConfig(
+        model=str(LOCAL_MODEL_CONFIG),
+        dtype="float16",
+        seed=42,
+        skip_tokenizer_init=True,
+    )
+    with _stub_model_resolution(_ResumingStubModel):
+        return VllmConfig(
+            model_config=model_config,
+            scheduler_config=SchedulerConfig(
+                max_model_len=model_config.max_model_len,
+                is_encoder_decoder=model_config.is_encoder_decoder,
+            ),
+            cache_config=CacheConfig(block_size=128),
+            parallel_config=ParallelConfig(),
+            device_config=DeviceConfig(device="cpu"),
+            kv_transfer_config=kv_transfer_config,
+        )
+
+
+@pytest.mark.parametrize(
+    ("connector", "patched"),
+    [("NixlConnector", True), ("ExampleConnector", False)],
+)
+def test_only_a_nixl_launch_patches_the_nixl_worker(connector, patched):
+    """The worker is rank 0 of 1 and registers a ``KVDramLayout``."""
+    from vllm.distributed import parallel_state
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker
+
+    _kv_transfer_launch(
+        KVTransferConfig(
+            kv_connector=connector, kv_role="kv_producer", kv_buffer_device="tt"
+        )
+    )
+
+    for name in (
+        "get_tensor_model_parallel_rank",
+        "get_tensor_model_parallel_world_size",
+    ):
+        unchanged = getattr(base_worker, name) is getattr(parallel_state, name)
+        assert unchanged is not patched
+    worker_cls = base_worker.NixlBaseConnectorWorker
+    for name in ("register_kv_caches", "_build_fa_local", "_build_fa_remote"):
+        assert hasattr(getattr(worker_cls, name), "upstream") is patched

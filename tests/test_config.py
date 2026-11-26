@@ -235,11 +235,18 @@ def test_kv_transfer_config_needs_a_model_that_resumes_a_prefill():
     tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=False)
 
 
-def test_nixl_connector_is_refused_until_tt_can_register_its_kv():
-    # vLLM's own check fails only after the model has loaded, with
-    # "tt is not supported."; the launch check names the reason first.
+def test_nixl_connector_needs_the_kv_in_card_dram():
+    # NIXL transfers TT KV in card DRAM; nothing stages it through a CPU
+    # buffer. vLLM's own check would fail only after the model has loaded, with
+    # "tt with cpu kv_buffer is not supported."; the launch check names the
+    # reason first.
     cfg = _vllm_config()
-    cfg.kv_transfer_config = SimpleNamespace(kv_connector="NixlConnector")
+    cfg.kv_transfer_config = SimpleNamespace(
+        kv_connector="NixlConnector", kv_buffer_device="cpu"
+    )
 
-    with pytest.raises(ValueError, match="NixlConnector"):
+    with pytest.raises(ValueError, match="NixlConnector.*kv_buffer_device='cpu'"):
         tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
+
+    cfg.kv_transfer_config.kv_buffer_device = "tt"
+    tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)

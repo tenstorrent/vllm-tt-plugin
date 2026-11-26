@@ -49,9 +49,30 @@ KV connector support on TT is experimental. `--kv-transfer-config` is
 supported without data parallelism, for a model that declares
 `supports_prefix_caching`: a request that loads KV from a connector resumes its
 prefill after that KV, as after a prefix-cache hit, and a model without that
-resume would compute on KV or state that never arrived. `NixlConnector` is
-refused at launch: its NIXL agent must register the KV in TT DRAM, which the
-plugin does not do yet.
+resume would compute on KV or state that never arrived. With a connector,
+`TTModelRunner.initialize_kv_cache` calls the worker-side connector's
+`register_kv_caches` once, after the model adapter allocates KV storage, with
+the KV's DRAM regions (see [KV in DRAM banks](#kv-in-dram-banks)).
+
+### NixlConnector
+
+`NixlConnector` (pull mode) moves KV directly between the DRAM of two servers'
+cards. It needs NIXL's Tenstorrent build, and runs only with
+`"kv_buffer_device": "tt"` (the default on TT); any other buffer device is
+refused at launch:
+
+```bash
+# prefill server
+--kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_producer", "kv_buffer_device": "tt"}'
+# decode server
+--kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_consumer", "kv_buffer_device": "tt"}'
+```
+
+A server with fewer chips than the other sets `"tt_kv_parts"` in
+`kv_connector_extra_config` to the other server's chip count. The config hook
+makes the NIXL worker tensor-parallel rank 0 of 1 and lets it register the
+DRAM regions: each DRAM bank once, and one strided descriptor per region, on
+that region's card.
 
 ### KV transfer layout
 
@@ -99,19 +120,19 @@ attention layer, `model.layers.<idx>.self_attn`, all with the default spec.
 NIXL's Tenstorrent build moves KV between the DRAM of two servers' cards. It
 addresses a card by N of `/dev/tenstorrent/N` and a byte by DRAM bank and
 offset in the bank. `kv_dram_layout` (`kv_dram.py`) turns the KV transfer
-layout into such addresses; the plugin does not pass them to `NixlConnector`
-yet. ttnn deals the pages of a DRAM interleaved tensor round-robin over a
-chip's 8 DRAM banks, so when a part's block is a multiple of 8 pages on a chip,
-block `b` is one byte range in each bank. Per layer name, the result lists one
+layout into such addresses for `NixlConnector`. ttnn deals the pages of a DRAM
+interleaved tensor round-robin over a chip's 8 DRAM banks, so when a part's
+block is a multiple of 8 pages on a chip, block `b` is one byte range in each
+bank. Per layer name, the result lists one
 region per bank for each shard of each part, in that order, and every bank that
 holds one. It refuses a tensor that is not DRAM interleaved, a shard copied to
 several chips (a pull reads one remote range into one local range), a chip that
 does not use all 8 banks (P100a and Bin6 Galaxy chips use 7), a chip that is
 not a PCIe card of the host, and blocks that are not whole pages in each bank
 or do not fit a bank. A server with fewer chips than the other server of a
-transfer passes `parts` equal to the other's shard count: with `parts=2`, a
-1-chip server lists each range as the two halves that the chips of a 2-chip
-server hold.
+transfer passes `parts` (`"tt_kv_parts"`) equal to the other's shard count:
+with `parts=2`, a 1-chip server lists each range as the two halves that the
+chips of a 2-chip server hold.
 
 ## Minimum implementation
 

@@ -657,7 +657,7 @@ def validate_tt_kv_transfer_config(
     ValueError
         With data parallelism (standard DP, or lanes, which run with
         ``data_parallel_size == 1``), for a model without prefix caching, or
-        for ``NixlConnector``, which cannot yet register TT KV.
+        for ``NixlConnector`` with a ``kv_buffer_device`` other than ``"tt"``.
     """
     if vllm_config.kv_transfer_config is None:
         return
@@ -675,10 +675,15 @@ def validate_tt_kv_transfer_config(
             "loads KV from a connector resumes its prefill after that KV, as "
             "after a prefix-cache hit."
         )
-    if vllm_config.kv_transfer_config.kv_connector == "NixlConnector":
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if (
+        kv_transfer_config.kv_connector == "NixlConnector"
+        and kv_transfer_config.kv_buffer_device != "tt"
+    ):
         raise ValueError(
-            "NixlConnector cannot run on TT yet: its NIXL agent must register "
-            "the KV in TT DRAM, which this plugin does not do yet."
+            "NixlConnector on TT transfers the KV in card DRAM directly and "
+            'needs "kv_buffer_device": "tt" in --kv-transfer-config; got '
+            f"kv_buffer_device={kv_transfer_config.kv_buffer_device!r}."
         )
 
 

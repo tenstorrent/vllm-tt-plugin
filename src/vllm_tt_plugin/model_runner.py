@@ -16,7 +16,7 @@ import regex as re
 import torch
 import ttnn
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.distributed.kv_transfer import has_kv_transfer_group
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.forward_context import set_forward_context
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
@@ -74,6 +74,8 @@ from vllm_tt_plugin.input_batch import (
     log_prefill_chunks,
     prefill_next_token_ids,
 )
+from vllm_tt_plugin.kv_dram import kv_dram_layout
+from vllm_tt_plugin.kv_layout import kv_transfer_layout
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
 from vllm_tt_plugin.logger import init_tt_logger
@@ -668,6 +670,10 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 group (uniform attention) or multiple groups (hybrid models
                 like Gemma3/4 / GPT-OSS that mix sliding-window and full
                 attention layers).
+
+        With a KV connector, the worker-side connector's
+        ``register_kv_caches`` gets the allocated KV's DRAM regions, a
+        ``KVDramLayout`` (see ``vllm_tt_plugin.kv_dram``).
         """
         kv_cache_groups = kv_cache_config.kv_cache_groups
         self._validate_kv_cache_groups(kv_cache_groups)
@@ -761,6 +767,16 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             self._layer_to_group_idx = mapping  # type: ignore[assignment]
 
         self.kv_caches = self._allocate_kv_caches(kv_cache_config)
+        if has_kv_transfer_group():
+            layout = kv_transfer_layout(self.model, self.kv_caches, kv_cache_config)
+            # A server with fewer chips than the other server of a transfer
+            # lists its KV in as many parts as the other has shards.
+            parts = self.vllm_config.kv_transfer_config.get_from_extra_config(
+                "tt_kv_parts", None
+            )
+            get_kv_transfer_group().register_kv_caches(
+                kv_dram_layout(layout, kv_cache_config.num_blocks, parts)
+            )
 
     @staticmethod
     def _validate_kv_cache_groups(kv_cache_groups: list) -> None:
