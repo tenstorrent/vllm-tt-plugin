@@ -134,9 +134,13 @@ does not certify every chained row. The call then carries the step's
 | Draws | Each column of the row is a draw under the row's own temperature, top-k, top-p and seed, as on an unchained device-sampled verify. |
 | Seeds | A seeded row's seed for each column follows from the position the device computed (the predecessor's column-0 position plus `c`, plus the column), so the draw at a position equals the draw an unchained verify of the request makes at that position. An unseeded row takes fresh randomness on every step. |
 
-A host-sampled step, and a row the draws do not certify (a penalty, logprobs,
-structured output, a token filter, a pending `min_tokens`), drain the
-predecessor first. Sources:
+A host-sampled step, and a row the draws do not certify (logprobs, structured
+output, a token filter, a pending `min_tokens`, and a penalty unless the model
+declares `supports_spec_device_penalties`), drain the predecessor first. A
+model declaring `supports_spec_device_penalties` also chains penalised rows:
+the step's `output_tokens` lack the predecessor's commit, and the model adds
+that commit to the row's penalty history itself
+([penalties on the verify](SPEC_DECODE_CONTRACT.md#4j-penalties-on-the-verify-supports_spec_device_penalties)). Sources:
 [spec_chain.py](../src/vllm_tt_plugin/spec_chain.py) and
 [mamba_state.py](../src/vllm_tt_plugin/mamba_state.py).
 
