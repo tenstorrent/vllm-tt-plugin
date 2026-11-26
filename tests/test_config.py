@@ -215,3 +215,48 @@ def test_kv_transfer_config_is_accepted_without_data_parallelism():
     cfg.kv_transfer_config = object()
 
     tt_config.validate_tt_kv_transfer_config(cfg)
+
+
+def test_long_prompt_scheduling_keys_default_to_off():
+    cfg = _vllm_config()
+
+    assert tt_config.get_tt_max_concurrent_partial_prefills(cfg) == 0
+    assert tt_config.get_tt_prefill_chunk_cap_table(cfg) == ()
+
+
+def test_prefill_chunk_cap_table_is_sorted_by_start_depth():
+    cfg = _vllm_config(tt_cfg={"prefill_chunk_cap_table": [[131072, 8192], [0, 16384]]})
+
+    assert tt_config.get_tt_prefill_chunk_cap_table(cfg) == (
+        (0, 16384),
+        (131072, 8192),
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid", [-1, True, 1.0, "1"], ids=["negative", "bool", "float", "string"]
+)
+def test_max_concurrent_partial_prefills_rejects_invalid_values(invalid):
+    cfg = _vllm_config(tt_cfg={"max_concurrent_partial_prefills": invalid})
+
+    with pytest.raises(ValueError, match="max_concurrent_partial_prefills"):
+        tt_config.get_tt_max_concurrent_partial_prefills(cfg)
+
+
+@pytest.mark.parametrize(
+    ("table", "match"),
+    [
+        pytest.param({"0": 16384}, "must be a list", id="not-a-list"),
+        pytest.param([[0, 16384, 1]], "integer pairs", id="triple"),
+        pytest.param([[0, True]], "integer pairs", id="bool"),
+        pytest.param([[0.0, 16384]], "integer pairs", id="float"),
+        pytest.param([[-1, 16384]], "start_tokens >= 0", id="negative-start"),
+        pytest.param([[0, 0]], "max_chunk_tokens >= 1", id="zero-cap"),
+        pytest.param([[0, 4096], [0, 8192]], "two entries", id="repeated-start"),
+    ],
+)
+def test_prefill_chunk_cap_table_rejects_invalid_values(table, match):
+    cfg = _vllm_config(tt_cfg={"prefill_chunk_cap_table": table})
+
+    with pytest.raises(ValueError, match=match):
+        tt_config.get_tt_prefill_chunk_cap_table(cfg)

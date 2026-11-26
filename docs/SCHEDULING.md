@@ -280,6 +280,78 @@ only for it:
 Text requests of the same launch keep prefix caching and chunked prefill. A
 model that declares True, or omits the key, keeps vLLM's multimodal rules.
 
+#### Long prompts
+
+Two `additional_config["tt"]` keys bound the prefill work of one step further.
+Both need chunked prefill: the platform refuses either key on a launch where
+chunked prefill is off. Both are off when absent, and `TTScheduler` logs one
+line at startup for each key that is set.
+
+`max_concurrent_partial_prefills` (integer, at least 0, default 0 = no limit)
+limits the *multi-chunk* requests of a step: requests whose uncached
+remainder needs more than one chunk. Without it, the base scheduler gives
+every running partial prefill and every admitted waiting request a chunk in
+each step, so several long prompts on one engine advance together and all
+reach their first token late. With a limit L above 0:
+
+- A prefill step advances at most L multi-chunk requests, oldest first:
+  running partial prefills in `running` order, then waiting requests in queue
+  order. A request whose remainder fits in one chunk (a short prompt, or the
+  last chunk of a long one) is always admitted, within the step budget.
+- While a waiting multi-chunk request that has a place under L waits next to
+  waiting single-chunk requests, the single-chunk requests go first. This
+  lasts at most 8 consecutive prefill steps (`SHORT_FIRST_MAX_STEPS`), so a
+  stream of short prompts cannot starve a long one.
+- One chunk is what `Scheduler.schedule` gives a request from where it
+  starts: at most `max_num_scheduled_tokens`, `max_num_batched_tokens` less
+  the draft slots, a positive `long_prefill_token_threshold` and the
+  `prefill_chunk_cap_table` cap. The multimodal part of a prompt of a model
+  that declares `supports_multimodal_prefill_resume` False takes a whole step.
+  vLLM's lift of the threshold for a lone request, its adaptive floor and the
+  chunk ends of its Mamba split are not modelled.
+- A waiting request that has computed nothing starts where its prefix-cache
+  hit would end. `TTScheduler._estimated_cache_hit` asks the KV cache
+  coordinator's `find_longest_cache_hit`, which only reads the block pool. For
+  a model with `MambaSpec` groups, the hit holds only up to a block boundary
+  where the GDN state block is cached too, so a follow-up turn whose cached
+  attention blocks reach past the last cached GDN state is not taken for a
+  short prompt. A model's `confirm_prefix_cache_hit` and a KV connector's
+  external tokens are not asked.
+
+`_schedule_prefill_only` hides the held requests from its base `schedule()`
+pass, like the running decodes, and puts them back in their places before it
+returns. A held partial prefill keeps its computed tokens, blocks and slot,
+and lowers both `max_num_running_reqs` and `max_num_active_reqs` for the pass.
+`get_request_counts` counts the held requests during the pass, so the
+threshold stays on the prompt that runs while they wait. Outside the pass
+nothing is hidden: `_has_pending_prefill`, the decode interleave, the decode
+fallback and a prefill kept in `_deferred_prefill` see every request. Requests
+in `kv_holding_waiting` are neither held nor counted.
+
+`prefill_chunk_cap_table` (list of `[start_tokens, max_chunk_tokens]` integer
+pairs, default empty) caps a text chunk by the depth it starts at: a chunk
+that starts at depth `s` holds at most the `max_chunk_tokens` of the pair with
+the largest `start_tokens <= s`, and a chunk that starts before every pair is
+not capped. Attention work per token grows with depth, so deeper chunks can be
+kept shorter to bound a step's duration. `start_tokens` must be at least 0
+and unique; `max_chunk_tokens` must be positive and a multiple of
+`prefill_chunk_alignment`, and of the KV block size when vLLM's Mamba split
+ends chunks on KV block boundaries (`MambaSpec` groups in mode `align`).
+`TTScheduler.__init__` checks the alignment, which it alone knows for a model
+with `MambaSpec` groups. In `_mamba_block_aligned_split` the cap applies after
+vLLM's split and before `_align_prefill_chunk_end`. Unlike
+`long_prefill_token_threshold`, it also caps a request that runs alone. Decode
+steps and multimodal chunks are not capped. For a model that declares
+`supports_multimodal_prefill_resume` True, that is every chunk of a multimodal
+request. For a model that declares False, it is the chunk that holds the
+multimodal items, which `_multimodal_prefill_grant` sizes; the text chunks
+after the last item are capped.
+
+Example: `{"tt": {"max_concurrent_partial_prefills": 1, "prefill_chunk_cap_table": [[0, 16384], [131072, 8192]]}}`.
+With `long_prefill_token_threshold` 16384, a 200000-token prompt then runs in
+chunks of 16384 tokens up to depth 131072 and of 8192 after it, and a second
+long prompt waits for it while short prompts still join its steps.
+
 ### Decode interleave
 
 Preferring prefill whenever prefill work is pending has one bad consequence.

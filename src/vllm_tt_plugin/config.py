@@ -989,3 +989,85 @@ def get_tt_decode_interleave_config(
             _DECODE_INTERLEAVE_DECODE_STEPS_DEFAULT,
         ),
     )
+
+
+# Long-prompt scheduling, read by TTScheduler. A TT prefill step stalls every
+# running decode for its whole duration, so these bound how much prefill work
+# one step carries. Both are off when absent.
+_MAX_CONCURRENT_PARTIAL_PREFILLS_KEY = "max_concurrent_partial_prefills"
+_PREFILL_CHUNK_CAP_TABLE_KEY = "prefill_chunk_cap_table"
+
+
+def get_tt_max_concurrent_partial_prefills(vllm_config: "VllmConfig") -> int:
+    """Return how many multi-chunk prefills one prefill step advances.
+
+    A request is multi-chunk when its uncached remainder needs more than one
+    prefill chunk; ``TTScheduler`` advances at most this many of them per
+    prefill step, oldest first. 0, the default, sets no limit.
+
+    Raises
+    ------
+    ValueError
+        The value is not an integer of at least 0.
+    """
+    value = get_tt_config(vllm_config).get(_MAX_CONCURRENT_PARTIAL_PREFILLS_KEY, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"additional_config['tt']['{_MAX_CONCURRENT_PARTIAL_PREFILLS_KEY}'] "
+            f"must be an integer >= 0 (0 sets no limit), got {value!r}"
+        )
+    return value
+
+
+def get_tt_prefill_chunk_cap_table(
+    vllm_config: "VllmConfig",
+) -> tuple[tuple[int, int], ...]:
+    """Return the prefill chunk caps by depth, sorted by start depth.
+
+    The key holds ``[start_tokens, max_chunk_tokens]`` pairs. A text prefill
+    chunk that starts at depth ``s`` holds at most the ``max_chunk_tokens`` of
+    the pair with the largest ``start_tokens <= s``; a chunk that starts before
+    every pair is not capped. Empty, the default, caps nothing. This reader
+    checks the pairs only; ``TTScheduler`` checks each cap against the chunk
+    alignment, which it alone knows for a model with ``MambaSpec`` groups.
+
+    Returns
+    -------
+    tuple[tuple[int, int], ...]
+        ``(start_tokens, max_chunk_tokens)`` pairs in increasing
+        ``start_tokens`` order.
+
+    Raises
+    ------
+    ValueError
+        The value is not a list of integer pairs, a ``start_tokens`` is
+        negative or repeated, or a ``max_chunk_tokens`` is below 1.
+    """
+    name = f"additional_config['tt']['{_PREFILL_CHUNK_CAP_TABLE_KEY}']"
+    raw = get_tt_config(vllm_config).get(_PREFILL_CHUNK_CAP_TABLE_KEY, [])
+    if not isinstance(raw, list | tuple):
+        raise ValueError(
+            f"{name} must be a list of [start_tokens, max_chunk_tokens] pairs, "
+            f"got {raw!r}"
+        )
+    caps: dict[int, int] = {}
+    for pair in raw:
+        if (
+            not isinstance(pair, list | tuple)
+            or len(pair) != 2
+            or any(isinstance(v, bool) or not isinstance(v, int) for v in pair)
+        ):
+            raise ValueError(
+                f"{name} entries must be [start_tokens, max_chunk_tokens] integer "
+                f"pairs, got {pair!r}"
+            )
+        start, cap = pair
+        if start < 0 or cap < 1:
+            raise ValueError(
+                f"{name} entry {list(pair)} needs start_tokens >= 0 and "
+                "max_chunk_tokens >= 1"
+            )
+        if start in caps:
+            raise ValueError(f"{name} has two entries for start_tokens={start}")
+        caps[start] = cap
+    return tuple(sorted(caps.items()))
