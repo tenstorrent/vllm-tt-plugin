@@ -3,7 +3,8 @@
 """A fake paged KV cache on a TT mesh.
 
 ``FakeKVCache`` keeps each chip's buffer as bytes, so KV layout tests can
-compare bytes without a device.
+compare bytes without a device. It reports the buffer facts a DRAM layout reads
+(address, page size, device IDs, memory config) as an interleaved DRAM tensor.
 """
 
 from types import SimpleNamespace
@@ -25,7 +26,13 @@ class FakeKVCache:
     block_bytes
         Bytes of one block on one chip.
     chips
-        Each chip's buffer as ``uint8``, block after block.
+        Each chip's buffer as ``uint8``, block after block, one page (tile) of
+        ``TILE_BYTES`` after another.
+    address
+        The buffer address, the same on every chip, as ttnn allocates a mesh
+        tensor.
+    device_ids
+        The ttnn device ID of each chip, in mesh order.
     """
 
     dtype = ttnn.bfloat8_b
@@ -39,6 +46,7 @@ class FakeKVCache:
         chips: int,
         block_size: int = TILE,
         head_dim: int = TILE,
+        address: int = 0,
     ):
         self.shape = (blocks, heads, block_size, head_dim)
         self.block_bytes = (
@@ -47,10 +55,30 @@ class FakeKVCache:
         self.chips = [
             np.zeros(blocks * self.block_bytes, dtype=np.uint8) for _ in range(chips)
         ]
+        self.address = address
+        self.device_ids = list(range(chips))
 
     def device(self) -> SimpleNamespace:
-        """The mesh, which only reports its chip count."""
-        return SimpleNamespace(get_num_devices=lambda: len(self.chips))
+        """The mesh, which reports its chip count and device IDs."""
+        return SimpleNamespace(
+            get_num_devices=lambda: len(self.chips),
+            get_device_ids=lambda: self.device_ids,
+        )
+
+    def buffer_address(self) -> int:
+        """The buffer address, as on every chip of a ttnn mesh tensor."""
+        return self.address
+
+    def buffer_aligned_page_size(self) -> int:
+        """Bytes of one page: one bfloat8_b tile."""
+        return TILE_BYTES
+
+    def memory_config(self) -> SimpleNamespace:
+        """DRAM interleaved: page ``i`` in DRAM bank ``i % num_banks``."""
+        return SimpleNamespace(
+            buffer_type=ttnn.BufferType.DRAM,
+            memory_layout=ttnn.TensorMemoryLayout.INTERLEAVED,
+        )
 
     def blocks_on(self, chip: int) -> np.ndarray:
         """Chip ``chip``'s buffer as ``[blocks, block_bytes]``."""

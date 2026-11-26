@@ -94,6 +94,25 @@ such a model needs the method.
 A model class without a `get_kv_cache_spec` hook gets one layer name per
 attention layer, `model.layers.<idx>.self_attn`, all with the default spec.
 
+#### KV in DRAM banks
+
+NIXL's Tenstorrent build moves KV between the DRAM of two servers' cards. It
+addresses a card by N of `/dev/tenstorrent/N` and a byte by DRAM bank and
+offset in the bank. `kv_dram_layout` (`kv_dram.py`) turns the KV transfer
+layout into such addresses; the plugin does not pass them to `NixlConnector`
+yet. ttnn deals the pages of a DRAM interleaved tensor round-robin over a
+chip's 8 DRAM banks, so when a part's block is a multiple of 8 pages on a chip,
+block `b` is one byte range in each bank. Per layer name, the result lists one
+region per bank for each shard of each part, in that order, and every bank that
+holds one. It refuses a tensor that is not DRAM interleaved, a shard copied to
+several chips (a pull reads one remote range into one local range), a chip that
+does not use all 8 banks (P100a and Bin6 Galaxy chips use 7), a chip that is
+not a PCIe card of the host, and blocks that are not whole pages in each bank
+or do not fit a bank. A server with fewer chips than the other server of a
+transfer passes `parts` equal to the other's shard count: with `parts=2`, a
+1-chip server lists each range as the two halves that the chips of a 2-chip
+server hold.
+
 ## Minimum implementation
 
 An ordinary text adapter needs `initialize_vllm_model`, `prefill_forward`,

@@ -86,9 +86,24 @@ class ClusterType(Enum):
     SIMULATOR_BLACKHOLE = "simulator_blackhole"
 
 
+class BufferType(Enum):
+    DRAM = "dram"
+    L1 = "l1"
+    L1_SMALL = "l1_small"
+    TRACE = "trace"
+
+
+class TensorMemoryLayout(Enum):
+    INTERLEAVED = "interleaved"
+    HEIGHT_SHARDED = "height_sharded"
+    WIDTH_SHARDED = "width_sharded"
+    BLOCK_SHARDED = "block_sharded"
+
+
 class _Cluster:
     ClusterType = ClusterType
     get_cluster_type = staticmethod(_no_device("cluster.get_cluster_type"))
+    get_dram_bank_table = staticmethod(_no_device("cluster.get_dram_bank_table"))
     serialize_cluster_descriptor = staticmethod(
         _no_device("cluster.serialize_cluster_descriptor")
     )
