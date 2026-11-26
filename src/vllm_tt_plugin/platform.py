@@ -67,6 +67,8 @@ if TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.utils.argparse_utils import FlexibleArgumentParser
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.selector import AttentionSelectorConfig
 else:
     FlexibleArgumentParser = object
 
@@ -813,6 +815,261 @@ def _install_tt_kv_engine_id_sync_patch() -> None:
         return original(vllm_config) if tp_size != 1 or pp_size != 1 else None
 
     kv_transfer_state._sync_engine_id_across_tp = patched_sync_engine_id
+
+
+def _install_tt_nixl_single_rank_patch() -> None:
+    """Tell the NIXL connector worker that it is rank 0 of 1.
+
+    The worker reads its tensor-parallel rank and world size through
+    ``get_tp_group()``, which TT never creates (see
+    ``_install_tt_kv_engine_id_sync_patch``). TT pins tensor parallelism to 1,
+    so the answers are fixed.
+
+    Raises
+    ------
+    RuntimeError
+        When vLLM's NIXL ``base_worker`` no longer imports the two functions.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker
+
+    for name in (
+        "get_tensor_model_parallel_rank",
+        "get_tensor_model_parallel_world_size",
+    ):
+        if not hasattr(base_worker, name):
+            raise RuntimeError(
+                f"vLLM's NIXL base_worker no longer imports {name}; update "
+                "_install_tt_nixl_single_rank_patch for this vLLM version."
+            )
+    base_worker.get_tensor_model_parallel_rank = lambda: 0
+    base_worker.get_tensor_model_parallel_world_size = lambda: 1
+
+
+# A card DRAM address is a bank number above 32 address bits. Bits from here up
+# are free to carry the card.
+_NIXL_CARD_SHIFT = 40
+
+
+def _install_tt_nixl_dram_registration_patch() -> None:
+    """Let the NIXL connector worker register KV that is in card DRAM.
+
+    The worker's ``register_kv_caches`` reads each layer's address, size and
+    block stride from a torch tensor and makes it one NIXL region. TT's KV is
+    in ttnn tensors, and a layer is several DRAM regions (see
+    ``vllm_tt_plugin.kv_dram.kv_dram_layout``). Given a ``KVDramLayout``
+    instead of tensors, the patched method records its regions the way the
+    upstream method records a tensor's, and registers its DRAM banks.
+    Everything after registration, the handshake and the transfers, is
+    upstream's and works from those records.
+
+    The worker has one NIXL device ID for all its regions, but a mesh's
+    regions are on several cards. The patched method puts each region's card
+    in the bits of its base address from ``_NIXL_CARD_SHIFT`` up, which a card
+    address does not use, and the patched ``_build_fa_local`` and
+    ``_build_fa_remote`` move it into each descriptor's device ID.
+
+    The patched ``add_remote_agent`` refuses a peer whose block size differs
+    before upstream builds any descriptor for it. Upstream pairs a larger
+    block with smaller ones by cutting it into contiguous byte ranges; a TT
+    block is tiles dealt over the DRAM banks, heads first, so those ranges do
+    not hold whole token blocks.
+
+    Raises
+    ------
+    RuntimeError
+        When vLLM's NIXL ``base_worker`` no longer has a name the patched
+        methods use.
+    """
+    import msgspec
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker
+
+    from vllm_tt_plugin.kv_dram import KVDramLayout
+
+    worker_cls = base_worker.NixlBaseConnectorWorker
+    upstream = worker_cls.register_kv_caches
+    if hasattr(upstream, "upstream"):
+        return
+    for name in (
+        "TransferTopology",
+        "compute_nixl_compatibility_hash",
+        "NixlAgentMetadata",
+        "NixlHandshakePayload",
+        "_region_sort_key",
+    ):
+        if not hasattr(base_worker, name):
+            raise RuntimeError(
+                f"vLLM's NIXL base_worker no longer has {name}; update "
+                "_install_tt_nixl_dram_registration_patch for this vLLM version."
+            )
+    for name in ("_build_fa_local", "_build_fa_remote", "add_remote_agent"):
+        if not hasattr(worker_cls, name):
+            raise RuntimeError(
+                f"vLLM's NIXL connector worker no longer has {name}; update "
+                "_install_tt_nixl_dram_registration_patch for this vLLM version."
+            )
+
+    def register_kv_caches(self, kv_caches) -> None:
+        """Register a ``KVDramLayout``; hand anything else to upstream.
+
+        Raises
+        ------
+        NotImplementedError
+            For a worker with a CPU buffer, MLA, Mamba state, pipeline
+            parallelism, kernel blocks smaller than vLLM's, or regions tracked
+            by layer name.
+        """
+        if not isinstance(kv_caches, KVDramLayout):
+            return upstream(self, kv_caches)
+        layout = kv_caches
+        if (
+            self.use_host_buffer
+            or self.use_mla
+            or self._has_mamba
+            or self.pp_size != 1
+            or self._physical_blocks_per_logical_kv_block != 1
+            or self._tracks_region_layers()
+        ):
+            raise NotImplementedError(
+                "KV in TT card DRAM is transferred directly only with "
+                '"kv_buffer_device": "tt", for attention layers, without '
+                "pipeline parallelism."
+            )
+        num_blocks = self.kv_cache_config.num_blocks
+        self.transfer_topo = base_worker.TransferTopology(
+            tp_rank=self.transfer_tp_rank,
+            tp_size=self.transfer_tp_size,
+            block_size=self.block_size,
+            engine_id=self.engine_id,
+            is_mla=False,
+            total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
+            attn_backends=self.attn_backends,
+            dcp_size=self.dcp_size,
+            tensor_shape=None,
+            is_mamba=False,
+        )
+        self.compat_hash = base_worker.compute_nixl_compatibility_hash(
+            self.vllm_config, self.backend_name, transfer_mode=self._TRANSFER_MODE
+        )
+
+        # One record per region, in the order both servers list them.
+        base_addresses: list[int] = []
+        self._ssm_region_indices = []
+        self._scratch_region_indices = []
+        self._ple_block_len = None
+        self._ple_region_index = None
+        group_by_layer = self.kv_cache_config.transfer_group_index_by_layer
+        for name in sorted(layout.regions, key=base_worker._region_sort_key):
+            for region in layout.regions[name]:
+                base_addresses.append(region.card << _NIXL_CARD_SHIFT | region.addr)
+                self.block_len_per_layer.append(region.block_bytes)
+                self.block_stride_per_layer.append(region.block_stride)
+                self.region_group_ids.append(group_by_layer[name])
+                self.region_names.append(name)
+                self.region_num_blocks.append(num_blocks)
+                self._region_is_mla.append(False)
+        # The card is in each base address instead; see ``card_from_address``.
+        self.device_id = 0
+        self.tt_card_in_address = True
+        self._head_sharded_draft_regions = self._get_head_sharded_draft_regions()
+        self.kv_caches_base_addr[self.engine_id][self.tp_rank] = base_addresses
+        self.num_regions = len(base_addresses)
+        self.region_mem_types = [self.nixl_memory_type] * self.num_regions
+        self._uses_region_group_mapping = len(set(self.region_group_ids)) > 1
+        self._mixed_mem_types = False
+        self._set_region_layers([])
+        self._packed_member_layouts = {}
+        self.num_descs = sum(self.region_num_blocks)
+        self._skip_dram_xfer = False
+
+        # A bank is registered once, whole: each registration takes one of
+        # the card's few DRAM mappings.
+        descs = self.nixl_wrapper.get_reg_descs(
+            [(addr, size, card, "") for addr, size, card in layout.banks],
+            self.nixl_memory_type,
+        )
+        self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
+        self._registered_descs.append(descs)
+
+        self.device_kv_caches = {}
+        self.dst_num_blocks[self.engine_id] = self.num_blocks
+        self.dst_region_num_blocks[self.engine_id] = self.region_num_blocks
+        self.dst_region_group_ids[self.engine_id] = self.region_group_ids
+        self.dst_uses_region_group_mapping[self.engine_id] = (
+            self._uses_region_group_mapping
+        )
+        self.dst_region_mem_types[self.engine_id] = self.region_mem_types
+
+        self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (
+            self.register_local_xfer_handler(self.block_size)
+        )
+        agent_metadata = base_worker.NixlAgentMetadata(
+            engine_id=self.engine_id,
+            agent_metadata=self.nixl_wrapper.get_agent_metadata(),
+            device_id=self.device_id,
+            kv_caches_base_addr=base_addresses,
+            num_blocks=self.num_blocks,
+            block_lens=self.block_len_per_layer,
+            block_strides=self.block_stride_per_layer,
+            kv_cache_layout=self.kv_cache_layout,
+            block_size=self.block_size,
+            ssm_sizes=self._mamba_ssm_size,
+            ple_block_len=None,
+            attn_backend_name=self.backend_name,
+            physical_blocks_per_logical_kv_block=1,
+            region_num_blocks=self.region_num_blocks,
+            region_group_ids=self.region_group_ids,
+            region_names=self.region_names,
+            region_mem_types=self.region_mem_types,
+            dcp_size=self.dcp_size,
+            pcp_size=self.pcp_size,
+            region_members=self.region_members,
+            packed_member_layouts={},
+        )
+        self.xfer_handshake_metadata = base_worker.NixlHandshakePayload(
+            compatibility_hash=self.compat_hash,
+            agent_metadata_bytes=msgspec.msgpack.Encoder().encode(agent_metadata),
+        )
+
+    register_kv_caches.upstream = upstream
+    worker_cls.register_kv_caches = register_kv_caches
+
+    def card_from_address(build_descs):
+        """Give each descriptor its own NIXL device ID.
+
+        ``build_descs`` returns rows of ``(address, bytes, device ID, stride,
+        count)``. For a worker that registered card DRAM, the wrapper moves
+        the card from the address's high bits to the device ID.
+        """
+
+        def build(self, *args, **kwargs):
+            descs = build_descs(self, *args, **kwargs)
+            if getattr(self, "tt_card_in_address", False):
+                descs[:, 2] = descs[:, 0] >> _NIXL_CARD_SHIFT
+                descs[:, 0] &= (1 << _NIXL_CARD_SHIFT) - 1
+            return descs
+
+        build.upstream = build_descs
+        return build
+
+    for name in ("_build_fa_local", "_build_fa_remote"):
+        setattr(worker_cls, name, card_from_address(getattr(worker_cls, name)))
+
+    upstream_add = worker_cls.add_remote_agent
+
+    def add_remote_agent(self, nixl_agent_meta, *args, **kwargs):
+        if (
+            getattr(self, "tt_card_in_address", False)
+            and nixl_agent_meta.block_size != self.block_size
+        ):
+            raise NotImplementedError(
+                "KV in TT card DRAM needs the same block size on both servers: "
+                f"local block size {self.block_size}, block size "
+                f"{nixl_agent_meta.block_size} on engine {nixl_agent_meta.engine_id}."
+            )
+        return upstream_add(self, nixl_agent_meta, *args, **kwargs)
+
+    add_remote_agent.upstream = upstream_add
+    worker_cls.add_remote_agent = add_remote_agent
 
 
 def _install_diffusion_gemma_architecture_patch() -> None:
@@ -1837,6 +2094,34 @@ class TTPlatform(Platform):
         return True
 
     @classmethod
+    def get_attn_backend_cls(
+        cls,
+        selected_backend: "AttentionBackendEnum | None",
+        attn_selector_config: "AttentionSelectorConfig",
+        num_heads: int | None = None,
+    ) -> str:
+        """Name ``TTAttentionBackend``, whatever backend vLLM selected.
+
+        TT runs no vLLM attention, but code outside the forward pass, such as
+        ``NixlConnector``, still asks for a backend class.
+        """
+        return "vllm_tt_plugin.attention_backend.TTAttentionBackend"
+
+    @classmethod
+    def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
+        """Let NIXL run on TT only with ``"kv_buffer_device": "tt"``.
+
+        NIXL's Tenstorrent build transfers the KV in card DRAM directly; no KV
+        is staged through a CPU buffer.
+        """
+        return {"tt": ("tt",)}
+
+    @classmethod
+    def get_nixl_memory_type(cls) -> str:
+        """What NIXL's Tenstorrent build calls card memory: ``"VRAM"``."""
+        return "VRAM"
+
+    @classmethod
     def pre_register_and_update(
         cls, parser: FlexibleArgumentParser | None = None
     ) -> None:
@@ -1879,7 +2164,9 @@ class TTPlatform(Platform):
 
     @classmethod
     def set_device(cls, device) -> None:
-        if device is None:
+        # NixlConnector passes its NIXL device ID before a handshake, for
+        # platforms whose threads each need a device context. TT has none.
+        if device is None or isinstance(device, int):
             return
 
         import ttnn
@@ -2542,6 +2829,9 @@ class TTPlatform(Platform):
         _install_tt_dp_prefix_cache_routing_patch()
         if vllm_config.kv_transfer_config is not None:
             _install_tt_kv_engine_id_sync_patch()
+            if vllm_config.kv_transfer_config.kv_connector == "NixlConnector":
+                _install_tt_nixl_single_rank_patch()
+                _install_tt_nixl_dram_registration_patch()
         if is_block_output_model:
             _install_block_output_streaming_input_patch()
 

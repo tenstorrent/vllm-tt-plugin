@@ -3,7 +3,9 @@
 """The KV connector lifecycle on the single-process TT path.
 
 No bytes move here. A fake connector records what the plugin asks of it and
-reports the transfers each test scripts.
+reports the transfers each test scripts. vLLM's NixlConnector worker runs with
+a fake NIXL agent that records the card memory it registers and the
+descriptors it prepares.
 """
 
 import threading
@@ -11,6 +13,7 @@ from collections import deque
 from functools import partial
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from vllm.config.kv_transfer import KVTransferConfig
@@ -22,15 +25,34 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
+from tests.support.kv_cache import (
+    BANKS,
+    TILE_BYTES,
+    Cluster,
+    FakeKVCache,
+    fake_cluster,
+)
 from tests.test_block_scheduler import BLOCK_SIZE, _request
 from tests.test_block_scheduler import _runner_output as _block_runner_output
 from tests.test_block_scheduler import _scheduler as _real_scheduler
 from tests.test_sample_time_grammar import _model_input, _sync_forward
 from vllm_tt_plugin.async_decode import AsyncTTModelRunnerOutput
+from vllm_tt_plugin.kv_dram import DramRegion, KVDramLayout, kv_dram_layout
+from vllm_tt_plugin.kv_layout import KVLayout, KVPart
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.platform import (
+    TTPlatform,
+    _install_tt_nixl_dram_registration_patch,
+    _install_tt_nixl_single_rank_patch,
+)
 
 
 class FakeKVMetadata(KVConnectorMetadata):
@@ -59,6 +81,9 @@ class FakeKVConnector(KVConnectorBase_V1, SupportsHMA):
         self.delay_free = False
 
     # Worker half.
+
+    def register_kv_caches(self, kv_caches):
+        self.kv_caches = kv_caches
 
     def bind_connector_metadata(self, connector_metadata):
         self.calls.append("bind")
@@ -238,6 +263,459 @@ def test_a_step_without_a_connector_reports_no_connector_output(vllm_config):
     output = TTModelRunner.sample_tokens(runner, None)
 
     assert output.kv_connector_output is None
+
+
+CHIPS = 2
+NUM_BLOCKS = 4
+HEAD_SIZE = 128  # With BLOCK_SIZE, 16 pages a head: 2 in each DRAM bank.
+LAYER_NAMES = ["model.layers.1.self_attn", "model.layers.0.self_attn"]
+
+
+@pytest.fixture
+def cluster(monkeypatch, tmp_path) -> Cluster:
+    """Devices 0 to 3 on cards 10 to 13, each with 8 banks at distinct bases."""
+    return fake_cluster(monkeypatch, tmp_path)
+
+
+def _initialize_kv_cache(kv_caches: list, model=None, tt_kv_parts=None) -> None:
+    """``TTModelRunner.initialize_kv_cache`` over a model holding ``kv_caches``.
+
+    ``tt_kv_parts`` is the connector's ``"tt_kv_parts"`` extra config.
+    """
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=CHIPS,
+        head_size=HEAD_SIZE,
+        dtype=torch.float32,
+    )
+    extra = {} if tt_kv_parts is None else {"tt_kv_parts": tt_kv_parts}
+    runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="NixlConnector",
+                kv_role="kv_producer",
+                kv_connector_extra_config=extra,
+            )
+        ),
+        tt_max_batch_size=2,
+        model_config=SimpleNamespace(max_model_len=BLOCK_SIZE),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=BLOCK_SIZE),
+        cache_config=SimpleNamespace(block_size=BLOCK_SIZE),
+        vocab_size=8,
+        _is_lane_mode=False,
+        _host_logitsprocs=None,
+        _is_block_output_model=False,
+        _output_tokens_per_step=1,
+        _validate_kv_cache_groups=TTModelRunner._validate_kv_cache_groups,
+        _allocate_kv_caches=lambda _kv_cache_config: kv_caches,
+        model=model if model is not None else SimpleNamespace(),
+    )
+    TTModelRunner.initialize_kv_cache(
+        runner,
+        KVCacheConfig(
+            num_blocks=NUM_BLOCKS,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(LAYER_NAMES, spec)],
+        ),
+    )
+
+
+def _kv_caches(
+    num_layers: int = 2,
+    heads: int = 1,
+    chips: int = CHIPS,
+    block_size: int = BLOCK_SIZE,
+) -> list:
+    """A bfloat8_b K and V per layer, each at its own buffer address."""
+    return [
+        [
+            FakeKVCache(
+                blocks=NUM_BLOCKS,
+                heads=heads,
+                chips=chips,
+                block_size=block_size,
+                head_dim=HEAD_SIZE,
+                address=0x100000 * (2 * layer + i + 1),
+            )
+            for i in range(2)
+        ]
+        for layer in range(num_layers)
+    ]
+
+
+def _offset(region: DramRegion) -> int:
+    """Where block 0 of ``region`` is in its bank."""
+    return region.addr & 0xFFFFFFFF
+
+
+class TestKVDramRegistration:
+    """``initialize_kv_cache`` hands the connector the KV's DRAM regions."""
+
+    def test_each_layer_name_gets_its_caches_regions_on_each_chip(
+        self, worker_connector, cluster
+    ):
+        kv_caches = _kv_caches()
+        _initialize_kv_cache(kv_caches)
+
+        layout = worker_connector.kv_caches
+        assert isinstance(layout, KVDramLayout)
+        assert list(layout.regions) == LAYER_NAMES
+        bank_0 = cluster.banks[0][0]["base_addr"]
+        for name in LAYER_NAMES:
+            k, v = kv_caches[int(name.split(".")[2])]
+            regions = layout.regions[name]
+            # K then V; in each, chip 0's 8 banks, then chip 1's.
+            assert len(regions) == 2 * CHIPS * BANKS
+            assert [_offset(r) - bank_0 for r in regions[::BANKS]] == [
+                k.address,
+                k.address,
+                v.address,
+                v.address,
+            ]
+            assert [r.card for r in regions[::BANKS]] == [10, 11, 10, 11]
+            # A head of a block is 2 pages in each bank.
+            assert {(r.block_bytes, r.block_stride) for r in regions} == {
+                (2 * TILE_BYTES, 2 * TILE_BYTES)
+            }
+
+    def test_tt_kv_parts_lists_a_chip_as_that_many_chips(
+        self, worker_connector, cluster
+    ):
+        # One chip with both heads, listed as the two chips of a 2-chip server
+        # hold them.
+        _initialize_kv_cache(_kv_caches(heads=CHIPS, chips=1), tt_kv_parts=CHIPS)
+
+        for regions in worker_connector.kv_caches.regions.values():
+            assert len(regions) == 2 * CHIPS * BANKS
+            assert {(r.block_bytes, r.block_stride) for r in regions} == {
+                (2 * TILE_BYTES, 4 * TILE_BYTES)
+            }
+
+    def test_a_model_layout_replaces_the_default_one(self, worker_connector, cluster):
+        class Model:
+            def get_kv_transfer_layout(self, kv_caches, kv_cache_config):
+                # One latent per layer instead of a K and V pair.
+                k = kv_caches[0][0]
+                return {name: [(k, k.block_bytes, [[0], [1]])] for name in LAYER_NAMES}
+
+        _initialize_kv_cache(_kv_caches(), Model())
+
+        for regions in worker_connector.kv_caches.regions.values():
+            assert len(regions) == CHIPS * BANKS
+
+    def test_kv_that_cannot_be_mapped_to_layer_names_is_refused(self, worker_connector):
+        with pytest.raises(ValueError, match="allocated 3 \\[k, v\\] entries for 2"):
+            _initialize_kv_cache(_kv_caches(num_layers=3))
+
+    def test_no_connector_is_handed_kv_without_a_transfer_group(self):
+        # Without --kv-transfer-config the model's KV caches are not inspected.
+        _initialize_kv_cache([["not", "a", "kv", "cache"]])
+
+
+class FakeNixlAgent:
+    """Stands in for NIXL's agent, ``nixl._api.nixl_agent``.
+
+    It records the memory a connector worker registers and the descriptor lists
+    it prepares, and moves no bytes.
+
+    Attributes
+    ----------
+    registered
+        Per ``register_memory`` call still registered, the ``(ranges,
+        mem_type)`` given to ``get_reg_descs``.
+    prepared
+        Per agent name, the last ``prep_xfer_dlist`` rows ``(address, bytes,
+        device ID, stride, count)`` and memory type. The local agent is
+        ``"NIXL_INIT_AGENT"``; a remote one is named by its metadata.
+    """
+
+    def __init__(self, name: str, config=None):
+        self.name = name
+        self.registered: list[tuple[list, str]] = []
+        self.prepared: dict[str, tuple[list[list[int]], str]] = {}
+
+    def get_agent_metadata(self) -> bytes:
+        return self.name.encode()
+
+    def add_remote_agent(self, metadata: bytes) -> str:
+        return metadata.decode()
+
+    def remove_remote_agent(self, name: str) -> None:
+        pass
+
+    def get_reg_descs(self, ranges: list, mem_type: str) -> tuple[list, str]:
+        return ranges, mem_type
+
+    def register_memory(self, descs: tuple[list, str], backends=None) -> None:
+        self.registered.append(descs)
+
+    def deregister_memory(self, descs: tuple[list, str]) -> None:
+        self.registered.remove(descs)
+
+    def prep_xfer_dlist(self, agent_name: str, descs: np.ndarray, mem_type: str):
+        self.prepared[agent_name] = (descs.tolist(), mem_type)
+        return len(self.prepared)
+
+    def release_dlist_handle(self, handle) -> None:
+        pass
+
+    def release_xfer_handle(self, handle) -> None:
+        pass
+
+
+@pytest.fixture
+def fake_nixl(monkeypatch) -> None:
+    """NIXL connector workers get a ``FakeNixlAgent``, with or without nixl."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker
+
+    monkeypatch.setattr(base_worker, "NixlWrapper", FakeNixlAgent)
+    monkeypatch.setattr(base_worker, "nixl_agent_config", None)
+
+
+def _nixl_connector(kv_role: str = "kv_producer", block_size: int = BLOCK_SIZE):
+    """A worker-side NixlConnector for one attention layer, as a server builds it.
+
+    Each call has its own ``VllmConfig``, so its own engine ID.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
+        NixlConnector,
+    )
+
+    vllm_config = _real_scheduler(output_width=1).vllm_config
+    vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="NixlConnector", kv_role=kv_role, kv_buffer_device="tt"
+    )
+    vllm_config.cache_config.block_size = block_size
+    model_config = vllm_config.model_config
+    spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=model_config.get_total_num_kv_heads(),
+        head_size=model_config.get_head_size(),
+        dtype=model_config.dtype,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=NUM_BLOCKS,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec([LAYER_NAMES[1]], spec)],
+    )
+    # The platform config hook installs these in a server.
+    _install_tt_nixl_single_rank_patch()
+    _install_tt_nixl_dram_registration_patch()
+    return NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
+
+
+def _dram_layout(
+    device_ids: list[int], heads: int = 1, parts=None, block_size: int = BLOCK_SIZE
+) -> KVDramLayout:
+    """The DRAM layout of one layer's K and V, split over ``device_ids``."""
+    (k, v) = _kv_caches(
+        num_layers=1, heads=heads, chips=len(device_ids), block_size=block_size
+    )[0]
+    shards = tuple((chip,) for chip in range(len(device_ids)))
+    for cache in (k, v):
+        cache.device_ids = device_ids
+    layout = KVLayout(
+        {LAYER_NAMES[1]: tuple(KVPart(c, c.block_bytes, shards) for c in (k, v))}
+    )
+    return kv_dram_layout(layout, NUM_BLOCKS, parts)
+
+
+def _handshake_metadata(connector):
+    """What the worker sends another server in a NIXL handshake."""
+    import msgspec
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
+
+    payload = connector.connector_worker.xfer_handshake_metadata
+    return msgspec.msgpack.decode(payload.agent_metadata_bytes, type=NixlAgentMetadata)
+
+
+def _rows(layout: KVDramLayout, reader: KVDramLayout | None = None) -> list[list[int]]:
+    """The NIXL descriptor of each region of ``layout``'s one layer.
+
+    A row is ``(bank address, bytes, card, block stride, blocks)``. With
+    ``reader``, the bytes are those of the reader's region in the same place:
+    a pull reads as many bytes as the local region holds.
+    """
+    (regions,) = layout.regions.values()
+    (sizes,) = (reader or layout).regions.values()
+    return [
+        [r.addr, size.block_bytes, r.card, r.block_stride, NUM_BLOCKS]
+        for r, size in zip(regions, sizes, strict=True)
+    ]
+
+
+class TestNixlConnectorOnTT:
+    """What vLLM's NixlConnector worker asks of TT, and records, when it starts."""
+
+    def test_nixl_accepts_tt_with_its_kv_in_card_dram_only(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+            _NIXL_SUPPORTED_DEVICE,
+        )
+        from vllm.platforms import current_platform
+
+        # No CPU buffer: NIXL transfers card memory.
+        assert _NIXL_SUPPORTED_DEVICE[current_platform.device_type] == ("tt",)
+
+    def test_nixl_finds_tt_attention_and_keeps_the_block_size(self, vllm_config):
+        from vllm.distributed.kv_transfer.kv_connector.utils import (
+            get_current_attn_backends,
+        )
+        from vllm.v1.worker.utils import select_common_block_size
+
+        # TT runs no vLLM attention layer, so NIXL asks the platform. Two
+        # servers compare the backend name; a kernel block size other than the
+        # block size would split each block.
+        (backend,) = get_current_attn_backends(vllm_config)
+        assert backend.get_name() == "TT"
+        assert select_common_block_size(BLOCK_SIZE, [backend]) == BLOCK_SIZE
+
+    def test_the_nixl_worker_is_rank_0_of_1(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker
+
+        # TT creates no tensor-parallel group to ask.
+        _install_tt_nixl_single_rank_patch()
+
+        assert base_worker.get_tensor_model_parallel_rank() == 0
+        assert base_worker.get_tensor_model_parallel_world_size() == 1
+
+    def test_the_nixl_worker_transfers_card_memory(self, fake_nixl):
+        connector = _nixl_connector()
+        try:
+            worker = connector.connector_worker
+            # What NIXL's Tenstorrent build calls card memory.
+            assert not worker.use_host_buffer
+            assert worker.nixl_memory_type == "VRAM"
+            # The worker hands the platform its NIXL device ID before a
+            # handshake; TT needs no device context for it.
+            TTPlatform.set_device(worker.device_id)
+        finally:
+            connector.shutdown()
+
+    def test_the_nixl_worker_registers_banks_and_describes_regions(
+        self, fake_nixl, cluster
+    ):
+        connector = _nixl_connector()
+        # Mesh index 0 is device 2 (card 12), index 1 is device 1 (card 11).
+        layout = _dram_layout([2, 1])
+        try:
+            connector.register_kv_caches(layout)
+
+            agent = connector.connector_worker.nixl_wrapper
+            # Each bank once, whole, as card memory.
+            assert agent.registered == [
+                ([(*bank, "") for bank in layout.banks], "VRAM")
+            ]
+            # A strided descriptor per region, on that region's card: K's
+            # banks on each chip, then V's.
+            assert agent.prepared["NIXL_INIT_AGENT"] == (_rows(layout), "VRAM")
+            # What the other server learns in the handshake.
+            metadata = _handshake_metadata(connector)
+            (regions,) = layout.regions.values()
+            assert metadata.block_lens == [r.block_bytes for r in regions]
+            assert metadata.block_strides == [r.block_stride for r in regions]
+            assert metadata.region_mem_types == ["VRAM"] * len(regions)
+            assert metadata.region_names == [LAYER_NAMES[1]] * len(regions)
+        finally:
+            connector.shutdown()
+
+    def test_a_decode_worker_reads_each_region_from_the_prefill_cards(
+        self, fake_nixl, cluster
+    ):
+        """A 1-chip prefill server listed in 2 parts hands its KV to a 2-chip
+        decode server: the handshake passes vLLM's checks, and the decode
+        worker reads each of its regions from the prefill region in the same
+        place, on the prefill server's card."""
+        prefill = _nixl_connector("kv_producer")
+        decode = _nixl_connector("kv_consumer")
+        sent = _dram_layout([0], heads=CHIPS, parts=CHIPS)
+        received = _dram_layout([1, 2])
+        try:
+            prefill.register_kv_caches(sent)
+            decode.register_kv_caches(received)
+
+            worker = decode.connector_worker
+            agent_name = worker.add_remote_agent(_handshake_metadata(prefill))
+
+            # Each read takes the decode region's bytes, from the prefill
+            # region's address and card, block after block at its stride.
+            assert worker.nixl_wrapper.prepared[agent_name] == (
+                _rows(sent, reader=received),
+                "VRAM",
+            )
+            assert worker.nixl_wrapper.prepared["NIXL_INIT_AGENT"] == (
+                _rows(received),
+                "VRAM",
+            )
+        finally:
+            prefill.shutdown()
+            decode.shutdown()
+
+    def test_a_peer_with_another_block_size_is_refused_before_any_read(
+        self, fake_nixl, cluster
+    ):
+        """vLLM pairs a larger block with smaller ones by cutting it into
+        contiguous byte ranges. A TT block is tiles per bank, heads first, so
+        those ranges are not whole token blocks and a read would put tiles in
+        the wrong place. The handshake refuses the peer before any descriptor
+        for it exists."""
+        prefill = _nixl_connector("kv_producer", block_size=BLOCK_SIZE // 2)
+        decode = _nixl_connector("kv_consumer")
+        try:
+            prefill.register_kv_caches(_dram_layout([0], block_size=BLOCK_SIZE // 2))
+            decode.register_kv_caches(_dram_layout([1]))
+            worker = decode.connector_worker
+
+            with pytest.raises(NotImplementedError, match="block size"):
+                worker.add_remote_agent(_handshake_metadata(prefill))
+            assert set(worker.nixl_wrapper.prepared) == {"NIXL_INIT_AGENT"}
+        finally:
+            prefill.shutdown()
+            decode.shutdown()
+
+    def test_registering_card_dram_records_what_upstream_records_for_tensors(
+        self, fake_nixl, cluster
+    ):
+        """The DRAM registration replaces an upstream method whose records
+        other upstream code reads. It fails when a vLLM update makes the
+        upstream method record more."""
+        upstream = _nixl_connector()
+        ours = _nixl_connector()
+        (group,) = upstream.connector_worker.kv_cache_config.kv_cache_groups
+        page_bytes = group.kv_cache_spec.page_size_bytes
+        # A torch cache NIXL registers in place, one page per block.
+        kv_caches = {
+            LAYER_NAMES[1]: torch.zeros(NUM_BLOCKS, page_bytes, dtype=torch.uint8)
+        }
+        try:
+            by_upstream = _changed_attributes(
+                upstream.connector_worker,
+                lambda: upstream.register_kv_caches(kv_caches),
+            )
+            by_ours = _changed_attributes(
+                ours.connector_worker,
+                lambda: ours.register_kv_caches(_dram_layout([0])),
+            )
+            assert by_upstream - by_ours == set()
+        finally:
+            upstream.shutdown()
+            ours.shutdown()
+
+
+def _changed_attributes(worker, register) -> set[str]:
+    """Names of ``worker``'s attributes that ``register()`` sets or resizes."""
+
+    def snapshot():
+        return {
+            name: (id(value), len(value) if hasattr(value, "__len__") else None)
+            for name, value in vars(worker).items()
+        }
+
+    before = snapshot()
+    register()
+    after = snapshot()
+    return {name for name in after if before.get(name) != after[name]}
 
 
 def _scheduler_with_running_decode():
