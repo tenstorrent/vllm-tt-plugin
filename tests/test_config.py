@@ -192,7 +192,9 @@ def test_supports_device_grammar_rejects_non_boolean(invalid):
 
 
 # A connector the plugin does not refuse by name.
-_CONNECTOR = SimpleNamespace(kv_connector="ExampleConnector", kv_connector_extra_config={})
+_CONNECTOR = SimpleNamespace(
+    kv_connector="ExampleConnector", kv_connector_extra_config={}
+)
 
 
 @pytest.mark.parametrize(
