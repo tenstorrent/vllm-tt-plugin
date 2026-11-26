@@ -97,8 +97,9 @@ def kv_transfer_layout(
     Raises
     ------
     ValueError
-        When the layout leaves out a layer name of ``kv_cache_config``, or
-        a part's ``block_bytes`` or ``shards`` are empty.
+        When the layout leaves out a layer name of ``kv_cache_config``,
+        gives a layer no part, or a part's ``block_bytes`` or ``shards`` are
+        empty.
     """
     declare = getattr(model, "get_kv_transfer_layout", None)
     if declare is None:
@@ -113,6 +114,8 @@ def kv_transfer_layout(
     }
     _check_covers(layers, kv_cache_config)
     for name, parts in layers.items():
+        if not parts:
+            raise ValueError(f"Layer {name} declares no part holding its KV.")
         for part in parts:
             if part.block_bytes <= 0 or not part.shards or not all(part.shards):
                 raise ValueError(f"Layer {name} declares an empty part: {part}.")
