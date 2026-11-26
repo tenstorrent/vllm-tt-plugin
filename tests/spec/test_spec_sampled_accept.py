@@ -90,6 +90,7 @@ def _ordinary_sample(
             output_token_ids=output_token_ids or [[] for _ in range(rows)],
             allowed_token_ids_mask=None,
             bad_words_token_ids={},
+            logprob_token_ids={},
             logitsprocs=LogitsProcessors(),
         ),
     ).sampled_token_ids.view(-1)

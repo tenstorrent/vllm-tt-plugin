@@ -2844,6 +2844,12 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             for local, g in enumerate(req_indices)
             if g in src_bad_words
         }
+        src_logprob_token_ids = input_batch.sampling.logprob_token_ids
+        logprob_token_ids = {
+            local: src_logprob_token_ids[g]
+            for local, g in enumerate(req_indices)
+            if g in src_logprob_token_ids
+        }
 
         # Builtin/custom logits processors hold per-row state over the whole
         # local batch, so the host sampler reuses them as-is.
@@ -2898,6 +2904,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
             bad_words_token_ids_list=[bad_words_token_ids],
+            logprob_token_ids_list=[logprob_token_ids],
             max_num_logprobs=[input_batch.max_num_logprobs],
             logitsprocs_list=[logitsprocs],
             generators_list=[generators],
@@ -4261,6 +4268,8 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         has_always_host_only_sampling_params = (
             not input_batch.no_allowed_token_ids  # allowed_token_ids set
             or input_batch.sampling.bad_words_token_ids  # bad_words set
+            # logprob_token_ids: the device sampler returns no full-vocab logprobs
+            or input_batch.sampling.logprob_token_ids
             or input_batch.sampling.has_active_logitsprocs()  # min_p, logit_bias,
             # min_tokens
             or bool(self.model_config.logits_processors)  # custom logitsprocs
@@ -4629,6 +4638,11 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                     allowed_token_ids_mask = allowed_token_ids_mask[:sz]
 
                 bad_words_token_ids = model_input.bad_words_token_ids_list[dp_rank]
+                logprob_token_ids = (
+                    model_input.logprob_token_ids_list[dp_rank]
+                    if model_input.logprob_token_ids_list is not None
+                    else None
+                )
 
                 logitsprocs = model_input.logitsprocs_list[dp_rank]
                 if logitsprocs is None:
@@ -4643,6 +4657,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                     top_k=top_k,
                     generators=generators,
                     max_num_logprobs=rank_max_num_logprobs,
+                    logprob_token_ids=logprob_token_ids or None,
                     no_penalties=no_penalties,
                     prompt_token_ids=prompt_token_ids,
                     frequency_penalties=frequency_penalty,

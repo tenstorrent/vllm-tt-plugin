@@ -11,8 +11,10 @@ model-output parsers use this layout; existing tests at the root and under
 | [unit/parsers/test_kolibri1.py](unit/parsers/test_kolibri1.py) | Kolibri thinking switches, reasoning/content extraction, streaming, and input ownership |
 | [integration/test_parser_registration.py](integration/test_parser_registration.py) | General entry point and vLLM registries: lazy resolution, aliases, repeated setup, and existing-name precedence |
 | [integration/test_decode_logprobs.py](integration/test_decode_logprobs.py) | Decode controller and runner cooperating on host logprob payloads |
+| [integration/test_logprob_token_ids.py](integration/test_logprob_token_ids.py) | `SamplingParams.logprob_token_ids` through the input batches, host-sampling routing, and `TTHostSampler`, including batches that mix named-id rows with top-N rows |
 | [support/logprobs.py](support/logprobs.py) | Ranked-payload test data shared by those two modules |
 | [tt/test_logprobs.py](tt/test_logprobs.py) | Logprobs returned by a live server on TT hardware |
+| [tt/test_systemone.py](tt/test_systemone.py) | `/v1/systemone` structured decisions on a live server; skips on models vLLM does not serve it for |
 
 Engineering and test-design rules live in
 [AGENTS.md](../AGENTS.md#test-design-and-review-evidence). Environment preparation
