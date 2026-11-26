@@ -4479,10 +4479,10 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         keeps the single traced logits buffer safe: the engine samples each
         forward before submitting the next. Stable device-sampled continuations
         can overlap readback; transitions requiring host state drain first.
-        ``spec_penalties``: the step's penalties are applied by a verify of a
-        model declaring ``supports_spec_device_penalties``
-        (``_decode_device_sampled``), so they do not need
-        ``supports_device_penalties``.
+        ``spec_penalties``: a decode step of a speculating launch whose model
+        declares ``supports_spec_device_penalties``
+        (``_decode_device_sampled``); the model applies the step's penalties
+        itself, so they do not need ``supports_device_penalties``.
         """
         want_device_sampling = self.sample_on_device_mode == "all" or (
             self.sample_on_device_mode == "decode_only" and is_decode
