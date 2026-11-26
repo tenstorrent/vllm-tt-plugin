@@ -139,6 +139,16 @@ class TestDeclaredLayout:
         with pytest.raises(ValueError, match="does not describe layers"):
             kv_transfer_layout(Model(), None, _config(["model.layers.0.attn"], 2))
 
+    def test_a_declared_layer_without_parts_is_refused(self):
+        # Naming a layer without any tensor would describe zero bytes of KV
+        # for it, and a transfer would move nothing for that layer.
+        class Model:
+            def get_kv_transfer_layout(self, kv_caches, kv_cache_config):
+                return {"model.layers.0.attn": []}
+
+        with pytest.raises(ValueError, match="model.layers.0.attn.*no part"):
+            kv_transfer_layout(Model(), None, _config(["model.layers.0.attn"], 2))
+
 
 def test_importing_the_module_needs_no_ttnn_dtypes(monkeypatch):
     # Model test suites import the plugin with their own partial ttnn stubs.
