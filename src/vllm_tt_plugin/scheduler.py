@@ -532,6 +532,9 @@ class TTScheduler(AsyncScheduler):
             )
         self._take_published_prefix_hit_confirmer()
         self._forced_mode = TTSchedulingMode.DEFAULT
+        # Running decodes _schedule_prefill_only removes from ``running`` for
+        # its base pass, and 0 outside it; see get_request_counts.
+        self._num_hidden_decodes = 0
         # Read only in DEFAULT mode. A lane coordinator sets a forced mode
         # before every one of its lanes' schedule() calls and owns the one
         # policy instance for the whole step, so this one stays dormant there.
@@ -1502,10 +1505,16 @@ class TTScheduler(AsyncScheduler):
 
         Temporarily hides the running *decode* requests so the base scheduler's
         running loop only advances partial prefills, and its waiting loop
-        admits new ones.  Lowers both running caps by the hidden decodes so the
-        waiting loop respects the true capacity: the loop admits against
-        ``max_num_active_reqs``, and the end-of-step check asserts
-        ``max_num_running_reqs``.
+        admits new ones. The hidden decodes still hold their slots and still
+        wait for this step, so the pass keeps two counts true for them:
+
+        - Both running caps are lowered by the hidden decodes, so the waiting
+          loop respects the true capacity: the loop admits against
+          ``max_num_active_reqs``, and the end-of-step check asserts
+          ``max_num_running_reqs``.
+        - ``_num_hidden_decodes`` holds their number, so
+          ``get_request_counts`` still reports them and the base pass keeps
+          ``long_prefill_token_threshold`` on a prompt they wait for.
         """
         pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
@@ -1515,12 +1524,14 @@ class TTScheduler(AsyncScheduler):
         self.running = cast(list[Request], partial_prefills)
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
         self.max_num_active_reqs = max(0, saved_active - len(pure_decodes))
+        self._num_hidden_decodes = len(pure_decodes)
         try:
             result = super().schedule()
         finally:
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
             self.max_num_active_reqs = saved_active
+            self._num_hidden_decodes = 0
         return result
 
     def _schedule_decode_only(self) -> SchedulerOutput:
@@ -1939,6 +1950,36 @@ class TTScheduler(AsyncScheduler):
             elif not solo or first_id != owner:
                 owner = None
         self._spec_session_owner = owner
+
+    def get_request_counts(self) -> tuple[int, int]:
+        """Count the running and waiting requests, hidden decodes included.
+
+        Returns
+        -------
+        tuple[int, int]
+            ``(num_running_reqs, num_waiting_reqs)`` as vLLM's
+            ``Scheduler.get_request_counts`` counts the queues, plus, in the
+            running count, the decodes ``_schedule_prefill_only`` removes from
+            ``running`` for its base pass. Outside that pass no decode is
+            hidden and the counts are vLLM's.
+
+        Notes
+        -----
+        vLLM's ``Scheduler.schedule`` applies ``long_prefill_token_threshold``
+        only when these counts add up to more than one request: the cap stops a
+        long prefill from starving the other requests, and a lone request has
+        none to starve. A TT step cannot mix prefill and decode rows, so every
+        decode hidden from a prefill pass waits for the whole step. Without
+        them, a long prompt that arrives beside running decodes, and the only
+        continuing partial prefill, count as one request and take the whole
+        token budget in one step. The same sum sets the fair share at which
+        ``long_prefill_token_threshold_adaptive`` floors the cap.
+
+        ``TTLaneCoordinator`` lane routing and ``make_stats`` call this between
+        scheduling passes, when no decode is hidden.
+        """
+        num_running, num_waiting = super().get_request_counts()
+        return num_running + self._num_hidden_decodes, num_waiting
 
     def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
         """None on a lane: TTLaneCoordinator.make_stats makes the step's one
