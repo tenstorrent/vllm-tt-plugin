@@ -320,7 +320,12 @@ def _initialize_kv_cache(kv_caches: list, model=None, tt_kv_parts=None) -> None:
     )
 
 
-def _kv_caches(num_layers: int = 2, heads: int = 1, chips: int = CHIPS) -> list:
+def _kv_caches(
+    num_layers: int = 2,
+    heads: int = 1,
+    chips: int = CHIPS,
+    block_size: int = BLOCK_SIZE,
+) -> list:
     """A bfloat8_b K and V per layer, each at its own buffer address."""
     return [
         [
@@ -328,7 +333,7 @@ def _kv_caches(num_layers: int = 2, heads: int = 1, chips: int = CHIPS) -> list:
                 blocks=NUM_BLOCKS,
                 heads=heads,
                 chips=chips,
-                block_size=BLOCK_SIZE,
+                block_size=block_size,
                 head_dim=HEAD_SIZE,
                 address=0x100000 * (2 * layer + i + 1),
             )
@@ -467,7 +472,7 @@ def fake_nixl(monkeypatch) -> None:
     monkeypatch.setattr(base_worker, "nixl_agent_config", None)
 
 
-def _nixl_connector(kv_role: str = "kv_producer"):
+def _nixl_connector(kv_role: str = "kv_producer", block_size: int = BLOCK_SIZE):
     """A worker-side NixlConnector for one attention layer, as a server builds it.
 
     Each call has its own ``VllmConfig``, so its own engine ID.
@@ -480,9 +485,10 @@ def _nixl_connector(kv_role: str = "kv_producer"):
     vllm_config.kv_transfer_config = KVTransferConfig(
         kv_connector="NixlConnector", kv_role=kv_role, kv_buffer_device="tt"
     )
+    vllm_config.cache_config.block_size = block_size
     model_config = vllm_config.model_config
     spec = FullAttentionSpec(
-        block_size=BLOCK_SIZE,
+        block_size=block_size,
         num_kv_heads=model_config.get_total_num_kv_heads(),
         head_size=model_config.get_head_size(),
         dtype=model_config.dtype,
@@ -498,9 +504,13 @@ def _nixl_connector(kv_role: str = "kv_producer"):
     return NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
 
 
-def _dram_layout(device_ids: list[int], heads: int = 1, parts=None) -> KVDramLayout:
+def _dram_layout(
+    device_ids: list[int], heads: int = 1, parts=None, block_size: int = BLOCK_SIZE
+) -> KVDramLayout:
     """The DRAM layout of one layer's K and V, split over ``device_ids``."""
-    (k, v) = _kv_caches(num_layers=1, heads=heads, chips=len(device_ids))[0]
+    (k, v) = _kv_caches(
+        num_layers=1, heads=heads, chips=len(device_ids), block_size=block_size
+    )[0]
     shards = tuple((chip,) for chip in range(len(device_ids)))
     for cache in (k, v):
         cache.device_ids = device_ids
@@ -638,6 +648,28 @@ class TestNixlConnectorOnTT:
                 _rows(received),
                 "VRAM",
             )
+        finally:
+            prefill.shutdown()
+            decode.shutdown()
+
+    def test_a_peer_with_another_block_size_is_refused_before_any_read(
+        self, fake_nixl, cluster
+    ):
+        """vLLM pairs a larger block with smaller ones by cutting it into
+        contiguous byte ranges. A TT block is tiles per bank, heads first, so
+        those ranges are not whole token blocks and a read would put tiles in
+        the wrong place. The handshake refuses the peer before any descriptor
+        for it exists."""
+        prefill = _nixl_connector("kv_producer", block_size=BLOCK_SIZE // 2)
+        decode = _nixl_connector("kv_consumer")
+        try:
+            prefill.register_kv_caches(_dram_layout([0], block_size=BLOCK_SIZE // 2))
+            decode.register_kv_caches(_dram_layout([1]))
+            worker = decode.connector_worker
+
+            with pytest.raises(NotImplementedError, match="block size"):
+                worker.add_remote_agent(_handshake_metadata(prefill))
+            assert set(worker.nixl_wrapper.prepared) == {"NIXL_INIT_AGENT"}
         finally:
             prefill.shutdown()
             decode.shutdown()

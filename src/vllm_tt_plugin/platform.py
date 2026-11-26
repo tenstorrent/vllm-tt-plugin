@@ -868,6 +868,12 @@ def _install_tt_nixl_dram_registration_patch() -> None:
     address does not use, and the patched ``_build_fa_local`` and
     ``_build_fa_remote`` move it into each descriptor's device ID.
 
+    The patched ``add_remote_agent`` refuses a peer whose block size differs
+    before upstream builds any descriptor for it. Upstream pairs a larger
+    block with smaller ones by cutting it into contiguous byte ranges; a TT
+    block is tiles dealt over the DRAM banks, heads first, so those ranges do
+    not hold whole token blocks.
+
     Raises
     ------
     RuntimeError
@@ -895,7 +901,7 @@ def _install_tt_nixl_dram_registration_patch() -> None:
                 f"vLLM's NIXL base_worker no longer has {name}; update "
                 "_install_tt_nixl_dram_registration_patch for this vLLM version."
             )
-    for name in ("_build_fa_local", "_build_fa_remote"):
+    for name in ("_build_fa_local", "_build_fa_remote", "add_remote_agent"):
         if not hasattr(worker_cls, name):
             raise RuntimeError(
                 f"vLLM's NIXL connector worker no longer has {name}; update "
@@ -1047,6 +1053,23 @@ def _install_tt_nixl_dram_registration_patch() -> None:
 
     for name in ("_build_fa_local", "_build_fa_remote"):
         setattr(worker_cls, name, card_from_address(getattr(worker_cls, name)))
+
+    upstream_add = worker_cls.add_remote_agent
+
+    def add_remote_agent(self, nixl_agent_meta, *args, **kwargs):
+        if (
+            getattr(self, "tt_card_in_address", False)
+            and nixl_agent_meta.block_size != self.block_size
+        ):
+            raise NotImplementedError(
+                "KV in TT card DRAM needs the same block size on both servers: "
+                f"local block size {self.block_size}, block size "
+                f"{nixl_agent_meta.block_size} on engine {nixl_agent_meta.engine_id}."
+            )
+        return upstream_add(self, nixl_agent_meta, *args, **kwargs)
+
+    add_remote_agent.upstream = upstream_add
+    worker_cls.add_remote_agent = add_remote_agent
 
 
 def _install_diffusion_gemma_architecture_patch() -> None:

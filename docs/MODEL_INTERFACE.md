@@ -69,11 +69,19 @@ refused at launch:
 ```
 
 A server with fewer chips than the other sets `"tt_kv_parts"` in
-`kv_connector_extra_config` to the other server's chip count; the launch
-refuses a value that is not a positive integer. The config hook
-makes the NIXL worker tensor-parallel rank 0 of 1 and lets it register the
+`kv_connector_extra_config` to the other server's shard count per KV part,
+which is its chip count when heads are split one shard per chip (the default
+layout); the launch refuses a value that is not a positive integer. The config
+hook makes the NIXL worker tensor-parallel rank 0 of 1 and lets it register the
 DRAM regions: each DRAM bank once, and one strided descriptor per region, on
 that region's card.
+
+Restrictions: both servers must use the same KV block size, or the handshake
+refuses the peer (vLLM would cut a larger block into contiguous byte ranges,
+which do not hold whole token blocks in TT's tiled layout). The registration
+refuses MLA, Mamba state, pipeline parallelism, and kernel blocks smaller than
+vLLM's block. Data parallelism is refused at launch. The DRAM layout refuses
+the cases listed under "KV in DRAM banks" below.
 
 ### KV transfer layout
 

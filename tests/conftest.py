@@ -125,7 +125,12 @@ def reset_tt_platform_class_state():
         ):
             setattr(nixl_worker, name, getattr(parallel_state, name))
         worker_cls = nixl_worker.NixlBaseConnectorWorker
-        for name in ("register_kv_caches", "_build_fa_local", "_build_fa_remote"):
+        for name in (
+            "register_kv_caches",
+            "_build_fa_local",
+            "_build_fa_remote",
+            "add_remote_agent",
+        ):
             method = getattr(worker_cls, name)
             setattr(worker_cls, name, getattr(method, "upstream", method))
 
