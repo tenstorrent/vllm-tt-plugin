@@ -1,7 +1,7 @@
 # Tests
 
 Tests follow the component and boundary they exercise. Logprobs, logging,
-model-output parsers, and KV transfer layouts and copies use this layout;
+model-output parsers, and KV transfer layouts use this layout;
 existing tests at the root and under `spec/` remain in place until their owning
 area is reorganized.
 
@@ -14,8 +14,7 @@ area is reorganized.
 | [integration/test_decode_logprobs.py](integration/test_decode_logprobs.py) | Decode controller and runner cooperating on host logprob payloads |
 | [support/logprobs.py](support/logprobs.py) | Ranked-payload test data shared by those two modules |
 | [unit/test_kv_layout.py](unit/test_kv_layout.py) | Default and model-declared KV transfer layouts, and the caches the default refuses |
-| [unit/test_kv_transfer.py](unit/test_kv_transfer.py) | Byte order of the copy between ttnn KV tensors and a connector's CPU buffer |
-| [support/kv_cache.py](support/kv_cache.py) | A fake paged KV cache and ttnn region copies over its bytes, shared by the KV tests |
+| [support/kv_cache.py](support/kv_cache.py) | A fake paged KV cache, shared by the KV tests |
 | [tt/test_logprobs.py](tt/test_logprobs.py) | Logprobs returned by a live server on TT hardware |
 
 Engineering and test-design rules live in

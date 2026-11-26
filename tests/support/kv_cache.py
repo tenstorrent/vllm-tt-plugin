@@ -1,17 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
-"""A fake paged KV cache on a TT mesh, and ttnn's region copies over it.
+"""A fake paged KV cache on a TT mesh.
 
-``FakeKVCache`` keeps each chip's buffer as bytes. ``fake_region_copies``
-replaces ``ttnn.copy_device_to_host_regions`` and
-``ttnn.copy_host_to_device_regions`` with their documented behavior over those
-bytes, so KV layout and copy tests can compare bytes without a device.
+``FakeKVCache`` keeps each chip's buffer as bytes, so KV layout tests can
+compare bytes without a device.
 """
 
 from types import SimpleNamespace
 
 import numpy as np
-import pytest
 import ttnn
 
 TILE = 32
@@ -58,44 +55,3 @@ class FakeKVCache:
     def blocks_on(self, chip: int) -> np.ndarray:
         """Chip ``chip``'s buffer as ``[blocks, block_bytes]``."""
         return self.chips[chip].reshape(-1, self.block_bytes)
-
-
-def fake_region_copies(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
-    """Replace ttnn's region copies with their behavior over ``FakeKVCache``.
-
-    A region is a row ``(chip, offset on the chip, bytes, offset in host)``,
-    where ``host`` is the contiguous numpy array the copy reads or writes. A
-    region outside ``host`` raises ``RuntimeError``, as in ttnn. A released
-    ttnn may lack both functions, so they are set, not replaced.
-
-    Returns
-    -------
-    list[bool]
-        The ``blocking`` argument of every call so far, in call order.
-    """
-    blocking_calls: list[bool] = []
-
-    def host_bytes(host: np.ndarray, start: int, size: int) -> np.ndarray:
-        flat = host.reshape(-1).view(np.uint8)
-        if start + size > flat.size:
-            raise RuntimeError(
-                f"region is outside the host array: host offset {start} + size "
-                f"{size} > {flat.size} bytes"
-            )
-        return flat[start : start + size]
-
-    def to_host(cache, host, regions, blocking=True, cq_id=None):
-        blocking_calls.append(blocking)
-        for chip, offset, size, start in np.asarray(regions, dtype=np.uint64):
-            data = cache.chips[int(chip)][int(offset) : int(offset + size)]
-            host_bytes(host, int(start), int(size))[:] = data
-
-    def to_device(cache, host, regions, blocking=True, cq_id=None):
-        blocking_calls.append(blocking)
-        for chip, offset, size, start in np.asarray(regions, dtype=np.uint64):
-            data = host_bytes(host, int(start), int(size))
-            cache.chips[int(chip)][int(offset) : int(offset + size)] = data
-
-    monkeypatch.setattr(ttnn, "copy_device_to_host_regions", to_host, raising=False)
-    monkeypatch.setattr(ttnn, "copy_host_to_device_regions", to_device, raising=False)
-    return blocking_calls

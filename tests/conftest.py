@@ -112,18 +112,6 @@ def reset_tt_platform_class_state():
                 module.lifespan = saved_lifespan
     torch.accelerator.empty_cache = saved_empty_cache
     kv_transfer_state._sync_engine_id_across_tp = saved_sync_engine_id
-    # Loaded only once a test has built a NIXL connector or installed the patch.
-    nixl_worker = sys.modules.get(
-        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker"
-    )
-    if nixl_worker is not None:
-        from vllm.distributed import parallel_state
-
-        for name in (
-            "get_tensor_model_parallel_rank",
-            "get_tensor_model_parallel_world_size",
-        ):
-            setattr(nixl_worker, name, getattr(parallel_state, name))
 
     engine_core.EngineCore.reset_prefix_cache = saved_reset_prefix_cache
     engine_core.EngineCore.pause_scheduler = saved_pause_scheduler

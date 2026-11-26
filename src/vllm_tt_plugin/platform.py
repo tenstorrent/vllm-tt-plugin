@@ -67,8 +67,6 @@ if TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.utils.argparse_utils import FlexibleArgumentParser
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
-    from vllm.v1.attention.selector import AttentionSelectorConfig
 else:
     FlexibleArgumentParser = object
 
@@ -815,34 +813,6 @@ def _install_tt_kv_engine_id_sync_patch() -> None:
         return original(vllm_config) if tp_size != 1 or pp_size != 1 else None
 
     kv_transfer_state._sync_engine_id_across_tp = patched_sync_engine_id
-
-
-def _install_tt_nixl_single_rank_patch() -> None:
-    """Tell the NIXL connector worker that it is rank 0 of 1.
-
-    The worker reads its tensor-parallel rank and world size through
-    ``get_tp_group()``, which TT never creates (see
-    ``_install_tt_kv_engine_id_sync_patch``). TT pins tensor parallelism to 1,
-    so the answers are fixed.
-
-    Raises
-    ------
-    RuntimeError
-        When vLLM's NIXL ``base_worker`` no longer imports the two functions.
-    """
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker
-
-    for name in (
-        "get_tensor_model_parallel_rank",
-        "get_tensor_model_parallel_world_size",
-    ):
-        if not hasattr(base_worker, name):
-            raise RuntimeError(
-                f"vLLM's NIXL base_worker no longer imports {name}; update "
-                "_install_tt_nixl_single_rank_patch for this vLLM version."
-            )
-    base_worker.get_tensor_model_parallel_rank = lambda: 0
-    base_worker.get_tensor_model_parallel_world_size = lambda: 1
 
 
 def _install_diffusion_gemma_architecture_patch() -> None:
@@ -1867,29 +1837,6 @@ class TTPlatform(Platform):
         return True
 
     @classmethod
-    def get_attn_backend_cls(
-        cls,
-        selected_backend: "AttentionBackendEnum | None",
-        attn_selector_config: "AttentionSelectorConfig",
-        num_heads: int | None = None,
-    ) -> str:
-        """Name ``TTAttentionBackend``, whatever backend vLLM selected.
-
-        TT runs no vLLM attention, but code outside the forward pass, such as
-        ``NixlConnector``, still asks for a backend class.
-        """
-        return "vllm_tt_plugin.attention_backend.TTAttentionBackend"
-
-    @classmethod
-    def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
-        """Let NIXL run on TT only with ``"kv_buffer_device": "cpu"``.
-
-        NIXL cannot register TT device memory, so a NIXL connector stages KV
-        through a CPU buffer that the plugin copies to and from the chips.
-        """
-        return {"tt": ("cpu",)}
-
-    @classmethod
     def pre_register_and_update(
         cls, parser: FlexibleArgumentParser | None = None
     ) -> None:
@@ -2595,8 +2542,6 @@ class TTPlatform(Platform):
         _install_tt_dp_prefix_cache_routing_patch()
         if vllm_config.kv_transfer_config is not None:
             _install_tt_kv_engine_id_sync_patch()
-            if vllm_config.kv_transfer_config.kv_connector == "NixlConnector":
-                _install_tt_nixl_single_rank_patch()
         if is_block_output_model:
             _install_block_output_streaming_input_patch()
 

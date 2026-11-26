@@ -9,7 +9,7 @@ over the chips or copied to all of them. ``KVLayout`` describes these cases the
 same way, as long as each part is paged by vLLM block ID. For each layer name it
 lists the paged device tensors, called parts here, that hold a block, how many
 bytes one block of a part takes on one chip, and which chips hold which shard
-of it. Connectors and the copy between chips and host only read the layout.
+of it. Connectors only read the layout.
 
 A model declares its layout with an optional ``get_kv_transfer_layout`` method
 (see ``docs/MODEL_INTERFACE.md``). Without it, ``default_kv_layout`` derives
@@ -46,7 +46,7 @@ class KVPart:
         Bytes of one block on one chip.
     shards
         Per shard, in transfer order, the mesh devices (row-major index) that
-        hold it. A copy reads a shard from its first device and writes it to
+        hold it. A transfer reads a shard from its first device and writes it to
         all of them.
     """
 
