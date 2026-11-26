@@ -140,6 +140,24 @@ predecessor first. Sources:
 [spec_chain.py](../src/vllm_tt_plugin/spec_chain.py) and
 [mamba_state.py](../src/vllm_tt_plugin/mamba_state.py).
 
+## Token-masked verify
+
+A model that declares `supports_spec_device_mask` (see
+[model capabilities](MODEL_CAPABILITIES.md)) takes an `argmax_ids` verify of a
+device-sampled step whose rows carry a grammar, `allowed_token_ids`,
+`bad_words` or a pending `min_tokens` in two calls:
+
+| Call | When | What the model does |
+|---|---|---|
+| `decode_forward(..., spec_mode="argmax_ids", defer_device_sampling=True, read_from_device=False)` | `execute_model` | Enqueues the verify forward and returns an opaque payload. No `sampling_params`. At most one payload is pending; another verify or a prefill before it is sampled raises. |
+| `sample_deferred_decode(payload, sampling_params=..., grammar_bitmask=..., num_valid_drafts=...)` | `sample_tokens` | Validates, then draws every column of a row the mask `int32 [rows, 1+K, ceil(V/32)]` constrains from the masked target (a greedy row: the masked argmax), and returns the unread `VerifyOutput` that `decode_forward(..., read_from_device=False)` returns for a verify. `num_valid_drafts` is at most the submitted counts. |
+
+`read_decode_output` and `process_decode_output_host` then read the
+`VerifyOutput` as for any verify. The mask, the rows it covers and the
+runner's routing are in
+[SPEC_DECODE_CONTRACT.md, section 4j](SPEC_DECODE_CONTRACT.md#4j-token-masked-verifies-supports_spec_device_mask).
+Source: [spec_token_mask.py](../src/vllm_tt_plugin/spec_token_mask.py).
+
 ## Prefill behind an unread verify
 
 A model that declares `supports_prefill_over_pending_spec` (see

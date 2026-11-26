@@ -119,6 +119,7 @@ launches without `speculative_config`.
 | `spec_hidden_handoff` | `[]` | How the target hidden state reaches a device drafter: `on_device`, `roundtrip`. Required when `speculative_config.method` needs `hidden_feed`. |
 | `output_tokens_per_step` | `1` | Must stay `1`. A value above 1 selects the block-output rail, which cannot be combined with speculation. |
 | `spec_ids_are_sampled` | `False` | On a device-sampled step an `argmax_ids` verify returns the device sampler's draws: for a drafted row one draw per candidate column under the row's own temperature, top-k, top-p and seed, for an undrafted row the plain decode's own draw. The id walk is then exact rejection sampling against the drafts, so a sampled request is speculable on such a step (a penalised one stays plain: the draws carry no penalty history). On a model that serves both modes the device draws take precedence over the host `logits` walk on a device-sampled step: `_spec_mode_for_step` picks `argmax_ids` where it picked `logits` before (section 4d, rule 2). Greedy rows stay the target argmax; a host-sampled step certifies nothing it did not before. |
+| `supports_spec_device_mask` | `False` | An `argmax_ids` verify of a device-sampled step may defer its sampling to `sample_tokens` and draw every column of a row from the target masked by a packed token mask: the grammar bitmask with `allowed_token_ids`, `bad_words` and a pending `min_tokens`. Such rows are then certifiable by the id walk. Section 4j. |
 | `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
 | `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. |
 
@@ -1041,6 +1042,10 @@ target argmax even with no draft of its own. Padding rows do not decide the
 mode. On a model declaring `spec_ids_are_sampled`, a non-zero temperature
 no longer rules a row out on a device-sampled step (section 4d, rule 2; a
 penalty still does): the `argmax_ids` answer carries the device sampler's draws for it.
+On a model declaring `supports_spec_device_mask`, structured output,
+`allowed_token_ids`, `bad_words` and a pending `min_tokens` no longer rule a
+row out on a device-sampled step either: the verify carries a token mask
+(section 4j).
 
 **What the model returns.** `VerifyOutput(spec_mode="logits", logits=...)`,
 with `logits` a floating point `[B, 1+K, V]` tensor: every submitted row,
@@ -1265,6 +1270,79 @@ a host-sampled step that verify would commit the target argmax, and the
 runner cannot promise every step samples on the device. The capability lifts
 the temperature rule for draft publication and the per-step mode, not for
 admission.
+
+## 4j. Token-masked verifies: `supports_spec_device_mask`
+
+**What it lifts.** Section 4h sends a row with structured output,
+`allowed_token_ids`, `bad_words` or a pending `min_tokens` to a `logits`
+verify: an `argmax_ids` answer cannot carry a control that rules tokens out,
+and the step reads back `[B, 1+K, V]` logits for every row. A model declaring
+`supports_spec_device_mask` (and `spec_ids_are_sampled`, which the platform
+requires) applies those controls on the device instead: it draws each column
+of a constrained row from the target masked by one packed token mask, a greedy
+row the masked argmax. A masked draw never equals a draft the mask forbids, so
+the unchanged id walk stays exact rejection sampling of the masked target, and
+the step reads back `[B, 1+K]` ids.
+
+**When the runner sends one.** `TTModelRunner._decode_mask_sampled` decides
+before the block is built: the model declares the capability, the launch
+offers `argmax_ids` (and not `fused_sample`), the step is front-packed (a
+lane-DP step keeps these controls on the host), a live row has one of the four
+controls, and `check_perform_device_sampling(..., token_masks=True)` keeps the
+step on the device once those controls leave the host (`min_p`, `logit_bias`,
+custom logits processors and an unservable `top_k` still keep it there). The
+block is then built as a device-sampled step, and `_spec_mode_for_step` asks
+for `argmax_ids` where every live row is certifiable under the mask. A row
+stays uncertifiable, and the step verifies in `logits` mode as before, when it
+asks for logprobs, carries a penalty, or its mask can allow no token at some
+column (`spec_token_mask.mask_may_allow_nothing`, at the worst case: every bad
+word fires; a structured row with any other control; an allowlist that the
+bad words and a pending `min_tokens` empty). An ordinary decode never carries
+a mask, so a step that does not verify keeps these rows on the host.
+
+**The call.** `execute_model` submits `decode_forward(..., spec_mode=
+"argmax_ids", num_valid_drafts=..., accepted_counts=...,
+defer_device_sampling=True, read_from_device=False)` with no
+`sampling_params`. The model enqueues the verify forward and returns an
+opaque payload; it holds at most one, and another verify or a prefill before
+the payload is sampled must raise. At `sample_tokens` the runner calls
+`sample_deferred_decode(payload, sampling_params=..., grammar_bitmask=...,
+num_valid_drafts=...)`:
+
+| Argument | Meaning |
+|---|---|
+| `sampling_params` | The step's device sampling parameters, as on any device-sampled verify. |
+| `grammar_bitmask` | The token mask, `int32 [rows, 1+K, ceil(V/32)]` over every row of the block, xgrammar's packing (bit `v % 32` of word `v // 32` allows token `v`), a row of -1 words constraining nothing; `None` when no row is constrained. Column `j` of a row is the mask after the row's committed output and its first `j` drafts. |
+| `num_valid_drafts` | `[rows]`, at most the submitted counts: a structured row whose drafts the scheduler did not validate walks with none (`_grammar_validated_drafts`), as in section 4h. |
+
+The model validates before it changes state (a stale payload, another shape,
+a column a row can commit that allows no token, more drafts than submitted),
+draws every column of a constrained row from the masked target, and returns
+the verify's unread `VerifyOutput`, as `decode_forward(...,
+read_from_device=False)` returns it. Any exception after the forward is
+terminal: the runner poisons itself as for device grammar
+(`TTAsyncDecodeController.complete_deferred_spec_sampling`).
+
+**The mask.** `spec_token_mask.step_static_token_mask` builds every control
+but the grammar at build time, because the controls read the committed output
+(`TTModelInput.spec_token_mask`): `allowed_token_ids` and one-token bad words
+from a per-request cache, a longer bad word at a column whose history
+(committed output plus the first `j` drafts) ends with its prefix, and the
+stop ids at a column `j` below the remaining `min_tokens`. `sample_tokens`
+ANDs the scheduler's grammar bitmask into it (`compose_token_mask`). The
+rules are the `logits` walk's (`spec_accept.apply_speculative_token_filters`
+and `_apply_grammar_bitmask`), so the mask rules out exactly what the host
+walk rules out.
+
+**Paths.** Under asynchronous scheduling the verify is registered as a
+pending step at `execute_model` and sampled, with its read started, at
+`sample_tokens` (`AsyncTTSpecDecodeOutput.sample_deferred`), before anything
+resolves it. `plan_chain` drains a step with these rows as before
+(`"grammar"`, or `"sampling"` for the three other controls), and a chained
+step never defers its sampling. Synchronously the step is sampled and read at
+`sample_tokens` (`TTModelRunner._sample_token_masked_verify`). The runner
+counts verifies by accept mode, and the token-masked ones, on the
+`TT submissions` cadence (`TT verifies by accept mode`).
 
 ## 5. One request, from prefill to release
 
