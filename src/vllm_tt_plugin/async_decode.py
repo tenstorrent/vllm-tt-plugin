@@ -27,6 +27,7 @@ from vllm_tt_plugin.scheduler import (
 )
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_FUSED_SAMPLE,
     ACCEPT_MODE_LOGITS,
     MODE_REQUIRED_FIELDS,
     PLACEHOLDER_TOKEN_ID,
@@ -37,6 +38,74 @@ from vllm_tt_plugin.structured_output import (
     has_scheduled_structured_outputs,
     has_structured_outputs,
 )
+
+
+def fused_sample_counts(ids: torch.Tensor) -> torch.Tensor:
+    """Each row's committed count in a ``fused_sample`` block: the columns before
+    its first ``PLACEHOLDER_TOKEN_ID``, or the whole width. 0 for a row whose
+    column 0 is the placeholder, which ``refuse_empty_fused_rows`` refuses."""
+    pad = ids == PLACEHOLDER_TOKEN_ID
+    width = int(ids.shape[1])
+    return torch.where(
+        pad.any(dim=1),
+        pad.to(torch.int64).argmax(dim=1),
+        torch.full((int(ids.shape[0]),), width, dtype=torch.int64),
+    )
+
+
+def refuse_empty_fused_rows(counts: torch.Tensor) -> None:
+    """Refuse a ``fused_sample`` block in which a row commits nothing.
+
+    Every row commits its column 0, a padding row included (count 1, as an
+    ``argmax_ids`` padding row). A row whose column 0 is
+    ``PLACEHOLDER_TOKEN_ID`` would publish the placeholder as a live request's
+    output token, or hand the drafter a count of 0 for a padding row.
+    """
+    empty = (counts < 1).nonzero().reshape(-1).tolist()
+    if empty:
+        raise ValueError(
+            f"a fused_sample verify commits nothing on rows {empty}: their "
+            "column 0 is PLACEHOLDER_TOKEN_ID, and every row, a padding row "
+            "included, commits its column 0"
+        )
+
+
+def fused_sample_ids(verify: VerifyOutput) -> torch.Tensor:
+    """A ``fused_sample`` verify's ``[B, 1+K]`` committed ids, checked against
+    its counts."""
+    ids = torch.as_tensor(verify.accepted_token_ids).to(torch.int64)
+    counts = torch.as_tensor(verify.accepted_counts).reshape(-1).to(torch.int64)
+    if (
+        ids.dim() != 2
+        or int(ids.shape[1]) < 1
+        or int(counts.numel()) != int(ids.shape[0])
+    ):
+        raise ValueError(
+            "a fused_sample verify returns [B, 1+K] accepted_token_ids (at least "
+            "one column) and [B] accepted_counts, got "
+            f"{tuple(ids.shape)} / {tuple(counts.shape)}"
+        )
+    # A count, in [1, 1+K] like the counts a verify takes (spec_decode's
+    # check_spec_side_tensors): 0 is never valid, not even on a padding row,
+    # which commits its column 0 with a count of 1.
+    width = int(ids.shape[1])
+    out_of_range = counts[(counts < 1) | (counts > width)]
+    if out_of_range.numel():
+        raise ValueError(
+            "a fused_sample verify's accepted_counts must lie in "
+            f"[1, {width}], its accepted_token_ids' columns, got "
+            f"{out_of_range.tolist()}"
+        )
+    derived = fused_sample_counts(ids)
+    refuse_empty_fused_rows(derived)
+    if not torch.equal(derived, counts):
+        raise ValueError(
+            "a fused_sample verify's accepted_counts disagree with its ids' "
+            f"committed prefixes: counts {counts.tolist()}, prefixes "
+            f"{derived.tolist()}; a row pads its tail with PLACEHOLDER_TOKEN_ID "
+            "right after its last committed token"
+        )
+    return ids
 
 
 def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch.Tensor:
@@ -77,6 +146,12 @@ def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch
         return tt_out.argmax_ids
     if spec_mode == ACCEPT_MODE_LOGITS:
         return tt_out.logits
+    if spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+        # The ids carry the counts: a row's committed prefix ends at its first
+        # PLACEHOLDER_TOKEN_ID (or fills the block), which is the one tensor
+        # every consumer above reads. The model's own counts must say the
+        # same, checked here where both are still in hand.
+        return fused_sample_ids(tt_out)
     raise NotImplementedError(
         f"the runner drives no accept walk for spec_mode {spec_mode!r}"
     )
@@ -389,9 +464,10 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
         both off ``model_input``. Only an ``argmax_ids`` verify has no use for
         a grammar, and no structured row reaches one.
         """
-        if self._model_input.spec_mode == ACCEPT_MODE_ARGMAX_IDS:
+        if self._model_input.spec_mode != ACCEPT_MODE_LOGITS:
             raise RuntimeError(
-                "a grammar bitmask reached an argmax_ids verify, whose ids "
+                f"a grammar bitmask reached a {self._model_input.spec_mode} "
+                "verify, whose ids "
                 "cannot be masked; a structured-output row makes its verify "
                 "ask for logits"
             )

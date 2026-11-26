@@ -62,6 +62,10 @@ from vllm_tt_plugin.platform import (
     _should_pre_register_tt_test_models_from_cli,
     register_tt_models,
 )
+from vllm_tt_plugin.scheduler import (
+    PrefixHitConfirmer,
+    publish_prefix_hit_confirmer,
+)
 from vllm_tt_plugin.utils.dp_discovery import (
     format_tt_visible_devices,
     parse_mesh_grid,
@@ -350,6 +354,10 @@ class TTWorker(WorkerBase):
 
     def load_model(self):
         self.model_runner.load_model()
+        # The scheduler of this process is constructed after the model loads
+        # (EngineCore.__init__: executor, KV caches, then the scheduler) and
+        # takes the confirmer from here; None for a model without one.
+        publish_prefix_hit_confirmer(self._prefix_hit_confirmer())
 
     def take_draft_token_ids(self) -> "DraftTokenIds | None":
         """Hand the runner's proposed drafts to the engine.
@@ -359,6 +367,30 @@ class TTWorker(WorkerBase):
         admission raises ``AttributeError`` on its first step.
         """
         return self.model_runner.take_draft_token_ids()
+
+    def _prefix_hit_confirmer(self) -> PrefixHitConfirmer | None:
+        """The loaded model's ``confirm_prefix_cache_hit(token_ids, mm_items,
+        num_computed_tokens) -> int`` when it declares
+        ``model_capabilities["confirms_prefix_cache_hits"]`` (the platform
+        checked the method is there), else None.
+
+        Raises
+        ------
+        ValueError
+            If the loaded model's declaration is not a boolean.
+        """
+        model = self.model_runner.model
+        capabilities = getattr(model, "model_capabilities", None) or {}
+        confirms = capabilities.get("confirms_prefix_cache_hits", False)
+        if not isinstance(confirms, bool):
+            raise ValueError(
+                f"Model {type(model).__module__}.{type(model).__name__} must "
+                "declare model_capabilities['confirms_prefix_cache_hits'] as a "
+                f"boolean, got {confirms!r}"
+            )
+        if not confirms:
+            return None
+        return model.confirm_prefix_cache_hit
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
@@ -626,6 +658,10 @@ class TTWorker(WorkerBase):
             ensure_kv_transfer_shutdown()
         except Exception:
             logger.exception("KV connector shutdown failed; closing the mesh anyway")
+        # The published prefix-hit confirmer is a bound method of the model:
+        # left in place it would keep the model alive past the mesh close
+        # below. The scheduler holds it weakly.
+        publish_prefix_hit_confirmer(None)
         if getattr(self, "model_runner", None) is not None:
             try:
                 self.model_runner.shutdown()
