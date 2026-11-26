@@ -181,3 +181,57 @@ def test_a_host_answer_unwraps_to_the_pair_a_deferred_read_returns():
     )
     pair = _verify_output_tensor(answer, "M", ACCEPT_MODE_ARGMAX_IDS)
     assert pair[0] is ids and pair[1] is payload
+
+
+def _sampling_runner(declared: bool, asked: list[int]) -> TTModelRunner:
+    """A one-device decode runner over a batch whose rows ask for ``asked``
+    logprobs (-2: none); the device-logprobs rules refuse any such row."""
+    runner = _runner(declared)
+    rows = len(asked)
+    runner.model.model_capabilities.update(
+        supports_sample_on_device=True, max_device_top_k=32
+    )
+    runner.sample_on_device_mode = "decode_only"
+    runner.num_devices, runner.tt_data_parallel_size = 1, 1
+    runner.seeded_sampling_policy = "device"
+    runner.supports_topk_logprobs = False
+    runner.supports_device_grammar = False
+    runner._num_speculative_tokens = 3
+    runner.model_config.logits_processors = None
+    requests = {
+        f"r{i}": SimpleNamespace(
+            sampling_params=SamplingParams(logprobs=None if n < 0 else n)
+        )
+        for i, n in enumerate(asked)
+    }
+    runner.requests = requests
+    runner.input_batch = SimpleNamespace(
+        req_ids=list(requests),
+        req_id_to_index={r: i for i, r in enumerate(requests)},
+        max_num_logprobs=max(asked) if max(asked) >= 0 else None,
+        no_penalties=True,
+        no_allowed_token_ids=True,
+        sampling=SimpleNamespace(
+            temperature=torch.zeros(rows),
+            top_k=torch.ones(rows, dtype=torch.int32),
+            seed=torch.full((rows,), -1),
+            num_logprobs=torch.tensor(asked),
+            bad_words_token_ids={},
+            has_active_logitsprocs=lambda: False,
+        ),
+    )
+    return runner
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_a_verify_step_samples_on_the_device_only_where_the_payload_serves(declared):
+    """Row 1 asks for 3 logprobs, which this one-device launch's device sampler
+    cannot return. A step that may be a verify stays on the device when the
+    model returns the payload; a step without that row does not change
+    route either way; without the declaration nothing changes."""
+    runner = _sampling_runner(declared, [-2, 3])
+    decide = runner.check_perform_device_sampling
+    assert decide(True, False, sampling_rows=[0, 1], spec_verify=True) is declared
+    assert decide(True, False, sampling_rows=[0, 1]) is False
+    # The asking row is not scheduled: the batch-wide rule still decides.
+    assert decide(True, False, sampling_rows=[0], spec_verify=True) is declared

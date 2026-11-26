@@ -4681,7 +4681,9 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
     def _spec_verify_serves_logprobs(self, rows: list[int] | None) -> bool:
         """Whether an ``argmax_ids`` verify's payload serves every logprobs
         request among the persistent batch's ``rows`` (all rows for
-        ``None``)."""
+        ``None``), on a model declaring ``supports_spec_device_logprobs``."""
+        if not self._declares_spec_device_logprobs():
+            return False
         batch = self.input_batch
         if rows is None:
             rows = list(batch.req_id_to_index.values())
