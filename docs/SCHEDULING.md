@@ -318,9 +318,9 @@ reach their first token late. With a limit L above 0:
   short prompt. A model's `confirm_prefix_cache_hit` and a KV connector's
   external tokens are not asked.
 
-`_schedule_prefill_only` hides the held requests from its base `schedule()`
-pass, like the running decodes, and puts them back in their places before it
-returns. A held partial prefill keeps its computed tokens, blocks and slot,
+`_schedule_prefill_only` hides the requests the limit holds back (held
+requests, `HeldPrefills`) from its base `schedule()` pass, like the running
+decodes, and puts them back in their places before it returns. A held partial prefill keeps its computed tokens, blocks and slot,
 and lowers both `max_num_running_reqs` and `max_num_active_reqs` for the pass.
 `get_request_counts` counts the held requests during the pass, so the
 threshold stays on the prompt that runs while they wait. Outside the pass
