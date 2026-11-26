@@ -28,7 +28,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
 )
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
 from tests.support.kv_cache import FakeKVCache, fake_region_copies
@@ -281,6 +281,7 @@ def _initialize_kv_cache(kv_caches: list, model=None) -> None:
         _allocate_kv_caches=lambda _kv_cache_config: kv_caches,
         model=model if model is not None else SimpleNamespace(),
     )
+    runner._kv_caches_by_lane = partial(TTModelRunner._kv_caches_by_lane, runner)
     TTModelRunner.initialize_kv_cache(
         runner,
         KVCacheConfig(
@@ -428,14 +429,27 @@ class TestNixlConnectorOnTT:
         assert base_worker.get_tensor_model_parallel_rank() == 0
         assert base_worker.get_tensor_model_parallel_world_size() == 1
 
-    def test_the_nixl_connector_stages_tt_kv_through_a_cpu_buffer(self, vllm_config):
+    @pytest.mark.parametrize(
+        "connector_name",
+        ["NixlConnector", "TTNixlPushConnector"],
+        ids=["mirror_of_the_pool", "staging_slots"],
+    )
+    def test_the_nixl_connector_stages_tt_kv_through_a_cpu_buffer(
+        self, vllm_config, connector_name
+    ):
         pytest.importorskip("nixl")
         from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
             NixlConnector,
         )
 
+        from vllm_tt_plugin.nixl_staging import TTNixlPushConnector
+
+        connector_cls = {
+            "NixlConnector": NixlConnector,
+            "TTNixlPushConnector": TTNixlPushConnector,
+        }[connector_name]
         vllm_config.kv_transfer_config = KVTransferConfig(
-            kv_connector="NixlConnector",
+            kv_connector=connector_name,
             kv_role="kv_producer",
             kv_buffer_device="cpu",
         )
@@ -451,15 +465,21 @@ class TestNixlConnectorOnTT:
         # The platform config hook installs this in a server.
         _install_tt_nixl_single_rank_patch()
 
-        connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
+        connector = connector_cls(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
         try:
             connector.register_kv_caches(kv_cache_descriptions(kv_cache_config, layout))
 
             # NIXL transfers its own CPU buffer, one transferred block per block:
-            # the K and V of that block on every chip.
-            for buffer in connector.connector_worker.host_xfer_buffers.values():
+            # the K and V of that block on every chip. With staging slots it
+            # has one row per slot, fewer than the pool's blocks.
+            worker = connector.connector_worker
+            rows = NUM_BLOCKS
+            if connector_name == "TTNixlPushConnector":
+                rows = worker.slots.num_slots
+                assert rows < NUM_BLOCKS
+            for buffer in worker.host_xfer_buffers.values():
                 assert buffer.device.type == "cpu"
-                assert buffer.shape[0] == NUM_BLOCKS
+                assert buffer.shape[0] == rows
                 assert buffer[0].nbytes == 2 * CHIPS * BLOCK_BYTES
                 # The copy reads it as one block after another.
                 assert kv_transfer._buffer_bytes(buffer).nbytes == buffer.nbytes
@@ -576,3 +596,200 @@ def test_a_notice_recorded_between_steps_reaches_the_returned_step(async_schedul
 
     assert set(step.num_scheduled_tokens) == {"A"}
     assert step.kv_connector_metadata.loads == {"C": []}
+
+
+class CountingFakeKVConnector(FakeKVConnector):
+    """Counts how often the scheduler half packs its metadata."""
+
+    builds = 0
+
+    def build_connector_meta(self, scheduler_output):
+        CountingFakeKVConnector.builds += 1
+        return super().build_connector_meta(scheduler_output)
+
+
+def _lane_coordinator():
+    """Two real lanes under a coordinator, sharing one fake connector."""
+    from vllm_tt_plugin.config import store_tt_lane_count
+    from vllm_tt_plugin.lane_scheduler import TTLaneCoordinator
+
+    base = _real_scheduler(
+        output_width=1,
+        max_num_seqs=4,
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="CountingFakeKVConnector",
+            kv_connector_module_path=__name__,
+            kv_role="kv_both",
+        ),
+    )
+    store_tt_lane_count(base.vllm_config, 2)
+    coordinator = TTLaneCoordinator(
+        base.vllm_config,
+        base.kv_cache_config,
+        base.structured_output_manager,
+        BLOCK_SIZE,
+    )
+    # Both lanes load "A" (lane 0) and "B" (lane 1) from a remote engine.
+    for lane, req_id in enumerate(("A", "B")):
+        coordinator._req_to_lane[req_id] = lane
+        coordinator.connector.external_tokens[req_id] = BLOCK_SIZE
+        coordinator.add_request(
+            _request(1, request_id=req_id, prompt_length=BLOCK_SIZE + 8)
+        )
+    return coordinator
+
+
+def test_lanes_share_one_connector_and_build_its_metadata_once_per_step():
+    coordinator = _lane_coordinator()
+    assert coordinator.get_kv_connector() is coordinator.connector
+    assert all(lane.connector is coordinator.connector for lane in coordinator.lanes)
+    CountingFakeKVConnector.builds = 0
+
+    step = coordinator.schedule()
+
+    assert CountingFakeKVConnector.builds == 1
+    loads = step.kv_connector_metadata.loads
+    assert set(loads) == {"A", "B"}
+    # Lanes number their blocks independently, so the lane rides along.
+    assert step.kv_connector_metadata.tt_lane_of == {"A": 0, "B": 1}
+
+
+def test_a_finished_load_reaches_only_the_lane_that_holds_the_request():
+    coordinator = _lane_coordinator()
+    step = coordinator.schedule()
+    pool = coordinator.lanes[0].kv_cache_config.num_blocks
+    runner_output = ModelRunnerOutput.with_kv_conn_output_only(
+        KVConnectorOutput(finished_recving={"B"}, invalid_block_ids={pool + 3})
+    )
+
+    lane0, lane1 = coordinator._runner_output_per_lane(runner_output)
+    coordinator.update_from_output(step, runner_output)
+
+    assert lane0.kv_connector_output.finished_recving == set()
+    assert lane1.kv_connector_output.finished_recving == {"B"}
+    assert lane1.kv_connector_output.invalid_block_ids == {3}
+    assert "B" in coordinator.lanes[1].finished_recving_kv_req_ids
+
+
+def _lane_runner(vllm_config, calls: list[str], *, async_decode: bool):
+    """A runner for ``_execute_lane_step`` whose forward and sampling are doubles."""
+    model_input = _model_input(
+        prompt_lens=None if async_decode else [1],
+        tt_sampling_params=SimpleNamespace(enable_log_probs=torch.zeros(1, dtype=bool)),
+    )
+
+    def forward(*_args, **_kwargs):
+        calls.append("forward")
+        return torch.zeros(1)
+
+    def submit_async_lane_decode(*_args):
+        calls.append("forward")
+        controller = SimpleNamespace(
+            complete_decode_step=lambda **_kwargs: SimpleNamespace(),
+            build_runner_output_from_completed_step=lambda *_a, **_k: _lane_output(),
+            enqueue_completed_decode_step=lambda _done: None,
+        )
+        return AsyncTTModelRunnerOutput(
+            controller, object(), model_input, threading.Event(), object()
+        )
+
+    runner = SimpleNamespace(
+        vllm_config=vllm_config,
+        request_specific_rope=False,
+        model=SimpleNamespace(),
+        requests={},
+        encoder_cache={},
+        lane_batch=SimpleNamespace(
+            apply_step_plan=lambda *_args, **_kwargs: False,
+            build_model_input=lambda *_args: model_input,
+            max_num_reqs=2,
+        ),
+        async_decode=SimpleNamespace(
+            can_attempt_steady_lane_decode_from_scheduler=lambda *_a, **_k: False,
+            must_drain_pending_async_steps=lambda *_args: False,
+            apply_completed_decode_steps_before_build=lambda _output: None,
+            capture_submitted_step_context=lambda _req_ids: object(),
+            submit_async_lane_decode=submit_async_lane_decode,
+        ),
+        async_decode_scheduling=async_decode,
+        _pending_samples=deque(),
+        submit_prefill=forward,
+    )
+    for name in (
+        "_reorder_grammar_bitmask",
+        "_finish_lane_sync",
+        "_finish_async_decode",
+    ):
+        setattr(runner, name, partial(getattr(TTModelRunner, name), runner))
+    return runner
+
+
+def _lane_output() -> ModelRunnerOutput:
+    return ModelRunnerOutput(
+        req_ids=["req-0"],
+        req_id_to_index={"req-0": 0},
+        sampled_token_ids=[[7]],
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+def test_a_lane_step_without_tokens_still_runs_the_connector(
+    vllm_config, worker_connector
+):
+    # Both requests wait for remote KV, so the lanes schedule no tokens. The
+    # worker must still bind this step's metadata and start its loads: a push
+    # connector's decode worker sends its block registrations from there.
+    step = _lane_coordinator().schedule()
+    assert step.total_num_scheduled_tokens == 0
+    worker_connector.finished_recving = {"A"}
+    runner = _lane_runner(vllm_config, worker_connector.calls, async_decode=False)
+
+    output = TTModelRunner._execute_lane_step(runner, step)
+
+    assert set(worker_connector.loads_started) == {"A", "B"}
+    assert output.kv_connector_output.finished_recving == {"A"}
+    assert not runner._pending_samples
+
+
+@pytest.mark.parametrize("async_decode", [False, True], ids=["prefill", "async_decode"])
+def test_a_lane_forward_runs_inside_the_connector_step(
+    vllm_config, worker_connector, monkeypatch, async_decode
+):
+    from vllm_tt_plugin.lane_scheduler import TTStepPlan
+
+    monkeypatch.setattr(
+        TTModelRunner, "_finish_lane_sync_impl", lambda *_a, **_k: _lane_output()
+    )
+    worker_connector.finished_recving = {"parked"}
+    plan = TTStepPlan(
+        is_decode=async_decode,
+        capacity=2,
+        scheduled_req_ids=("req-0",),
+        scheduled_rows=(0,),
+        input_rows=(0, 1),
+        req_id_to_row={"req-0": 0},
+        batch_size_per_dp=(1, 1),
+        prefill_empty_slots=None,
+    )
+    step = _scheduler_output()
+    step._tt_step_state = SimpleNamespace(plan=plan)
+    runner = _lane_runner(
+        vllm_config, worker_connector.calls, async_decode=async_decode
+    )
+
+    assert TTModelRunner._execute_lane_step(runner, step) is None
+    output = TTModelRunner.sample_tokens(runner, None)
+    if async_decode:
+        output = output.get_output()
+
+    assert worker_connector.calls == [
+        "bind",
+        "forward",
+        "start_load_kv",
+        "wait_for_save",
+        "get_finished",
+        "clear",
+    ]
+    assert worker_connector.loads_started == {"parked": [3]}
+    assert output.kv_connector_output.finished_recving == {"parked"}

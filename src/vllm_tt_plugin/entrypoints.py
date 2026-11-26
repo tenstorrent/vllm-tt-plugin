@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
-"""Activates TT model/parser registration and optional TT platform discovery.
+"""Activates TT model, parser and KV connector registration and TT platform discovery.
 
 vLLM invokes ``register`` and ``platform_plugin`` through package entry points.
 Model and parser registration imports are deferred until activation so importing
@@ -13,12 +13,14 @@ logger = init_tt_logger(__name__)
 
 
 def register() -> None:
-    """Registers TT models and missing model-output parsers in this vLLM process."""
+    """Registers TT models, missing model-output parsers and TT KV connectors."""
     from vllm_tt_plugin.model_registry import register_tt_models_from_plugin
+    from vllm_tt_plugin.nixl_staging import register_kv_connectors
     from vllm_tt_plugin.parsers.registration import register_parsers
 
     register_tt_models_from_plugin()
     register_parsers()
+    register_kv_connectors()
 
 
 def platform_plugin() -> str | None:

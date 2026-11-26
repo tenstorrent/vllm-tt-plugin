@@ -70,23 +70,25 @@ def kv_cache_descriptions(
     return descriptions
 
 
-def make_copy_blocks(layout: KVLayout) -> CopyBlocksOp:
+def make_copy_blocks(layouts: list[KVLayout]) -> CopyBlocksOp:
     """The copy between the model's ttnn KV tensors and a connector's CPU buffer.
 
     Parameters
     ----------
-    layout
-        The device side: the model's KV transfer layout.
+    layouts
+        The device side: the model's KV transfer layout, one per lane (one in
+        total without lane DP).
 
     Returns
     -------
     CopyBlocksOp
-        ``copy(src, dst, src_block_ids, dst_block_ids, direction)``. The CPU
-        side is the connector's own buffer: per layer name, a ``uint8`` CPU
-        tensor shaped like ``kv_cache_descriptions``, in ``dst`` for
-        ``"d2h"`` and in ``src`` for ``"h2d"``. The other dict holds the
+        ``copy(src, dst, src_block_ids, dst_block_ids, direction, lane=0)``.
+        The CPU side is the connector's own buffer: per layer name, a
+        ``uint8`` CPU tensor shaped like ``kv_cache_descriptions``, in ``dst``
+        for ``"d2h"`` and in ``src`` for ``"h2d"``. The other dict holds the
         descriptions and is ignored. Block ``src_block_ids[i]`` is copied to
-        ``dst_block_ids[i]``.
+        ``dst_block_ids[i]``. ``lane`` names the lane whose blocks the device
+        IDs are: lanes number their blocks independently.
 
     Notes
     -----
@@ -95,8 +97,11 @@ def make_copy_blocks(layout: KVLayout) -> CopyBlocksOp:
     them in order, so the copy returns once all of them have landed.
     """
 
-    def copy_blocks(src, dst, src_block_ids, dst_block_ids, direction) -> None:
+    def copy_blocks(
+        src, dst, src_block_ids, dst_block_ids, direction, lane: int = 0
+    ) -> None:
         """Copy blocks ``src_block_ids`` of ``src`` to ``dst_block_ids``."""
+        layout = layouts[lane]
         to_host = direction == "d2h"
         buffers = dst if to_host else src
         device_ids, host_ids = (

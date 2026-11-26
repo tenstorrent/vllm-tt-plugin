@@ -817,6 +817,12 @@ def _install_tt_kv_engine_id_sync_patch() -> None:
     kv_transfer_state._sync_engine_id_across_tp = patched_sync_engine_id
 
 
+# Connectors built on vLLM's NIXL worker, which asks for a TP group TT never creates.
+_NIXL_CONNECTORS = frozenset(
+    {"NixlConnector", "NixlPushConnector", "TTNixlPushConnector"}
+)
+
+
 def _install_tt_nixl_single_rank_patch() -> None:
     """Tell the NIXL connector worker that it is rank 0 of 1.
 
@@ -2595,7 +2601,7 @@ class TTPlatform(Platform):
         _install_tt_dp_prefix_cache_routing_patch()
         if vllm_config.kv_transfer_config is not None:
             _install_tt_kv_engine_id_sync_patch()
-            if vllm_config.kv_transfer_config.kv_connector == "NixlConnector":
+            if vllm_config.kv_transfer_config.kv_connector in _NIXL_CONNECTORS:
                 _install_tt_nixl_single_rank_patch()
         if is_block_output_model:
             _install_block_output_streaming_input_patch()

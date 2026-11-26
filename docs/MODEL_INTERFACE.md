@@ -46,16 +46,17 @@ storage, device execution, and any model-specific state.
 ## KV connectors
 
 KV connector support on TT is experimental. `--kv-transfer-config` is
-supported without data parallelism, for a model that declares
-`supports_prefix_caching`: a request that loads KV from a connector resumes its
-prefill after that KV, as after a prefix-cache hit, and a model without that
-resume would compute on KV or state that never arrived. With a connector,
+supported on the single-process path, with standard DP (one engine process per
+rank) and with lane DP, which accepts only `TTNixlPushConnector`, for a model
+that declares `supports_prefix_caching`: a request that loads KV from a
+connector resumes its prefill after that KV, as after a prefix-cache hit, and a
+model without that resume would compute on KV or state that never arrived. With a connector,
 `TTModelRunner.initialize_kv_cache` calls the worker-side connector's
 `register_kv_caches` once, after the model adapter allocates KV storage, and
 then `set_host_xfer_buffer_ops` with the function that copies KV blocks between
 the adapter's ttnn tensors and the connector's CPU buffer. vLLM's base
-connector ignores that function, and `NixlConnector` keeps it only with a CPU
-buffer.
+connector ignores that function, and `NixlConnector` and `TTNixlPushConnector`
+keep it only with a CPU buffer.
 
 The copy moves each chip's share of each block as one region with
 `ttnn.copy_device_to_host_regions` and `ttnn.copy_host_to_device_regions`,
@@ -132,6 +133,34 @@ split heads in chip order.
 
 A model class without a `get_kv_cache_spec` hook gets one layer name per
 attention layer, `model.layers.<idx>.self_attn`, all with the default spec.
+
+### Host staging slots
+
+`TTNixlPushConnector` (vLLM's `NixlPushConnector` with a TT worker) sizes the
+CPU buffer for the requests in flight instead of the whole KV pool: room for
+two requests of `max_model_len` tokens, at most the pool. D hands P staging
+slot numbers instead of block IDs and copies the slots into its chips once
+P's write lands; P copies only the blocks D registered, once the two are
+matched. A D request whose KV does not arrive within
+`push_registration_timeout` (vLLM's setting, default `decoder_kv_blocks_ttl`)
+fails instead of waiting forever. P may still write into its slots then, so D
+gives them to another request only once P has confirmed that it writes no more
+into them: P acknowledges each registration it records, D sends a cancel for a
+failed receive once P has acknowledged its registration, and P acknowledges
+the cancel once no write into those slots is in flight and drops any later
+one. A P that is alive but never answers keeps the slots reserved on D. A P
+that is gone does not: while a cancel waits, D probes P's NIXL agent every
+second, and once NIXL refuses a send to it as disconnected (or refused the
+registration itself), D frees the slots, after 10 s in the probe case. D logs
+each cancel it sends and each freeing at INFO. These notifications are not part
+of vLLM's push protocol, so P and D must both use `TTNixlPushConnector`.
+
+Under lane DP the lanes share the engine's one connector. Block IDs are
+lane-local, so the coordinator builds the connector metadata once per step and
+names each request's lane in it (`tt_lane_of`), the runner keeps one transfer
+layout per lane (`get_kv_transfer_layout` is called with each lane's caches),
+and the worker records each slot's lane. Transfer results go back to the lane
+that holds the request.
 
 ## Minimum implementation
 

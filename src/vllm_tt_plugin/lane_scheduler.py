@@ -29,6 +29,7 @@ negotiates that mode before scheduling any lane.
 from __future__ import annotations
 
 import copy
+import dataclasses
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -289,7 +290,7 @@ class TTLaneCoordinator(SchedulerInterface):
         self._free_slots_by_lane: list[list[int]] = [
             list(range(self._per_lane_max)) for _ in range(self.num_lanes)
         ]
-        # No KV or encoder-cache connector on TT; EngineCore reads both.
+        # EngineCore reads both. The KV connector is set once the lanes exist.
         self.connector: KVConnectorBase_V1 | None = None
         self.ec_connector: ECConnectorBase | None = None
         # One policy for the whole step, not one per lane. Every lane executes
@@ -335,6 +336,13 @@ class TTLaneCoordinator(SchedulerInterface):
         ]
         for sched in self.lanes:
             sched.stats_made_by_coordinator = True
+        # One scheduler-side KV connector serves the engine: the first lane's.
+        # Request IDs are unique across lanes, so its per-request state holds
+        # every lane's requests; block IDs are lane-local, so the coordinator
+        # builds its metadata once per step and names each request's lane.
+        self.connector = self.lanes[0].connector
+        for sched in self.lanes[1:]:
+            sched.connector = self.connector
 
     def _build_per_lane_vllm_config(self, vllm_config: VllmConfig) -> VllmConfig:
         """Return a ``vllm_config`` view whose ``max_num_seqs`` is per-lane.
@@ -556,7 +564,12 @@ class TTLaneCoordinator(SchedulerInterface):
         lane_outputs: list[SchedulerOutput] = []
         for sched in self.lanes:
             sched.set_forced_mode(forced_mode)
-            lane_outputs.append(sched.schedule())
+            if self.connector is None:
+                lane_outputs.append(sched.schedule())
+            else:
+                # Lanes record connector work; ``schedule`` builds it once.
+                with sched._skip_kv_connector_meta(lambda _: True):
+                    lane_outputs.append(sched.schedule())
             sched.set_forced_mode(TTSchedulingMode.DEFAULT)
         return lane_outputs
 
@@ -740,6 +753,14 @@ class TTLaneCoordinator(SchedulerInterface):
         )
         plan = self._build_step_plan(lane_outputs, merged, is_decode)
         _set_tt_step_state(merged, _LaneStepState(lane_outputs=lane_outputs, plan=plan))
+        if self.connector is not None:
+            merged.kv_connector_metadata = self.connector.build_connector_meta(merged)
+            # The worker needs each request's lane to find its blocks.
+            merged.kv_connector_metadata.tt_lane_of = {
+                req_id: lane
+                for lane, sched in enumerate(self.lanes)
+                for req_id in sched.requests
+            }
         return merged
 
     def get_grammar_bitmask(
@@ -795,8 +816,13 @@ class TTLaneCoordinator(SchedulerInterface):
         # unique) request ID, and the base update loop is driven by the lane's
         # num_scheduled_tokens, so a lane only ever touches its own requests.
         per_lane_outputs: list[dict[int, EngineCoreOutputs]] = [
-            sched.update_from_output(lane_output, model_runner_output)
-            for sched, lane_output in zip(self.lanes, state.lane_outputs, strict=True)
+            sched.update_from_output(lane_output, runner_output)
+            for sched, lane_output, runner_output in zip(
+                self.lanes,
+                state.lane_outputs,
+                self._runner_output_per_lane(model_runner_output),
+                strict=True,
+            )
         ]
         merged = self._merge_engine_core_outputs(per_lane_outputs)
 
@@ -810,6 +836,48 @@ class TTLaneCoordinator(SchedulerInterface):
                 merged[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
         return merged
+
+    def _runner_output_per_lane(
+        self, output: ModelRunnerOutput
+    ) -> list[ModelRunnerOutput]:
+        """``output`` for each lane, its KV connector results cut to that lane.
+
+        A lane scheduler expects every finished transfer it is told of to be
+        one of its own requests. Requests belong to the lane that holds them;
+        blocks of failed loads arrive numbered ``lane * pool blocks + block``.
+        Connector stats, events and worker metadata go to the first lane only,
+        so the shared connector sees them once.
+        """
+        kv = getattr(output, "kv_connector_output", None)
+        if kv is None or len(self.lanes) == 1:
+            return [output] * len(self.lanes)
+        pool_blocks = self.lanes[0].kv_cache_config.num_blocks
+        outputs = []
+        for lane, sched in enumerate(self.lanes):
+
+            def own(req_ids, sched=sched):
+                return {req_id for req_id in req_ids or () if req_id in sched.requests}
+
+            lane_kv = dataclasses.replace(
+                kv,
+                finished_sending=own(kv.finished_sending),
+                finished_recving=own(kv.finished_recving),
+                failed_recving=own(kv.failed_recving),
+                invalid_block_ids={
+                    block % pool_blocks
+                    for block in kv.invalid_block_ids
+                    if block // pool_blocks == lane
+                },
+                kv_connector_stats=kv.kv_connector_stats if lane == 0 else None,
+                kv_cache_events=kv.kv_cache_events if lane == 0 else None,
+                kv_connector_worker_meta=(
+                    kv.kv_connector_worker_meta if lane == 0 else None
+                ),
+            )
+            lane_output = copy.copy(output)
+            lane_output.kv_connector_output = lane_kv
+            outputs.append(lane_output)
+        return outputs
 
     @staticmethod
     def _merge_engine_core_outputs(
@@ -961,4 +1029,4 @@ class TTLaneCoordinator(SchedulerInterface):
             sched.shutdown()
 
     def get_kv_connector(self) -> KVConnectorBase_V1 | None:
-        return None
+        return self.connector

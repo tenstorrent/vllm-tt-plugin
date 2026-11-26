@@ -15,6 +15,7 @@ area is reorganized.
 | [support/logprobs.py](support/logprobs.py) | Ranked-payload test data shared by those two modules |
 | [unit/test_kv_layout.py](unit/test_kv_layout.py) | Default and model-declared KV transfer layouts, and the caches the default refuses |
 | [unit/test_kv_transfer.py](unit/test_kv_transfer.py) | Byte order of the copy between ttnn KV tensors and a connector's CPU buffer |
+| [unit/test_nixl_staging.py](unit/test_nixl_staging.py) | `TTNixlPushConnector` host staging slots on P and D, their lifetime, cancellation of failed receives, and lanes |
 | [support/kv_cache.py](support/kv_cache.py) | A fake paged KV cache and ttnn region copies over its bytes, shared by the KV tests |
 | [tt/test_logprobs.py](tt/test_logprobs.py) | Logprobs returned by a live server on TT hardware |
 

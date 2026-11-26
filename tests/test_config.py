@@ -196,26 +196,25 @@ _DEVICE_KV_BUFFER = SimpleNamespace(kv_buffer_device="tt")
 
 
 @pytest.mark.parametrize(
-    ("data_parallel_size", "lane_count"),
-    [(2, None), (1, 2)],
-    ids=["standard_dp", "lane_dp"],
+    ("connector", "accepted"),
+    [("NixlConnector", False), ("TTNixlPushConnector", True)],
 )
-def test_kv_transfer_config_is_refused_with_data_parallelism(
-    data_parallel_size, lane_count
-):
-    cfg = _vllm_config(data_parallel_size=data_parallel_size, lane_count=lane_count)
-    cfg.kv_transfer_config = _DEVICE_KV_BUFFER
+def test_lane_dp_takes_only_a_lane_aware_kv_connector(connector, accepted):
+    cfg = _vllm_config(data_parallel_size=1, lane_count=2)
+    cfg.kv_transfer_config = SimpleNamespace(
+        kv_connector=connector, kv_buffer_device="tt"
+    )
 
-    with pytest.raises(ValueError, match="kv-transfer-config"):
+    if accepted:
         tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
+    else:
+        with pytest.raises(ValueError, match="lane DP.*NixlConnector"):
+            tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
 
-    # The same parallelism is fine when no connector is configured.
-    cfg.kv_transfer_config = None
-    tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
 
-
-def test_kv_transfer_config_is_accepted_without_data_parallelism():
-    cfg = _vllm_config()
+@pytest.mark.parametrize("data_parallel_size", [1, 2], ids=["no_dp", "standard_dp"])
+def test_kv_transfer_config_is_accepted_without_lanes(data_parallel_size):
+    cfg = _vllm_config(data_parallel_size=data_parallel_size)
     cfg.kv_transfer_config = _DEVICE_KV_BUFFER
 
     tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)

@@ -637,10 +637,19 @@ def uses_tt_lane_coordinator(vllm_config: "VllmConfig") -> bool:
     )
 
 
+# The one KV connector whose worker knows that block IDs are lane-local.
+_LANE_DP_KV_CONNECTOR = "TTNixlPushConnector"
+
+
 def validate_tt_kv_transfer_config(
     vllm_config: "VllmConfig", *, supports_prefix_caching: bool
 ) -> None:
     """Check that the launch can run ``--kv-transfer-config``.
+
+    Standard DP runs one engine process per rank, each with its own connector,
+    as vLLM's connectors expect. Lane DP runs several lanes inside one engine,
+    whose block IDs repeat across lanes; only ``TTNixlPushConnector`` tells
+    them apart.
 
     Parameters
     ----------
@@ -655,20 +664,20 @@ def validate_tt_kv_transfer_config(
     Raises
     ------
     ValueError
-        With data parallelism (standard DP, or lanes, which run with
-        ``data_parallel_size == 1``), or for a model without prefix caching.
+        With lane DP and a connector other than ``TTNixlPushConnector``, or for
+        a model without prefix caching.
     RuntimeError
         For a connector with a CPU buffer (``kv_buffer_device == "cpu"``) when
         ttnn lacks the region copies that move KV through that buffer.
     """
-    if vllm_config.kv_transfer_config is None:
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if kv_transfer_config is None:
         return
-    data_parallel_size = vllm_config.parallel_config.data_parallel_size
     lanes = get_tt_data_parallel_size(vllm_config)
-    if data_parallel_size != 1 or lanes != 1:
+    if lanes != 1 and kv_transfer_config.kv_connector != _LANE_DP_KV_CONNECTOR:
         raise ValueError(
-            "--kv-transfer-config is supported only without data parallelism on "
-            f"TT; got data_parallel_size={data_parallel_size}, TT lanes={lanes}."
+            f"--kv-transfer-config with TT lane DP ({lanes} lanes) supports only "
+            f"{_LANE_DP_KV_CONNECTOR}; got {kv_transfer_config.kv_connector}."
         )
     if not supports_prefix_caching:
         raise ValueError(
@@ -677,7 +686,7 @@ def validate_tt_kv_transfer_config(
             "loads KV from a connector resumes its prefill after that KV, as "
             "after a prefix-cache hit."
         )
-    if vllm_config.kv_transfer_config.kv_buffer_device == "cpu":
+    if kv_transfer_config.kv_buffer_device == "cpu":
         # Deferred: the copy imports ttnn, which this module does not need.
         from vllm_tt_plugin.kv_transfer import check_region_copies
 
