@@ -69,7 +69,8 @@ refused at launch:
 ```
 
 A server with fewer chips than the other sets `"tt_kv_parts"` in
-`kv_connector_extra_config` to the other server's chip count. The config hook
+`kv_connector_extra_config` to the other server's chip count; the launch
+refuses a value that is not a positive integer. The config hook
 makes the NIXL worker tensor-parallel rank 0 of 1 and lets it register the
 DRAM regions: each DRAM bank once, and one strided descriptor per region, on
 that region's card.

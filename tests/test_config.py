@@ -192,7 +192,7 @@ def test_supports_device_grammar_rejects_non_boolean(invalid):
 
 
 # A connector the plugin does not refuse by name.
-_CONNECTOR = SimpleNamespace(kv_connector="ExampleConnector")
+_CONNECTOR = SimpleNamespace(kv_connector="ExampleConnector", kv_connector_extra_config={})
 
 
 @pytest.mark.parametrize(
@@ -242,11 +242,35 @@ def test_nixl_connector_needs_the_kv_in_card_dram():
     # reason first.
     cfg = _vllm_config()
     cfg.kv_transfer_config = SimpleNamespace(
-        kv_connector="NixlConnector", kv_buffer_device="cpu"
+        kv_connector="NixlConnector",
+        kv_buffer_device="cpu",
+        kv_connector_extra_config={},
     )
 
     with pytest.raises(ValueError, match="NixlConnector.*kv_buffer_device='cpu'"):
         tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
 
     cfg.kv_transfer_config.kv_buffer_device = "tt"
+    tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
+
+
+@pytest.mark.parametrize(
+    "parts",
+    ["2", 0, -1, True, 2.0],
+    ids=["string", "zero", "negative", "bool", "float"],
+)
+def test_tt_kv_parts_must_be_a_positive_integer(parts):
+    # The value is the other server's chip count. Without this check a bad value
+    # fails only after the model has loaded, deep in the DRAM layout.
+    cfg = _vllm_config()
+    cfg.kv_transfer_config = SimpleNamespace(
+        kv_connector="NixlConnector",
+        kv_buffer_device="tt",
+        kv_connector_extra_config={"tt_kv_parts": parts},
+    )
+
+    with pytest.raises(ValueError, match="tt_kv_parts"):
+        tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
+
+    cfg.kv_transfer_config.kv_connector_extra_config = {"tt_kv_parts": 2}
     tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
