@@ -7,7 +7,7 @@ each test scripts. KV bytes move only between fake chips and CPU buffers.
 """
 
 import threading
-from collections import deque
+from collections import Counter, deque
 from functools import partial
 from types import SimpleNamespace
 
@@ -20,8 +20,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorTransferResults,
     SupportsHMA,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    NixlConnectorMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
+    NixlPushConnectorWorker,
+)
+from vllm.utils.math_utils import cdiv
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -29,9 +38,16 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
 )
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
 
 from tests.support.kv_cache import FakeKVCache, fake_region_copies
+from tests.support.nixl_staging import (
+    push_metadata,
+    record_push_worker,
+    staging_worker,
+)
+from tests.support.nixl_writer import push_writer
+from tests.support.nixl_writer import registration as push_registration
 from tests.test_block_scheduler import BLOCK_SIZE, _request
 from tests.test_block_scheduler import _runner_output as _block_runner_output
 from tests.test_block_scheduler import _scheduler as _real_scheduler
@@ -41,6 +57,7 @@ from vllm_tt_plugin.async_decode import AsyncTTModelRunnerOutput
 from vllm_tt_plugin.kv_layout import default_kv_layout
 from vllm_tt_plugin.kv_transfer import kv_cache_descriptions
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.nixl_staging import NixlPushChunkJob, TTNixlPushConnector
 from vllm_tt_plugin.platform import _install_tt_nixl_single_rank_patch
 
 
@@ -395,6 +412,82 @@ def test_kv_moves_between_two_servers_through_their_cpu_buffers(
                 assert not received_blocks[[1, 2, 3, 7, 8]].any()
 
 
+def test_kv_moves_between_two_servers_chunk_by_chunk(worker_connector, monkeypatch):
+    """P writes each prefill step's chunk from its slots into D's slots; D
+    copies them into its chips on the one notification, as the chips' bytes.
+    """
+    fake_region_copies(monkeypatch)
+    recorder = record_push_worker(monkeypatch)
+
+    def server():
+        kv_caches = _kv_caches()
+        _initialize_kv_cache(kv_caches)
+        worker = push_writer(staging_worker(num_slots=NUM_BLOCKS, chunked=True))
+        worker.copy_blocks = worker_connector.copy_blocks
+        worker.device_kv_caches = None
+        worker.host_xfer_buffers = {
+            name: torch.zeros(
+                (d.shape[0], d.shape[2], d.shape[1], d.shape[3]), dtype=d.dtype
+            ).permute(0, 2, 1, 3)
+            for name, d in worker_connector.kv_caches.items()
+        }
+        return kv_caches, worker
+
+    (sent, p), (received, d) = server(), server()
+    rng = np.random.default_rng(0)
+    for cache in (cache for layer in sent for cache in layer):
+        for chip in cache.chips:
+            chip[:] = rng.integers(0, 256, chip.size, dtype=np.uint8)
+
+    def write(handle):
+        # NIXL moves P's slot rows into D's; one region, so descriptors are rows.
+        landed = p.nixl_wrapper.writes[handle - 1]
+        for name in LAYER_NAMES:
+            d.host_xfer_buffers[name][landed.remote] = p.host_xfer_buffers[name][
+                landed.local
+            ]
+
+    p.nixl_wrapper.transfer = write
+
+    # D holds the prompt's first two blocks and registers the other three.
+    d.start_load_kv(
+        push_metadata({"p": {"request_id": "p", "local_block_ids": ([9, 4, 7],)}})
+    )
+    d_slots = recorder.metadata[-1].push_registrations["p"]["local_block_ids"][0]
+    p._pending_d_registrations["p"] = push_registration(d_slots)
+    # P's five prompt blocks, prefilled in three steps.
+    sent_ids = [3, 8, 0, 11, 5]
+    for start, end in ((0, 1), (1, 3), (3, 5)):
+        step = push_metadata(
+            jobs=[NixlPushChunkJob("p", sent_ids[start:end], start, end, len(sent_ids))]
+        )
+        p.save_kv_to_host(step)
+        p.finish_chunk_step(step)
+        p._push_writer_pass()
+        p.nixl_wrapper.finish()
+    p._push_writer_pass()
+    assert [landed.notif for landed in p.nixl_wrapper.writes] == [b"", b"p:1"]
+
+    # D copies its slots into its chips only on the notification.
+    assert not any(
+        chip.any() for layer in received for cache in layer for chip in cache.chips
+    )
+    recorder.results.finished_recving = {"p"}
+    d.get_transfer_results()
+
+    received_ids = [9, 4, 7]
+    others = [b for b in range(NUM_BLOCKS) if b not in received_ids]
+    for sent_layer, received_layer in zip(sent, received):
+        for sent_cache, received_cache in zip(sent_layer, received_layer):
+            for chip in range(CHIPS):
+                sent_blocks = sent_cache.blocks_on(chip)
+                received_blocks = received_cache.blocks_on(chip)
+                assert (
+                    received_blocks[received_ids] == sent_blocks[sent_ids[2:]]
+                ).all()
+                assert not received_blocks[others].any()
+
+
 class TestNixlConnectorOnTT:
     """What vLLM's NixlConnector worker asks of TT when it starts."""
 
@@ -441,8 +534,6 @@ class TestNixlConnectorOnTT:
         from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
             NixlConnector,
         )
-
-        from vllm_tt_plugin.nixl_staging import TTNixlPushConnector
 
         connector_cls = {
             "NixlConnector": NixlConnector,
@@ -793,3 +884,276 @@ def test_a_lane_forward_runs_inside_the_connector_step(
     ]
     assert worker_connector.loads_started == {"parked": [3]}
     assert output.kv_connector_output.finished_recving == {"parked"}
+
+
+# Chunked push: P copies each prefill step's completed blocks into staging slots.
+
+CHUNK_TOKENS = 200
+
+
+def _chunked_push_scheduler(monkeypatch, chunked_prefill: bool = True):
+    """A prefill server's TT scheduler with chunked push, under async scheduling.
+
+    It holds two requests. With ``chunked_prefill`` it prefills at most
+    ``CHUNK_TOKENS`` tokens a step; without, a whole prompt in one step.
+    ``monkeypatch`` installs fake ttnn region copies, which a CPU KV buffer
+    requires at startup and a released ttnn may lack.
+    """
+    fake_region_copies(monkeypatch)
+    scheduler = _real_scheduler(
+        output_width=1,
+        max_num_seqs=2,
+        max_model_len=1024,
+        num_blocks=16,
+        async_scheduling=True,
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="TTNixlPushConnector",
+            kv_connector_module_path="vllm_tt_plugin.nixl_staging",
+            kv_role="kv_producer",
+            kv_buffer_device="cpu",
+            kv_connector_extra_config={"enable_chunked_push": True},
+        ),
+    )
+    if chunked_prefill:
+        # The stub model declares no chunked prefill, so the platform turned
+        # it off.
+        scheduler.scheduler_config.enable_chunked_prefill = True
+        scheduler.max_num_scheduled_tokens = CHUNK_TOKENS
+    return scheduler
+
+
+def _push_request(prompt_length: int) -> Request:
+    """``B``, a prompt whose KV goes to a decode server, as the proxy sends it."""
+    request = _request(1, request_id="B", prompt_length=prompt_length)
+    request.kv_transfer_params = {"do_remote_decode": True}
+    return request
+
+
+def _serve_behind_a_decode(scheduler, push_request, done) -> list[SchedulerOutput]:
+    """Run the engine loop until ``done()``; return the steps in the order they ran.
+
+    ``A`` decodes from the first iteration, and ``push_request`` arrives at
+    the third, so its first prefill is kept behind A's decode. As in
+    ``EngineCore.step_with_batch_queue`` with two batches in flight, a step's
+    output is committed once the next step has been scheduled. A step samples
+    a token for each request whose prompt is complete.
+    """
+    arrivals = {0: _request(50, request_id="A"), 3: push_request}
+    executed: list[SchedulerOutput] = []
+    in_flight: deque = deque()
+    computed: Counter[str] = Counter()
+    for iteration in range(100):
+        if done():
+            return executed
+        if iteration in arrivals:
+            scheduler.add_request(arrivals[iteration])
+        step = scheduler.schedule()
+        executed.append(step)
+        req_ids = list(step.num_scheduled_tokens)
+        for req_id in req_ids:
+            computed[req_id] += step.num_scheduled_tokens[req_id]
+        output = ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+            sampled_token_ids=[
+                [7] if computed[r] >= scheduler.requests[r].num_prompt_tokens else []
+                for r in req_ids
+            ],
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+        in_flight.appendleft((step, output))
+        if len(in_flight) == 2:
+            scheduler.update_from_output(*in_flight.pop())
+    raise AssertionError("the engine loop did not reach its end condition")
+
+
+def test_jobs_are_built_before_the_scheduler_advances_num_computed_tokens(monkeypatch):
+    scheduler = _chunked_push_scheduler(monkeypatch)
+    request = _push_request(prompt_length=600)  # Five blocks, the last partial.
+    kept: set[int] = set()
+
+    def done() -> bool:
+        if scheduler._deferred_prefill is not None:
+            kept.add(id(scheduler._deferred_prefill))
+        return request.is_finished()
+
+    executed = _serve_behind_a_decode(scheduler, request, done)
+
+    # Each step's jobs are the blocks completed by the B tokens that step ran.
+    (table,) = scheduler.kv_cache_manager.get_block_ids("B")
+    computed = planned = 0
+    for step in executed:
+        expected = []
+        if "B" in step.num_scheduled_tokens:
+            computed += step.num_scheduled_tokens["B"]
+            end = (
+                cdiv(computed, BLOCK_SIZE)
+                if computed >= 600
+                else computed // BLOCK_SIZE
+            )
+            if end > planned:
+                expected = [NixlPushChunkJob("B", table[planned:end], planned, end, 5)]
+                planned = end
+        assert step.kv_connector_metadata.push_chunk_jobs == expected
+    assert planned == 5
+    # A kept prefill ran: its metadata was built before the release step's.
+    assert any(id(step) in kept for step in executed)
+
+
+def test_a_prompt_prefilled_in_one_step_is_staged_by_one_job(monkeypatch):
+    # Without chunked prefill (a model that does not declare it, or
+    # --no-enable-chunked-prefill) the one prefill step completes every block.
+    scheduler = _chunked_push_scheduler(monkeypatch, chunked_prefill=False)
+    scheduler.add_request(_push_request(prompt_length=600))
+
+    step = scheduler.schedule()
+
+    (table,) = scheduler.kv_cache_manager.get_block_ids("B")
+    assert step.num_scheduled_tokens == {"B": 600}
+    assert step.kv_connector_metadata.push_chunk_jobs == [
+        NixlPushChunkJob("B", table[:5], start_block=0, end_block=5, total_blocks=5)
+    ]
+
+
+def test_a_preemption_the_release_pass_drained_reaches_the_connector(monkeypatch):
+    # B is part way through its prefill, behind A's held decode. A keep pause
+    # with a cache reset (what EngineCore.pause_scheduler(mode="keep",
+    # clear_cache=True) does) preempts both between two schedule() calls. The
+    # next call's release pass drains the preemptions and its prefill pass
+    # schedules nothing, so the call returns the prefill pass's step with the
+    # release pass's cleanup added. P's worker gives B's staging slots back at
+    # the step whose metadata lists B.
+    scheduler = _chunked_push_scheduler(monkeypatch)
+    request = _push_request(prompt_length=600)
+
+    def done() -> bool:
+        held = scheduler._unreleased_step
+        return (
+            held is not None
+            and "A" in held.num_scheduled_tokens
+            and request.num_computed_tokens > 0
+        )
+
+    _serve_behind_a_decode(scheduler, request, done)
+    scheduler.set_pause_state(PauseState.PAUSED_ALL)
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+
+    step = scheduler.schedule()
+
+    assert step.total_num_scheduled_tokens == 0
+    assert step.preempted_req_ids == {"A", "B"}
+    assert step.kv_connector_metadata.push_chunk_preemptions == {"B"}
+
+
+def test_a_step_that_runs_no_forward_copies_nothing(
+    vllm_config, staging_connector, monkeypatch
+):
+    # The release step that goes ahead of B's kept prefill schedules nothing.
+    # Its metadata is built after that prefill's, once B has advanced.
+    scheduler = _chunked_push_scheduler(monkeypatch)
+    request = _push_request(prompt_length=600)
+    *_, release = _serve_behind_a_decode(
+        scheduler, request, lambda: scheduler._deferred_prefill is not None
+    )
+    assert release.total_num_scheduled_tokens == 0
+    assert scheduler._deferred_prefill.kv_connector_metadata.push_chunk_jobs
+    runner = _runner(vllm_config, staging_connector.calls, async_decode=False)
+
+    TTModelRunner.execute_model(runner, release)
+
+    assert staging_connector.calls == ["start_load_kv", "get_transfer_results"]
+
+
+def test_chunked_push_is_refused_under_lane_dp(monkeypatch):
+    from vllm_tt_plugin.config import store_tt_lane_count
+    from vllm_tt_plugin.lane_scheduler import TTLaneCoordinator
+
+    base = _chunked_push_scheduler(monkeypatch)
+    store_tt_lane_count(base.vllm_config, 2)
+
+    with pytest.raises(ValueError, match="lane"):
+        TTLaneCoordinator(
+            base.vllm_config,
+            base.kv_cache_config,
+            base.structured_output_manager,
+            BLOCK_SIZE,
+        )
+
+
+@pytest.fixture
+def staging_connector(monkeypatch):
+    """P's ``TTNixlPushConnector`` with a worker built without NIXL.
+
+    It is installed where ``TTWorker`` would put it. ``connector.calls``
+    records vLLM's push worker calls and the TT worker's copies, each made on
+    the test's thread; ``connector.record`` adds a call.
+    """
+    calls: list[str] = []
+    thread = threading.get_ident()
+
+    def record(name: str) -> None:
+        if threading.get_ident() != thread:
+            raise AssertionError(f"{name} ran on another thread")
+        calls.append(name)
+
+    def get_transfer_results(self):
+        record("get_transfer_results")
+        return KVConnectorTransferResults()
+
+    monkeypatch.setattr(
+        NixlPushConnectorWorker,
+        "start_load_kv",
+        lambda self, metadata: record("start_load_kv"),
+    )
+    monkeypatch.setattr(
+        NixlPushConnectorWorker, "get_transfer_results", get_transfer_results
+    )
+    monkeypatch.setattr(
+        NixlPushConnectorWorker, "get_kv_connector_stats", lambda self: None
+    )
+    worker = staging_worker(num_slots=8)
+    worker.use_host_buffer = True
+    worker.pcp_rank = 0
+    worker.copy_blocks = lambda src, dst, src_ids, dst_ids, direction, lane=0: record(
+        f"copy {direction} {list(src_ids)} to {list(dst_ids)}"
+    )
+    connector = TTNixlPushConnector.__new__(TTNixlPushConnector)
+    connector._connector_metadata = None
+    connector.connector_scheduler = None
+    connector.connector_worker = worker
+    connector.kv_transfer_config = KVTransferConfig(
+        kv_connector="TTNixlPushConnector", kv_role="kv_producer"
+    )
+    connector.calls = calls
+    connector.record = record
+    monkeypatch.setattr(kv_transfer_state, "_KV_CONNECTOR_AGENT", connector)
+    return connector
+
+
+def test_a_chunk_copy_runs_after_the_prefill_forward_inside_the_connector_step(
+    vllm_config, staging_connector
+):
+    step = _scheduler_output()
+    step.kv_connector_metadata = NixlConnectorMetadata()
+    step.kv_connector_metadata.push_chunk_jobs = [
+        NixlPushChunkJob("req-0", [30], start_block=0, end_block=1, total_blocks=3)
+    ]
+    runner = _runner(vllm_config, staging_connector.calls, async_decode=False)
+    # The writer thread gets the job, as slot numbers, once its copy is done.
+    staging_connector.connector_worker._queue_chunk_jobs = lambda jobs: (
+        staging_connector.record(
+            f"queue {[(job.request_id, job.block_ids) for job in jobs]}"
+        )
+    )
+
+    assert TTModelRunner.execute_model(runner, step) is None
+    TTModelRunner.sample_tokens(runner, None)
+
+    assert staging_connector.calls == [
+        "forward",
+        "start_load_kv",
+        "copy d2h [30] to [0]",
+        "queue [('req-0', [0])]",
+        "get_transfer_results",
+    ]

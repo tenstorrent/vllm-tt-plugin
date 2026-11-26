@@ -14,6 +14,14 @@ the requests in flight:
 * P (prefill) waits until its finished request is matched with D's
   registration, then takes slots for only the blocks D asked for, copies them
   from its chips, and lets vLLM write the slots to D.
+* With ``"enable_chunked_push": true`` in ``kv_connector_extra_config``
+  (experimental), P instead copies the prompt blocks each prefill step
+  completes into slots for the whole prompt, right after the step, and its
+  writer thread writes them to D as soon as D's registration is known
+  (``ChunkedPushWorker``). A request that is written whole instead (D
+  registered after P finished, or a chunk was not written) is written from
+  its slots without a copy. Names follow vLLM's chunked push proposal
+  (``NixlPushChunkJob``, ``_build_chunk_jobs``, ``finish_chunk_step``).
 * D fails a receive whose KV has not arrived within
   ``push_registration_timeout``. It gives the receive's slots to another
   request only once P has confirmed that it writes nothing more into them
@@ -38,7 +46,7 @@ import time
 from collections import deque
 from collections.abc import Iterable
 from concurrent.futures import Future
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import msgspec
 import torch
@@ -60,19 +68,34 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_scheduler import (
     NixlPushConnectorScheduler,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
-    NixlPushConnectorWorker,
-)
 from vllm.utils.math_utils import cdiv
+from vllm.v1.kv_cache_interface import KVCacheConfig, is_full_attention_spec
 
+from vllm_tt_plugin.config import get_tt_data_parallel_size
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.nixl_chunk_push import (
+    ChunkedPushWorker,
+    NixlPushChunkJob,
+    _ChunkRetirement,
+)
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.request import Request
 
 logger = init_tt_logger(__name__)
 
 CONNECTOR_NAME = "TTNixlPushConnector"
 
-# A request in flight on each side while the next one is being staged.
-_REQUESTS_PER_POOL = 2
+# Longest requests the pool holds at once. P, with chunked push, holds a
+# request's slots from its first prefill step until its write ends; D, behind
+# a proxy that sends both legs at once, holds them from the start of P's
+# prefill. One request being written, one waiting for its write and one
+# starting its prefill need three; the fourth is headroom. A request that finds
+# too few free slots is not refused: P copies it whole once matched, and D's
+# registration waits for slots.
+_REQUESTS_PER_POOL = 4
+
 
 TT_NOTIF_PREFIX = PUSH_REG_NOTIF_PREFIX + b"tt:"
 """Prefix of the notifications that only ``TTNixlPushConnectorWorker`` sends.
@@ -144,7 +167,7 @@ def register_kv_connectors() -> None:
 
 
 def staging_slot_count(vllm_config, num_blocks: int, num_groups: int) -> int:
-    """Number of staging slots: room for two longest requests, at most the pool.
+    """Number of staging slots: room for four longest requests, at most the pool.
 
     One request crosses in one NIXL write, which cannot be split, so the pool
     must hold the longest request whole.
@@ -155,7 +178,9 @@ def staging_slot_count(vllm_config, num_blocks: int, num_groups: int) -> int:
         The engine's ``VllmConfig``; ``max_model_len`` and ``block_size`` set
         the longest request in blocks.
     num_blocks
-        Blocks in the KV pool; more slots than blocks are never useful.
+        Blocks in the KV pool; more slots than blocks are not useful, since a
+        request holds its slots while it holds, or is prefilling into, as many
+        blocks.
     num_groups
         KV cache groups; a request takes blocks in each.
     """
@@ -202,6 +227,175 @@ class StagingSlots:
     def give_back(self, slots: list[int]) -> None:
         """Return slots taken earlier."""
         self._free.extend(slots)
+
+
+@dataclasses.dataclass
+class _ChunkPushTracker:
+    """A P request with chunked push and the prompt blocks it has jobs for.
+
+    Attributes
+    ----------
+    request
+        The scheduler's request; its ``num_computed_tokens`` is read per step.
+    next_block
+        Prompt blocks already put into jobs.
+    """
+
+    request: "Request"
+    next_block: int = 0
+
+
+class TTNixlPushConnectorScheduler(NixlPushConnectorScheduler):
+    """vLLM's push scheduler that also names the blocks each P step completes.
+
+    With ``enable_chunked_push`` on a producer, each step's metadata gets two
+    fields: ``push_chunk_jobs``, a ``NixlPushChunkJob`` per P request whose
+    prefill in the step completes prompt blocks, and
+    ``push_chunk_preemptions``, the P requests preempted since the previous
+    step. Off, or on a consumer, it is vLLM's push scheduler.
+
+    Raises
+    ------
+    ValueError
+        When ``enable_chunked_push`` is not a boolean, on either side, and
+        when it is on for a producer whose KV is not one full-attention group,
+        whose prompt tail is left to D (a prefill backoff, for a Mamba state
+        or a multi-module MTP lookahead), or that runs TT lane DP.
+
+    Notes
+    -----
+    Runs on the engine core thread. A request is in ``_chunk_trackers`` from
+    its block allocation (``update_state_after_alloc``, called again when a
+    preempted request is scheduled again) to ``request_finished``.
+    """
+
+    def __init__(self, vllm_config, engine_id: str, kv_cache_config: KVCacheConfig):
+        transfer_config = vllm_config.kv_transfer_config
+        enabled = transfer_config.get_from_extra_config("enable_chunked_push", False)
+        if not isinstance(enabled, bool):
+            raise ValueError(
+                "enable_chunked_push in kv_connector_extra_config must be true or "
+                f"false; got {enabled!r}."
+            )
+        super().__init__(vllm_config, engine_id, kv_cache_config)
+        self._chunked_push = enabled and transfer_config.kv_role == "kv_producer"
+        self._chunk_trackers: dict[str, _ChunkPushTracker] = {}
+        if self._chunked_push:
+            self._refuse_unsupported_chunked_push(vllm_config, kv_cache_config)
+
+    def update_state_after_alloc(
+        self, request: "Request", blocks, num_external_tokens: int
+    ) -> None:
+        """Start a P request's jobs at block 0, also after a preemption."""
+        super().update_state_after_alloc(request, blocks, num_external_tokens)
+        params = request.kv_transfer_params
+        if self._chunked_push and params and params.get("do_remote_decode"):
+            self._chunk_trackers[request.request_id] = _ChunkPushTracker(request)
+
+    def request_finished(
+        self, request: "Request", block_ids: BlockIds
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Plan no more jobs for the request; vLLM's push scheduler does the rest."""
+        self._chunk_trackers.pop(request.request_id, None)
+        return super().request_finished(request, block_ids)
+
+    def build_connector_meta(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> NixlConnectorMetadata:
+        """vLLM's push metadata, with the step's chunk jobs when chunked push is on."""
+        meta = super().build_connector_meta(scheduler_output)
+        if self._chunked_push:
+            self._build_chunk_jobs(meta, scheduler_output)
+        return meta
+
+    def _build_chunk_jobs(
+        self, meta: NixlConnectorMetadata, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Set ``meta.push_chunk_jobs`` and ``meta.push_chunk_preemptions``.
+
+        vLLM builds a step's metadata before it adds the step's tokens to
+        ``num_computed_tokens``, so the prompt tokens computed once the step
+        has run are the two summed. A job takes the blocks those tokens fill;
+        the prompt's partial last block goes with the job that completes the
+        prompt. Block IDs are read only for a step with a job: ``TTScheduler``
+        can build a release step's metadata after its block state is dropped.
+
+        Raises
+        ------
+        RuntimeError
+            When the step carries no block IDs for a request it has a job for.
+        """
+        meta.push_chunk_preemptions = {
+            req_id
+            for req_id in scheduler_output.preempted_req_ids or ()
+            if req_id in self._chunk_trackers
+        }
+        meta.push_chunk_jobs = []
+        block_size = self.kv_cache_config.transfer_groups[0].kv_cache_spec.block_size
+        for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+            tracker = self._chunk_trackers.get(req_id)
+            if tracker is None:
+                continue
+            prompt = tracker.request.num_prompt_tokens
+            computed = min(tracker.request.num_computed_tokens + num_tokens, prompt)
+            end = (
+                cdiv(computed, block_size)
+                if computed >= prompt
+                else computed // block_size
+            )
+            start = tracker.next_block
+            if end <= start:
+                continue
+            block_state = scheduler_output.kv_connector_block_state
+            block_ids = (
+                None if block_state is None else block_state.get_block_ids(req_id)
+            )
+            if block_ids is None:
+                raise RuntimeError(
+                    f"The step completes blocks {start} to {end - 1} of {req_id} "
+                    "but carries no block IDs for it."
+                )
+            table = self.kv_cache_config.select_transfer_block_ids(block_ids)[0]
+            meta.push_chunk_jobs.append(
+                NixlPushChunkJob(
+                    request_id=req_id,
+                    block_ids=list(table[start:end]),
+                    start_block=start,
+                    end_block=end,
+                    total_blocks=cdiv(prompt, block_size),
+                )
+            )
+            tracker.next_block = end
+
+    def _refuse_unsupported_chunked_push(
+        self, vllm_config, kv_cache_config: KVCacheConfig
+    ) -> None:
+        """Refuse KV that a step's completed blocks do not hold in full.
+
+        Raises
+        ------
+        ValueError
+            With more than one transfer group or one that is not full
+            attention, with a prefill backoff, or with TT lane DP, whose
+            coordinator builds metadata without block state.
+        """
+        groups = kv_cache_config.transfer_groups
+        if len(groups) != 1 or not is_full_attention_spec(groups[0].kv_cache_spec):
+            raise ValueError(
+                "enable_chunked_push needs one full-attention KV cache group; got "
+                f"{[type(group.kv_cache_spec).__name__ for group in groups]}."
+            )
+        backoff = self._prefill_backoff()
+        if backoff > 0:
+            raise ValueError(
+                "enable_chunked_push does not support a prefill backoff (Mamba "
+                f"state, multi-module MTP lookahead); got {backoff} tokens."
+            )
+        lanes = get_tt_data_parallel_size(vllm_config)
+        if lanes > 1:
+            raise ValueError(
+                f"enable_chunked_push does not support TT lane DP; got {lanes} lanes."
+            )
 
 
 @dataclasses.dataclass
@@ -318,8 +512,11 @@ class _WriterTask:
     reg: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
-class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
+class TTNixlPushConnectorWorker(ChunkedPushWorker):
     """vLLM's push worker with its host buffer cut down to staging slots.
+
+    With chunked push, P's writer thread writes each staged chunk from its
+    slots (``ChunkedPushWorker``).
 
     Attributes
     ----------
@@ -363,24 +560,31 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
     NIXL does not order notifications, so ``CANCEL`` waits for ``REG_ACK``:
     P reads a ``CANCEL`` only after it has recorded the registration, and no
     copy of the registration can reach P afterwards. P submits writes only on
-    its writer thread, and each submission point (``_do_start_push_kv``)
-    checks the mark there. Any write into the slots was therefore submitted
-    before P read ``CANCEL`` and ended before P sent ``CANCEL_ACK``, which is
-    before D frees the slots. A write ends when vLLM releases its handle, after
-    NIXL reports it done or failed; as vLLM's own release of P's blocks, this
-    takes NIXL's word that a done write has landed. A P that is alive but
-    never answers leaves the slots reserved: D loses capacity, never data. A
-    gone P is the exception: D frees without its word, on NIXL's report that
-    the endpoint failed. That P's own endpoint to D has failed then too, or
-    that P's process is gone, NIXL does not tell D. TT engines run one NIXL
+    its writer thread, and each submission point (``_do_start_push_kv``, and
+    ``_chunk_path_supported`` before a chunk WRITE) checks the mark there. Any
+    write into the slots was therefore submitted before P read ``CANCEL`` and
+    ended before P sent ``CANCEL_ACK``, which is before D frees the slots. A
+    write ends when vLLM releases its handle, after NIXL reports it done or
+    failed; as vLLM's own release of P's blocks, this takes NIXL's word that
+    a done write has landed. A P that is alive but never answers leaves the
+    slots reserved: D loses capacity, never data. A gone P is the exception:
+    D frees without its word, on NIXL's report that the endpoint failed. That
+    P's own endpoint to D has failed then too, or that P's process is gone,
+    NIXL does not tell D. D cannot tell P's chunk WRITEs from its
+    whole-request WRITEs, so the same holds for both. TT engines run one NIXL
     agent each; the acknowledgements name the agent, so several are allowed.
 
     State and threads:
 
     * ``_receives``, ``_recv_deadlines``, ``_cancelling``,
       ``_cancels_checked``, ``_load_errors`` and ``_waiting_registrations``
-      (D), ``_waiting_stage`` (P) and ``slots`` belong to the model runner
-      thread.
+      (D), ``_waiting_stage``, ``_chunk_slots``, ``_chunk_staged``,
+      ``_chunk_unstaged`` and ``_chunk_retiring`` (P) and ``slots`` belong to
+      the model runner thread.
+    * A chunk WRITE may read a request's slots from the moment
+      ``finish_chunk_step`` queues its first job. From then on, the model
+      runner thread gives the slots back only once the writer thread has
+      settled their retirement (``_ChunkRetirement.done``).
     * ``_unacked`` (D) belongs to the writer thread. ``_cancel_done`` carries
       settled cancellations from the writer thread to the model runner
       thread; ``_reg_send_inbox`` carries ``_WriterTask`` items to the writer
@@ -449,8 +653,10 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
 
         A registration waits until enough slots are free. Under lane DP,
         ``metadata.tt_lane_of`` names each request's lane: block IDs are
-        lane-local. Without it every request is on lane 0.
+        lane-local. Without it every request is on lane 0. P first gives back
+        the chunk slots of requests preempted or aborted.
         """
+        self.handle_preemptions(metadata)
         lane_of = getattr(metadata, "tt_lane_of", None) or {}
         now = time.perf_counter()
         queued = list(self._waiting_registrations)
@@ -481,7 +687,49 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         self._stage_matched_sends()
 
     def save_kv_to_host(self, metadata: NixlConnectorMetadata) -> None:
-        """Copy nothing per step: P stages a request once D's blocks are known."""
+        """Copy the step's chunk jobs from the chips into their requests' slots.
+
+        vLLM calls this after the step's forward is enqueued; the copy runs
+        after the forward on the same command queue and returns once the
+        blocks are in the slots. ``finish_chunk_step`` then hands the jobs to
+        the writer thread. Without chunked push there are no jobs: P stages a
+        request once D's blocks are known.
+        """
+        self._stage_chunk_jobs(getattr(metadata, "push_chunk_jobs", ()))
+
+    def finish_chunk_step(self, metadata: NixlConnectorMetadata) -> None:
+        """Hand the step's staged chunk jobs to the writer thread, as slot numbers.
+
+        Runs on the model runner thread after ``save_kv_to_host``, so NIXL
+        can read the slots at once and the jobs carry no event. A job of a
+        request without slots is left out; that request is staged whole once
+        matched.
+        """
+        jobs = []
+        for job in getattr(metadata, "push_chunk_jobs", ()):
+            slots = self._chunk_slots.get(job.request_id)
+            if slots is not None:
+                jobs.append(
+                    dataclasses.replace(
+                        job, block_ids=slots[job.start_block : job.end_block]
+                    )
+                )
+        if jobs:
+            self._queue_chunk_jobs(jobs)
+
+    def handle_preemptions(self, metadata: NixlConnectorMetadata) -> None:
+        """Retire the chunk staging of preempted and aborted P requests.
+
+        Nothing waits: chunk WRITEs read slots, not the device blocks that
+        vLLM gives to other requests, so a preempted request's recompute takes
+        new slots and the old slots go back once no WRITE reads them.
+        """
+        if not self._chunked_push:
+            return
+        preempted = set(getattr(metadata, "push_chunk_preemptions", ()))
+        aborted = set(metadata.reqs_not_processed or ())
+        if preempted or aborted:
+            self._retire_chunk_staging(preempted, aborted)
 
     def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta) -> None:
         """Copy a received request from its slots into the chips; free the slots.
@@ -539,6 +787,7 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
                     self._recv_timeout,
                 )
         self._give_back_cancelled()
+        self._give_back_retired_slots()
         results = super().get_transfer_results()
         for req_id in results.failed_recving:
             self._recv_deadlines.pop(req_id, None)
@@ -552,6 +801,10 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
             self._cancelling[req_id] = _flatten(receive.slots)
             self._reg_send_inbox.put((req_id, _WriterTask(CANCEL, receive.reg)))
             self._push_writer_wake.set()
+        # Handed off through its chunks, or its lease expired.
+        ended = results.finished_sending & self._chunk_slots.keys()
+        if ended:
+            self._retire_chunk_staging(ended=ended)
         self._end_sends(results.finished_sending)
         with self._lock:
             settle = bool(self._cancel_waits)
@@ -612,6 +865,17 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         # P: per request ID of D that D cancelled, D's CANCEL and the P requests
         # matched with it, whose writes must end before P acknowledges it.
         self._cancel_waits: dict[str, tuple[dict[str, Any], list[str]]] = {}
+        # P, chunked push: a slot per prompt block of each staged request, slot
+        # i holding block i, until the request is matched or ends.
+        self._chunk_slots: dict[str, list[int]] = {}
+        # P, chunked push: prompt blocks of each request copied into its slots.
+        self._chunk_staged: dict[str, int] = {}
+        # P, chunked push: requests whose first job found too few free slots;
+        # they are staged whole once matched.
+        self._chunk_unstaged: set[str] = set()
+        # P, chunked push: retired chunk staging and its slots, until the
+        # writer thread has no WRITE of the retired requests in flight.
+        self._chunk_retiring: list[tuple[_ChunkRetirement, list[int]]] = []
 
     def _send_registration_to_p(
         self, req_id: str, reg_data: dict[str, Any] | _WriterTask
@@ -732,12 +996,45 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
             with self._lock:
                 send.submitting = False
 
+    def _chunk_path_supported(
+        self, job: NixlPushChunkJob, reg_data: dict[str, Any]
+    ) -> bool:
+        """Whether the job may be written alone, which is never once D cancelled.
+
+        Runs on the writer thread, right before the job's WRITE is submitted.
+        A job of a cancelled registration (see ``_on_cancel``) is refused: it
+        sends no WRITE, the request's last WRITE then carries no completion
+        notification, and ``_do_start_push_kv`` drops the whole-request push
+        that follows.
+        """
+        if reg_data.get(_CANCELLED):
+            logger.debug(
+                "Not writing blocks %d to %d of %s: D cancelled %s.",
+                job.start_block,
+                job.end_block - 1,
+                job.request_id,
+                reg_data["request_id"],
+            )
+            return False
+        return super()._chunk_path_supported(job, reg_data)
+
+    def _poll_chunk_transfers(self) -> None:
+        """Finish chunk WRITEs as vLLM's chunk writer does, then settle cancels.
+
+        Runs on the writer thread, which polls while a chunk WRITE is in
+        flight, so a cancellation waiting for one is acknowledged once it ends.
+        """
+        super()._poll_chunk_transfers()
+        if self._cancel_waits:
+            self._settle_cancels()
+
     def _stage_matched_sends(self) -> None:
         """Copy matched P requests from the chips into slots and queue their writes.
 
         D registers only blocks it has no prefix-cache hit for, so P stages
         the same number of its last blocks per group, the blocks vLLM's push
-        path would pair with D's.
+        path would pair with D's. A request staged chunk by chunk is written
+        from the last of its slots instead, without a copy.
         """
         pending = list(self._waiting_stage)
         self._waiting_stage.clear()
@@ -754,29 +1051,136 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
             # Only this thread ends a send or stages it.
             if send is None or send.ended or send.slots is not None or cancelled:
                 continue
-            device = _last_blocks(
-                self._as_grouped_block_ids(device_ids),
-                self._as_grouped_block_ids(reg["local_block_ids"]),
-            )
-            slots = self._take_slots(device)
-            if slots is None:
-                self._waiting_stage.append((req_id, device_ids, reg))
-                continue
-            flat_slots = _flatten(slots)
-            self.copy_blocks(
-                self.device_kv_caches,
-                self.host_xfer_buffers,
-                _flatten(device),
-                flat_slots,
-                "d2h",
-                lane=send.lane,
-            )
+            remote = self._as_grouped_block_ids(reg["local_block_ids"])
+            flat_slots = self._take_staged_chunks(req_id)
+            if flat_slots is not None:
+                slots = _last_blocks((flat_slots,), remote)
+            else:
+                device = _last_blocks(self._as_grouped_block_ids(device_ids), remote)
+                slots = self._take_slots(device)
+                if slots is None:
+                    self._waiting_stage.append((req_id, device_ids, reg))
+                    continue
+                flat_slots = _flatten(slots)
+                self.copy_blocks(
+                    self.device_kv_caches,
+                    self.host_xfer_buffers,
+                    _flatten(device),
+                    flat_slots,
+                    "d2h",
+                    lane=send.lane,
+                )
             with self._lock:
                 send.slots = flat_slots
             self._deferred_push_inbox.put((req_id, slots, reg))
             queued = True
         if queued:
             self._push_writer_wake.set()
+
+    def _stage_chunk_jobs(self, jobs: Iterable[NixlPushChunkJob]) -> None:
+        """Copy each job's blocks into its request's slots at their prompt positions.
+
+        A job at block 0 begins its request: it takes ``total_blocks`` slots,
+        or none when fewer are free, and then the request is staged whole once
+        matched. Slots the request held from before a preemption are retired
+        first, whether or not the preemption was listed.
+
+        Raises
+        ------
+        RuntimeError
+            When a later job does not start where the request's staged blocks
+            end, or counts another number of prompt blocks.
+        """
+        for job in jobs:
+            req_id = job.request_id
+            if job.start_block == 0:
+                if req_id in self._chunk_slots:
+                    self._retire_chunk_staging(preempted={req_id})
+                self._chunk_unstaged.discard(req_id)
+                taken = self.slots.take(job.total_blocks)
+                if taken is None:
+                    self._chunk_unstaged.add(req_id)
+                    logger.debug(
+                        "No %d free staging slots for %s; staging it once matched.",
+                        job.total_blocks,
+                        req_id,
+                    )
+                    continue
+                self._chunk_slots[req_id] = taken
+                self._chunk_staged[req_id] = 0
+            elif req_id in self._chunk_unstaged:
+                continue
+            slots = self._chunk_slots.get(req_id, [])
+            staged = self._chunk_staged.get(req_id, 0)
+            if job.start_block != staged or job.total_blocks != len(slots):
+                raise RuntimeError(
+                    f"A chunk job for {req_id} starts at block {job.start_block} "
+                    f"of {job.total_blocks}; its slots hold {staged} staged "
+                    f"blocks of {len(slots)}."
+                )
+            self.copy_blocks(
+                self.device_kv_caches,
+                self.host_xfer_buffers,
+                job.block_ids,
+                slots[job.start_block : job.end_block],
+                "d2h",
+            )
+            self._chunk_staged[req_id] = job.end_block
+
+    def _take_staged_chunks(self, req_id: str) -> list[int] | None:
+        """A matched request's slots for its whole prompt, or None if not staged.
+
+        Raises
+        ------
+        RuntimeError
+            When the request was matched before all its blocks were staged.
+        """
+        self._chunk_unstaged.discard(req_id)
+        slots = self._chunk_slots.pop(req_id, None)
+        staged = self._chunk_staged.pop(req_id, None)
+        if slots is not None and staged != len(slots):
+            raise RuntimeError(
+                f"{req_id} was matched with {staged} of its {len(slots)} prompt "
+                "blocks staged."
+            )
+        return slots
+
+    def _retire_chunk_staging(
+        self,
+        preempted: set[str] = frozenset(),
+        ended: set[str] = frozenset(),
+    ) -> None:
+        """Forget requests' chunk staging; their slots go back once unread.
+
+        The writer thread drops the requests' queued jobs and settles the
+        retirement once none of their WRITEs is in flight; then
+        ``_give_back_retired_slots`` returns the slots.
+
+        Parameters
+        ----------
+        preempted
+            Requests computed again from the start; the writer keeps D's
+            registration for each.
+        ended
+            Requests aborted, or reported sent; the writer drops them.
+        """
+        slots = []
+        for req_id in preempted | ended:
+            self._chunk_unstaged.discard(req_id)
+            self._chunk_staged.pop(req_id, None)
+            slots += self._chunk_slots.pop(req_id, [])
+        retirement = self._queue_chunk_retirement(preempted, ended)
+        self._chunk_retiring.append((retirement, slots))
+
+    def _give_back_retired_slots(self) -> None:
+        """Give back the slots of retirements the writer thread has settled."""
+        waiting = []
+        for retirement, slots in self._chunk_retiring:
+            if retirement.done.is_set():
+                self.slots.give_back(slots)
+            else:
+                waiting.append((retirement, slots))
+        self._chunk_retiring = waiting
 
     def _end_sends(self, finished: set[str]) -> None:
         """Mark P's sends vLLM reports finished; free those no write reads.
@@ -952,14 +1356,21 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
     def _on_cancel(self, message: dict[str, Any]) -> None:
         """P: write nothing more for D's cancelled registration.
 
-        Drops a pending registration and marks a matched one, which every
-        submission point checks; ``_settle_cancels`` then acknowledges the
-        cancellation once the matched requests' writes have ended.
+        Drops a pending registration and marks a matched one, whether a
+        finished request or a request with chunk jobs holds it; every
+        submission point checks the mark. ``_settle_cancels`` then acknowledges
+        the cancellation once the matched requests' writes have ended.
         """
         req_id = message["request_id"]
         self._pending_d_registrations.pop(req_id, None)
         writing = []
         with self._lock:
+            for state in self._chunk_states.values():
+                if (
+                    state.reg_data is not None
+                    and state.reg_data["request_id"] == req_id
+                ):
+                    state.reg_data[_CANCELLED] = True
             for p_req_id, send in self._sends.items():
                 if send.reg is not None and send.reg["request_id"] == req_id:
                     send.reg[_CANCELLED] = True
@@ -971,14 +1382,24 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         """P: send ``CANCEL_ACK`` for each cancellation with no write in flight.
 
         Runs on the writer thread, the only thread that submits writes, so no
-        write of a cancelled registration starts while this looks.
+        write of a cancelled registration starts while this looks. A chunk
+        WRITE counts by its registration, also once its request's chunk record
+        has been dropped.
         """
+        chunk_writes = {
+            task.state.reg_data["request_id"]
+            for task in self._chunk_transfer_tasks.values()
+            if task.state.reg_data is not None
+        }
         due = []
         with self._lock, self._sending_transfers_lock:
             for req_id, (message, writing) in list(self._cancel_waits.items()):
-                if not any(self._sending_transfers.get(p) for p in writing):
-                    del self._cancel_waits[req_id]
-                    due.append(message)
+                if req_id in chunk_writes or any(
+                    self._sending_transfers.get(p) for p in writing
+                ):
+                    continue
+                del self._cancel_waits[req_id]
+                due.append(message)
         for message in due:
             self._send_tt_notif(CANCEL_ACK, message)
 
@@ -1132,7 +1553,8 @@ class TTNixlPushConnector(NixlPushConnector):
     Raises
     ------
     ValueError
-        With decode context parallelism, as ``NixlPushConnector`` does.
+        With decode context parallelism, as ``NixlPushConnector`` does, and
+        for a configuration ``TTNixlPushConnectorScheduler`` refuses.
     """
 
     def __init__(self, vllm_config, role: KVConnectorRole, kv_cache_config):
@@ -1146,7 +1568,7 @@ class TTNixlPushConnector(NixlPushConnector):
         self.connector_scheduler = None
         self.connector_worker = None
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = NixlPushConnectorScheduler(
+            self.connector_scheduler = TTNixlPushConnectorScheduler(
                 vllm_config, self.engine_id, kv_cache_config
             )
         elif role == KVConnectorRole.WORKER:
@@ -1155,6 +1577,15 @@ class TTNixlPushConnector(NixlPushConnector):
             )
         else:
             raise ValueError(f"Unsupported KVConnectorRole: {role}")
+
+    def wait_for_save(self) -> None:
+        """Stage the step's chunk jobs into slots, then hand them to the writer.
+
+        The order of vLLM's chunked push proposal, whose ``wait_for_save``
+        also calls the worker's ``finish_chunk_step`` after vLLM's save.
+        """
+        super().wait_for_save()
+        self.connector_worker.finish_chunk_step(self._connector_metadata)
 
 
 def _agent_name(name: str | bytes) -> str:

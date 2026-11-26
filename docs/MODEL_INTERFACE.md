@@ -138,7 +138,7 @@ attention layer, `model.layers.<idx>.self_attn`, all with the default spec.
 
 `TTNixlPushConnector` (vLLM's `NixlPushConnector` with a TT worker) sizes the
 CPU buffer for the requests in flight instead of the whole KV pool: room for
-two requests of `max_model_len` tokens, at most the pool. D hands P staging
+four requests of `max_model_len` tokens, at most the pool. D hands P staging
 slot numbers instead of block IDs and copies the slots into its chips once
 P's write lands; P copies only the blocks D registered, once the two are
 matched. A D request whose KV does not arrive within
@@ -154,6 +154,8 @@ second, and once NIXL refuses a send to it as disconnected (or refused the
 registration itself), D frees the slots, after 10 s in the probe case. D logs
 each cancel it sends and each freeing at INFO. These notifications are not part
 of vLLM's push protocol, so P and D must both use `TTNixlPushConnector`.
+
+`"enable_chunked_push": true` in P's `kv_connector_extra_config` (experimental; vLLM's name for the same setting) moves P's copy into the prefill. After each prefill step, P copies the prompt blocks that the step completed from its chips into staging slots that hold the whole prompt. The copy runs after the step's forward on the model's command queue, so it lengthens the step. Without chunked prefill (a model that does not declare `supports_chunked_prefill`, or `--no-enable-chunked-prefill`), the prompt's one prefill step copies the whole prompt. P's writer thread writes each step's blocks from those slots into the blocks D registered as soon as D's registration has arrived, without a completion notification, so the transfer overlaps P's later prefill steps; blocks staged before the registration arrives are written when it arrives. The write of the prompt's last blocks carries the completion notification and starts only after every earlier write of the request has completed, so D, which is unchanged, copies its slots into its chips only once all of the KV has landed. D registers only after it has received its own request, so the writes overlap P's prefill only behind a proxy that sends the request to P and D at the same time. Behind vLLM 0.33's `toy_proxy_server.py`, which waits for P's answer before it calls D, P writes the whole request after it finishes, from its slots without a second copy. P also writes the whole request from its slots when a chunk write or the handshake with D fails, or when D's tensor parallel size differs from P's. Once D has cancelled the registration of a failed receive, P writes no chunk either: the request's last write then carries no notification, its whole-request write is dropped, and P acknowledges the cancel only after its chunk writes in flight have ended. A preempted or aborted request keeps its slots until no write reads them; a recompute takes new slots, and its writes reach D after the old ones. A request that finds too few free slots at its first prefill step is copied whole once matched, as without the setting. P refuses the setting at startup when the KV is not one full-attention group (sliding window, GDN, Mamba), when P leaves a prompt tail to D (multi-module MTP lookahead), and under lane DP. D ignores it. Both refuse a value other than `true` or `false` at startup.
 
 Under lane DP the lanes share the engine's one connector. Block IDs are
 lane-local, so the coordinator builds the connector metadata once per step and

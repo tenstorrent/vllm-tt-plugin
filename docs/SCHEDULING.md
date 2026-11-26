@@ -387,7 +387,9 @@ interleave does not take the step for decode:
 If the prefill pass schedules nothing (every slot taken, KV pressure, a request
 waiting for its grammar), `schedule()` returns the decode fallback with the
 cleanup from step 1, so running decodes keep their overlap; no empty step
-comes between two decodes. With `--no-async-scheduling` the engine commits
+comes between two decodes.
+With no running decode, `schedule()` returns the prefill pass's empty step with the cleanup from step 1, and builds that step's KV connector metadata only after the cleanup is added, so that the connector sees the requests preempted before step 1.
+With `--no-async-scheduling` the engine commits
 every step before it schedules the next one, and none of this happens.
 Single-process lane-DP does not do it: `TTLaneCoordinator` runs its lanes in
 forced modes.
