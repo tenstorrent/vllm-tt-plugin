@@ -122,6 +122,7 @@ launches without `speculative_config`.
 | `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
 | `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. |
 | `supports_spec_device_logprobs` | `False` | An `argmax_ids` verify sent `spec_num_logprobs` returns a `SpecLogprobs` payload with its ids, so a request with `logprobs` 0 to 20 stays on `argmax_ids` verifies and chains: see section 4j. |
+| `supports_spec_device_top_p` | `False` | An `argmax_ids` verify of a device-sampled step draws a sampled row with top-k off and `top_p` below 1 from the full-vocabulary nucleus, so such a row stays on device verifies that never chain: see section 4k. |
 
 A model never names a vLLM speculative method. The plugin owns the mapping from
 a method name to the requirements that method places on the model, so a new
@@ -1324,6 +1325,40 @@ logprobs, `n` the largest `logprobs` of the step's live rows, through
 `build_device_logprobs`; `spec_committed_logprobs` then cuts them to the
 published prefixes as for a `logits` verify. A verify sent
 `spec_num_logprobs` that returns no payload raises.
+
+## 4k. Top-p with top-k off on the device: `supports_spec_device_top_p`
+
+Approved by the submitter on 2026-11-26. Default `False`; valid only with
+`spec_ids_are_sampled`. A model without the declaration is served exactly as
+the sections above state.
+
+**Which rows.** A sampled request whose `top_k` is off (below 1, or at least
+the vocabulary, which `InputBatch` stores as the vocabulary size) and whose
+`top_p` is below 1. Without the capability `check_perform_device_sampling`
+sends a step with such a row to the host, because its top-k exceeds
+`max_device_top_k`; with it, on a step that may be an `argmax_ids` verify
+(`spec_verify=True`), the row does not count against `max_device_top_k`. The
+step stays device-sampled, the row is certifiable by the id walk as any
+device-sampled row (section 4i), and its verify carries it in
+`sampling_params` with its own `top_k` and `top_p`. A step built as an ordinary
+decode (section 4d) decides without the exception and samples such a row on
+the host. A finite `top_k` above `max_device_top_k`, and `top_p == 1` with
+top-k off, keep the host route.
+
+**What the model does.** For every column of such a row the verify's id is a
+draw from vLLM's full-vocabulary nucleus at the row's temperature: the
+largest tokens while the mass before them is below `top_p`. The model draws on
+the device when it can prove the nucleus lies inside the candidates its device
+sampler draws from, and otherwise draws the column again from the step's full
+logits when the verify is read, before its ids are returned. The ids it
+returns are never an approximation of the nucleus.
+
+**What the runner does.** A read may draw columns again from device logits, so
+the runner keeps every device operation that could overwrite those logits
+behind the read: `spec_chain.plan_chain` returns no chain on an unread verify
+holding such a row (drain reason `top_p`), and
+`spec_chain.prefill_over_pending` runs no prefill behind it
+(`model_input.spec_verify_holds_top_p_rows`).
 
 ## 5. One request, from prefill to release
 

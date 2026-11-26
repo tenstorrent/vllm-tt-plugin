@@ -376,13 +376,38 @@ def validate_spec_device_logprobs(
         )
 
 
+SUPPORTS_SPEC_DEVICE_TOP_P = "supports_spec_device_top_p"
+
+
+def validate_spec_device_top_p(
+    model_capabilities: Mapping[str, Any] | None, model_name: str
+) -> None:
+    """Raise for a ``supports_spec_device_top_p`` declaration the plugin cannot
+    honor: not a bool, or without ``spec_ids_are_sampled``, the device draws
+    on whose verify the capability widens to rows with top-k off."""
+    value = (model_capabilities or {}).get(SUPPORTS_SPEC_DEVICE_TOP_P, False)
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"TT model {model_name} declares {SUPPORTS_SPEC_DEVICE_TOP_P}="
+            f"{value!r}; the capability is a bool"
+        )
+    if value and (model_capabilities or {}).get("spec_ids_are_sampled") is not True:
+        raise ValueError(
+            f"TT model {model_name} declares {SUPPORTS_SPEC_DEVICE_TOP_P} without "
+            "spec_ids_are_sampled; a top-p row is served by the device draws of "
+            "an argmax_ids verify"
+        )
+
+
 __all__ = [
     "SUPPORTS_CHAINED_SPEC_VERIFY",
     "SUPPORTS_PREFILL_OVER_PENDING_SPEC",
     "SUPPORTS_SPEC_DEVICE_LOGPROBS",
+    "SUPPORTS_SPEC_DEVICE_TOP_P",
     "method_requirements",
     "resolve_speculative_plan",
     "validate_chained_spec_verify",
     "validate_prefill_over_pending_spec",
     "validate_spec_device_logprobs",
+    "validate_spec_device_top_p",
 ]

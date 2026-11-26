@@ -95,6 +95,7 @@ from vllm_tt_plugin.pooling import execute_pooling_step, supported_pooling_tasks
 from vllm_tt_plugin.spec_accept import accept_sampled_drafts, spec_sampling_inputs
 from vllm_tt_plugin.spec_admission import (
     SUPPORTS_SPEC_DEVICE_LOGPROBS,
+    SUPPORTS_SPEC_DEVICE_TOP_P,
     method_requirements,
 )
 from vllm_tt_plugin.spec_chain import (
@@ -177,6 +178,12 @@ class _SyncForward:
     decode_submission: TTDecodeSubmission | None = None
     # The verify's hidden handle, for a model whose drafter consumes it.
     spec_hidden: Any | None = None
+
+
+def _declares(runner: Any, capability: str) -> bool:
+    """Whether ``runner``'s loaded model declares the boolean ``capability``."""
+    capabilities = getattr(getattr(runner, "model", None), "model_capabilities", None)
+    return (capabilities or {}).get(capability, False) is True
 
 
 def _has_unresolved_commit(accepted_counts: torch.Tensor, num_rows: int) -> bool:
@@ -2803,10 +2810,13 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             if (
                 spec_mode is None
                 and device_sampled
-                and input_batch.max_num_logprobs is not None
+                and (
+                    input_batch.max_num_logprobs is not None
+                    or _declares(self, SUPPORTS_SPEC_DEVICE_TOP_P)
+                )
             ):
-                # An ordinary decode returns the device sampler's logprobs,
-                # not a verify's payload, so its own rules decide.
+                # An ordinary decode returns the device sampler's logprobs and
+                # draws, not a verify's, so its own rules decide.
                 device_sampled = self._decode_device_sampled(
                     scheduler_output, grammar_output, req_indices, verify=False
                 )
@@ -4583,7 +4593,9 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         ``spec_verify`` asks for the decision of an ``argmax_ids`` verify:
         when the verify's payload serves every logprobs request among the
         rows (``_spec_serves_logprobs``), the device-logprobs rules, which
-        describe the device sampler's own logprobs, do not apply.
+        describe the device sampler's own logprobs, do not apply; on a model
+        declaring ``supports_spec_device_top_p`` a sampled row with top-k off
+        and ``top_p`` below 1 does not exceed ``max_device_top_k``.
         """
         want_device_sampling = self.sample_on_device_mode == "all" or (
             self.sample_on_device_mode == "decode_only" and is_decode
@@ -4627,6 +4639,9 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             needs_unbounded_or_larger_k = (temperature != 0) & (
                 (top_k < 1) | (top_k > max_top_k)
             )
+            if spec_verify and _declares(self, SUPPORTS_SPEC_DEVICE_TOP_P):
+                top_k_off = (top_k < 1) | (top_k >= self.vocab_size)
+                needs_unbounded_or_larger_k &= ~(top_k_off & (sampling.top_p[rows] < 1))
             if needs_unbounded_or_larger_k.any():
                 return False
         if not input_batch.no_penalties and not self.model.model_capabilities.get(
