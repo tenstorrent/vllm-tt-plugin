@@ -31,6 +31,7 @@ CONTEXT_SECONDS = 10.0
 # Stage-0 prompt key holding the audio after the chunk; asr2aligner reads it.
 CONTEXT_KEY = "tt_diarize_context"
 CONTEXT_SAMPLES_KWARG = "diarize_context_samples"
+DIARIZER_ARCHITECTURES = ("Qwen3ForcedAlignerDiarizer", "TTQwen3ForcedAlignerDiarizer")
 
 # Per diarized request: the chunk prompts in order and the aligner result of each.
 _request_state: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
@@ -241,6 +242,14 @@ def _install_serving() -> None:
         if not self.has_asr_aligner:
             return self.create_error_response(
                 "diarized_json requires an ASR stage connected to a forced aligner."
+            )
+        # Other stage-1 models cannot take the context audio added below.
+        aligner = self.engine_client.engine.stage_vllm_configs[1].model_config
+        if aligner.architecture not in DIARIZER_ARCHITECTURES:
+            return self.create_error_response(
+                "diarized_json requires a diarizing forced-aligner stage "
+                f"({', '.join(DIARIZER_ARCHITECTURES)}); stage 1 is "
+                f"{aligner.architecture}."
             )
         from models.experimental.pyannote.reference.diarization import diarize
 
