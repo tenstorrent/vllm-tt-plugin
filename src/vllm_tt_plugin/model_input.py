@@ -271,6 +271,11 @@ class TTModelInput:
     # predecessor's commit fills them (``vllm_tt_plugin.spec_chain``).
     spec_predecessor: Any | None = None
 
+    # Host sampling only, one entry per rank like ``bad_words_token_ids_list``:
+    # req_index -> ``SamplingParams.logprob_token_ids``. ``None`` when the
+    # builder never fills it (lane mode reads the merged batch instead).
+    logprob_token_ids_list: list[dict[int, list[int]]] | None = None
+
 
 def live_row_index(
     model_input: TTModelInput, row_req_ids: list[str] | None = None
