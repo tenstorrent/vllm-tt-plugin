@@ -703,9 +703,9 @@ export TT_MODEL_CLASS_OVERRIDES="TTLlamaForCausalLM=tt_transformers.vllm_registr
 ```
 
 Each entry has the form `TT<Arch>=tt_transformers.vllm_registry:<Arch>`, for an
-architecture that `tt_transformers.vllm_registry` exports. The class serves the
-`--model` checkpoint: a Hugging Face id that tt-transformers lists, or a Hugging
-Face cache snapshot of one.
+architecture that `tt_transformers.vllm_registry` exports. The class selects its
+generator by the `--model` Hugging Face id, given directly or as a Hugging Face
+cache snapshot of it; it ignores the snapshot's revision.
 
 Every tt-transformers model is experimental, and its
 [support matrix](https://github.com/tenstorrent/tt-transformers/blob/main/SUPPORT.md)
@@ -717,9 +717,11 @@ does not qualify vLLM serving. Before launching:
   then run `source docs/install-vllm-tt.sh` from this repository. The script
   replaces the `transformers` pin with the range vLLM requires; tt-transformers
   does not qualify that combination.
-- Serve only the checkpoints and device geometries that the support matrix
-  lists. An unlisted checkpoint fails with `UnsupportedModelError` after the
-  device mesh opens. The plugin does not check the geometry.
+- Serve only the checkpoints, pinned revisions, and device geometries that the
+  support matrix lists, and pass the pinned revision with `--revision`. An
+  unlisted checkpoint fails with `UnsupportedModelError` after the device mesh
+  opens. Neither the plugin nor tt-transformers checks the revision or the
+  geometry.
 
 The plugin applies the selected class's `model_capabilities` as for any model;
 see [Model capabilities](docs/MODEL_CAPABILITIES.md). A launch option that the
