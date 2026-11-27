@@ -139,6 +139,7 @@ def test_a_speculative_step_missing_its_side_tensors_raises_by_name():
     runner = _bare_runner()
     fwd = SimpleNamespace(
         tt_out=torch.zeros(1, 4, dtype=torch.int32),
+        tt_log_probs=None,
         model_input=SimpleNamespace(
             row_req_ids=["r"],
             draft_token_ids=None,

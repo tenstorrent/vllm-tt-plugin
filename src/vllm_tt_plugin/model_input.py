@@ -19,6 +19,7 @@ import torch
 from vllm.v1.sample.logits_processor import LogitsProcessors
 
 from vllm_tt_plugin.mamba_state import MambaStepState
+from vllm_tt_plugin.spec_decode import ACCEPT_MODE_ARGMAX_IDS
 
 
 @dataclass(frozen=True)
@@ -263,6 +264,15 @@ class TTModelInput:
     # request's output has grown.
     spec_min_tokens: dict[int, tuple[int, tuple[int, ...]]] | None = None
 
+    # Token-masked ``argmax_ids`` verify only (``supports_spec_device_mask``):
+    # every control of the block's rows but the grammar, ``[rows, 1+K, W]``
+    # int32 in xgrammar's packing over every row of the padded block, all ones
+    # where nothing applies; ``None`` when no row has such a control. Built at
+    # build time (``spec_token_mask.step_static_token_mask``) because the
+    # controls read the committed output; ``sample_tokens`` ANDs the grammar
+    # into it before the model samples.
+    spec_token_mask: torch.Tensor | None = None
+
     # Chained verify only (``supports_chained_spec_verify``), else ``None``:
     # the unread ``VerifyOutput`` of the verify submitted just before, which
     # ``submit_decode`` passes to the model as ``spec_predecessor``. The live
@@ -303,6 +313,37 @@ def live_row_index(
             f"live requests {row_req_ids}: {live_rows}"
         )
     return torch.as_tensor(live_rows, dtype=torch.int64)
+
+
+def spec_verify_num_logprobs(model_input: TTModelInput) -> torch.Tensor | None:
+    """The ``spec_num_logprobs`` an ``argmax_ids`` verify asks its model for.
+
+    Returns
+    -------
+    torch.Tensor or None
+        ``[B]`` int32 over the block's rows: each live row's request
+        ``logprobs`` (0 for the committed token alone), ``-2`` for a live row
+        that asks for none and for every other row. ``None`` for a step that
+        is not an ``argmax_ids`` verify, or whose live rows ask for none (or
+        whose sampling carries no ``num_logprobs``).
+
+    Notes
+    -----
+    Read off ``tt_sampling_params``, the step's own copy, so the walk on the
+    readback thread sees the request the model was sent. A lane build's
+    sampling rows cover unscheduled slots too, which are left out here.
+    """
+    if model_input.spec_mode != ACCEPT_MODE_ARGMAX_IDS:
+        return None
+    asked = getattr(model_input.tt_sampling_params, "num_logprobs", None)
+    if asked is None:
+        return None
+    rows = int(model_input.input_tokens.shape[0])
+    asked = torch.as_tensor(asked).reshape(-1)
+    live = live_row_index(model_input)
+    counts = torch.full((rows,), -2, dtype=torch.int32)
+    counts[live] = asked[live].to(torch.int32)
+    return counts if bool((counts >= 0).any()) else None
 
 
 def penalty_history(output_tokens: torch.Tensor) -> list[list[int]]:

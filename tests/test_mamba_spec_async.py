@@ -78,8 +78,10 @@ from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     DRAFTER_STATE_INTERNAL,
+    MAX_SPEC_DEVICE_LOGPROBS,
     PLACEHOLDER_TOKEN_ID,
     DraftOutput,
+    SpecLogprobs,
     SpecPlan,
     VerifyOutput,
 )
@@ -149,12 +151,38 @@ def _draw(prefix: list[int], device_seed: int) -> int:
     return FIRST_ID + (token - FIRST_ID + 1 + device_seed % 7) % (VOCAB - FIRST_ID)
 
 
-class _Answer:
-    """A verify's deferred ``argmax_ids``: the ids, and how often the host read them."""
+def _device_logprob(prefix: list[int], token: int) -> float:
+    """The raw logprob the device reports for ``token`` after ``prefix``
+    (``supports_spec_device_logprobs``): a function of both, so a published
+    logprob is checkable against the token history alone. Never 0, which
+    is what the host sampler reports on this harness's one-hot logits."""
+    return -float(1 + (7 * sum(prefix[-4:]) + 3 * len(prefix) + token) % 61) / 8.0
 
-    def __init__(self, ids: torch.Tensor, record: SimpleNamespace):
+
+def _device_rank(prefix: list[int], token: int) -> int:
+    return 1 + (len(prefix) + token) % 5
+
+
+def _device_top(prefix: list[int]) -> tuple[list[int], list[float]]:
+    """The top ``MAX_SPEC_DEVICE_LOGPROBS`` ids and logprobs after ``prefix``."""
+    first = (sum(prefix[-3:]) + len(prefix)) % VOCAB
+    ids = [(first + i) % VOCAB for i in range(MAX_SPEC_DEVICE_LOGPROBS)]
+    return ids, [-0.25 * i - (len(prefix) % 3) for i in range(MAX_SPEC_DEVICE_LOGPROBS)]
+
+
+class _Answer:
+    """A verify's deferred ``argmax_ids``: the ids, and how often the host read
+    them; with ``payload`` the ``SpecLogprobs`` the read returns with them."""
+
+    def __init__(
+        self,
+        ids: torch.Tensor,
+        record: SimpleNamespace,
+        payload: SpecLogprobs | None = None,
+    ):
         self.ids = ids
         self.record = record
+        self.payload = payload
         self.reads = 0
 
 
@@ -214,6 +242,11 @@ class _LedgerDevice:
         # Every row the device ran, in order: (row, start block per group,
         # window blocks per group).
         self.inputs: list[tuple] = []
+        # The token mask of the verify being sampled (``supports_spec_device_
+        # mask``), and the token-masked verifies sampled, chained or not.
+        self.mask: torch.Tensor | None = None
+        self.masked_verifies = 0
+        self.chained_masked = 0
 
     def allocate_kv_cache_per_layer(self, per_layer_specs):
         return ["kv"]
@@ -305,8 +338,13 @@ class _LedgerDevice:
                     block = int(mamba_state.groups[i].checkpoint_blocks[row, 0])
                     self.h.ledger.write(g, block, prefix, position)
             if not bool(mamba_state.intermediate_prefill_mask[row]):
-                self.truth[req_id] = [*prefix, _target(prefix)]
-                logits[row, 0, _target(prefix)] = 1e4
+                token = _target(prefix)
+                allowed = self.h.requests[req_id].sampling_params.allowed_token_ids
+                if allowed:
+                    # The host sampler applies the allowlist to these logits.
+                    token = self._masked(token, allowed.__contains__)
+                self.truth[req_id] = [*prefix, token]
+                logits[row, 0, token] = 1e4
         self._run_rows(mamba_state, rows)
         return logits
 
@@ -317,6 +355,17 @@ class _LedgerDevice:
                 "of this model reloads, its ordinary decode being host-answered"
             )
         live = self._live()
+        if kwargs.pop("defer_device_sampling", False):
+            # A token-masked verify: it runs when sample_deferred_decode
+            # brings its mask, over the rows it was submitted with.
+            self.last_kind = "verify"
+            return SimpleNamespace(
+                live=live,
+                tokens=tokens.clone(),
+                start_pos=start_pos.clone(),
+                mamba_state=mamba_state,
+                kwargs=kwargs,
+            )
         if kwargs.get("spec_mode") is not None:
             self.last_kind = "verify"
         if kwargs.get("spec_mode") is None:
@@ -332,6 +381,38 @@ class _LedgerDevice:
             return logits[:, 0].argmax(dim=-1).to(torch.int32).reshape(-1, 1)
         return self._verify(live, tokens, start_pos, mamba_state, kwargs)
 
+    def sample_deferred_decode(
+        self, payload, sampling_params=None, grammar_bitmask=None, num_valid_drafts=None
+    ):
+        kwargs = {
+            **payload.kwargs,
+            "sampling_params": sampling_params,
+            "num_valid_drafts": num_valid_drafts,
+        }
+        self.mask = grammar_bitmask
+        try:
+            out = self._verify(
+                payload.live,
+                payload.tokens,
+                payload.start_pos,
+                payload.mamba_state,
+                kwargs,
+            )
+        finally:
+            self.mask = None
+        self.masked_verifies += 1
+        self.chained_masked += kwargs.get("spec_predecessor") is not None
+        return out
+
+    def _masked(self, token: int, allowed) -> int:
+        """The first token from ``token`` upward (mod VOCAB) that ``allowed``
+        holds: the masked choice of a row whose unmasked choice is ``token``."""
+        for step in range(VOCAB):
+            candidate = (token + step) % VOCAB
+            if allowed(candidate):
+                return candidate
+        raise AssertionError("a token mask allowed nothing")
+
     def _draws(self, row: int, sampling) -> bool:
         """Whether ``row``'s ids are draws: a sampled row of a device-sampled
         step (``sampling``) on a device declaring ``spec_ids_are_sampled``."""
@@ -342,16 +423,23 @@ class _LedgerDevice:
             and int(sampling.top_k[row]) != 1
         )
 
-    def _token(self, prefix, row: int, position: int, sampling) -> int:
+    def _token(self, prefix, row: int, position: int, sampling, column=None) -> int:
         """The device's token after ``prefix`` at input ``position``: the
         target's, or a drawing row's draw, seeded by the request seed and the
-        position or by fresh entropy."""
+        position or by fresh entropy; under a token mask, the first token from
+        there upward that the mask of ``row`` and ``column`` allows."""
         if not self._draws(row, sampling):
-            return _target(prefix)
-        seed = sampling.seed[row]
-        if seed is None:
-            return _draw(prefix, self.entropy.randrange(1 << 20))
-        return _draw(prefix, _position_seed(seed, position))
+            token = _target(prefix)
+        elif sampling.seed[row] is None:
+            token = _draw(prefix, self.entropy.randrange(1 << 20))
+        else:
+            token = _draw(prefix, _position_seed(sampling.seed[row], position))
+        if self.mask is None or column is None:
+            return token
+        words = self.mask[row, column]
+        return self._masked(
+            token, lambda t: bool((int(words[t // 32]) >> (t % 32)) & 1)
+        )
 
     def _offer(self, req_id: str) -> int:
         """The drafts the drafter offers after the request's history."""
@@ -371,7 +459,12 @@ class _LedgerDevice:
             )
             starts = [int(g.start_blocks[row]) for g in mamba_state.groups]
             rows.append((row, truth[:position], starts, [(0, tuple(truth))]))
-            truth.append(self._token(truth, row, position, sampling))
+            token = self._token(truth, row, position, sampling)
+            allowed = self.h.requests[req_id].sampling_params.allowed_token_ids
+            if sampling is None and allowed:
+                # The host sampler applies the allowlist to these logits.
+                token = self._masked(token, allowed.__contains__)
+            truth.append(token)
             logits[row, 0, truth[-1]] = 1e4
             self.next_drafts[req_id] = self.drafts(truth)
         self._run_rows(mamba_state, rows)
@@ -402,6 +495,8 @@ class _LedgerDevice:
             sampled=[self._draws(row, sampling) for row in range(len(live))],
             chained=predecessor is not None,
             followed=False,
+            # row -> the token history before each verified column's token.
+            prefixes={},
         )
         self.records.append(record)
         for row, req_id in enumerate(live):
@@ -463,8 +558,42 @@ class _LedgerDevice:
         self._run_rows(mamba_state, rows)
         self.steps.append(record)
         return VerifyOutput(
-            spec_mode=ACCEPT_MODE_ARGMAX_IDS, argmax_ids=_Answer(ids, record)
+            spec_mode=ACCEPT_MODE_ARGMAX_IDS,
+            argmax_ids=_Answer(ids, record, self._payload(live, record, kwargs)),
         )
+
+    def _payload(self, live, record, kwargs) -> SpecLogprobs | None:
+        """The ``SpecLogprobs`` of a verify sent ``spec_num_logprobs``, which
+        the runner sends exactly when this device declares
+        ``supports_spec_device_logprobs`` and a live row asks for logprobs."""
+        asked = [self.h.requests[r].sampling_params.logprobs for r in live]
+        sent = kwargs.get("spec_num_logprobs")
+        declared = self.model_capabilities.get("supports_spec_device_logprobs")
+        if not declared or all(n is None for n in asked):
+            assert sent is None, sent
+            return None
+        rows = int(record.ids.shape[0])
+        expected = [-2 if n is None else n for n in asked] + [-2] * (rows - len(live))
+        assert sent.dtype == torch.int32 and sent.tolist() == expected, (
+            sent,
+            expected,
+        )
+        n = MAX_SPEC_DEVICE_LOGPROBS
+        payload = SpecLogprobs(
+            torch.zeros(rows, T),
+            torch.zeros(rows, T, dtype=torch.int32),
+            torch.zeros(rows, T, n),
+            torch.zeros(rows, T, n, dtype=torch.int32),
+        )
+        for row, prefixes in record.prefixes.items():
+            for t, prefix in enumerate(prefixes):
+                token = int(record.ids[row, t])
+                payload.sampled_logprobs[row, t] = _device_logprob(prefix, token)
+                payload.selected_token_ranks[row, t] = _device_rank(prefix, token)
+                top_ids, top_logprobs = _device_top(prefix)
+                payload.top_token_ids[row, t] = torch.tensor(top_ids)
+                payload.top_logprobs[row, t] = torch.tensor(top_logprobs)
+        return payload
 
     def _verify_row(self, row, req_id, p0, block, starts, ids, record, rows, sampling):
         truth = self.truth[req_id]
@@ -472,10 +601,11 @@ class _LedgerDevice:
         nv = len(block) - 1
         for t in range(T):
             ids[row, t] = (
-                self._token(prefix + block[: t + 1], row, p0 + t, sampling)
+                self._token(prefix + block[: t + 1], row, p0 + t, sampling, t)
                 if t <= nv
                 else PLACEHOLDER_TOKEN_ID
             )
+        record.prefixes[row] = [prefix + block[: t + 1] for t in range(nv + 1)]
         count = 1
         while count <= nv and block[count] == int(ids[row, count - 1]):
             count += 1
@@ -509,6 +639,8 @@ class _LedgerDevice:
         if not isinstance(tt_out, _Answer):
             raise AssertionError(f"nothing deferred to read: {type(tt_out).__name__}")
         tt_out.reads += 1
+        if tt_out.payload is not None:
+            return tt_out.ids, tt_out.payload
         return tt_out.ids
 
     def propose_draft_tokens(
@@ -553,6 +685,8 @@ class _AsyncHarness:
         device_sampling: bool = False,
         sampled_ids: bool = False,
         prefill_over_pending: bool = False,
+        device_logprobs: bool = False,
+        token_masks: bool = False,
     ):
         cfg = _vllm_config(mode)
         cfg.model_config.max_model_len = MAX_MODEL_LEN
@@ -608,6 +742,11 @@ class _AsyncHarness:
                 max_device_top_k=MAX_DEVICE_TOP_K,
                 supports_device_penalties=False,
             )
+        if device_logprobs:
+            self.device.model_capabilities["supports_spec_device_logprobs"] = True
+        if token_masks:
+            # A model drawing its verifies under the plugin's token mask.
+            self.device.model_capabilities["supports_spec_device_mask"] = True
         if prefill_over_pending:
             # As TTPlatform stores the validated declaration for the scheduler.
             self.device.model_capabilities["supports_prefill_over_pending_spec"] = True
@@ -1553,3 +1692,333 @@ def test_a_sampled_device_count_unequal_to_the_walk_raises_before_its_step_is_se
     for req_id, request in h.requests.items():
         tokens = list(request.output_token_ids)
         assert tokens == reference.outputs[req_id][: len(tokens)], req_id
+
+
+def _collect_logprobs(h: _AsyncHarness) -> dict[str, list[tuple]]:
+    """Wrap the harness's update to collect, per request, each published
+    token with its logprob row: ``(prefix, token, ids, logprobs, rank)``,
+    ``prefix`` the request's token history before the token."""
+    published: dict[str, list[tuple]] = {}
+    update = h._update
+
+    def collect(scheduler_output, output):
+        resolved = output.get_output() if hasattr(output, "get_output") else output
+        lists = resolved.logprobs
+        for index, req_id in enumerate(resolved.req_ids):
+            tokens = resolved.sampled_token_ids[index]
+            request = h.requests[req_id]
+            if lists is None or request.sampling_params.logprobs is None:
+                continue
+            rows = lists.slice_request(index, len(tokens))
+            history = list(request.all_token_ids)
+            for j, token in enumerate(tokens):
+                published.setdefault(req_id, []).append(
+                    (
+                        history + list(tokens[:j]),
+                        int(token),
+                        [int(i) for i in rows.logprob_token_ids[j]],
+                        [float(v) for v in rows.logprobs[j]],
+                        int(rows.sampled_token_ranks[j]),
+                    )
+                )
+        update(scheduler_output, resolved)
+
+    h._update = collect
+    return published
+
+
+@pytest.mark.parametrize("mode", ["none", "align"])
+def test_a_verify_payload_serves_logprobs_rows_and_they_chain(mode):
+    """On a device declaring ``supports_spec_device_logprobs`` a request with
+    logprobs 0 to 20 is certifiable by the id walk: greedy, and sampled on a
+    device-sampled step, which a verify stays on although this one-device
+    launch keeps the device sampler's own logprobs on the host. Its steps are
+    ``argmax_ids`` verifies sent ``spec_num_logprobs`` (the device checks the
+    rows it was sent), they chain like any other row, and every token a verify
+    commits is published with the payload's logprob, rank and top ids at its
+    column. Ordinary decodes (prompt ends, declined drafts) sample those rows
+    on the host, whose logits give logprob 0."""
+    h = _AsyncHarness(
+        SAMPLED_BLOCKS,
+        mode=mode,
+        asynchronous=True,
+        chained=True,
+        sampled_ids=True,
+        device_logprobs=True,
+    )
+    h.add("g0", 1019, max_tokens=24)
+    h.add("l0", 1022, max_tokens=24, logprobs=0)
+    h.add("l5", 2045, max_tokens=24, logprobs=5)
+    h.add("s3", 900, max_tokens=24, temperature=0.8, top_k=5, seed=7, logprobs=3)
+    h.add("s20", 1500, max_tokens=24, temperature=1.0, top_k=5, logprobs=20)
+    h.device.decline = lambda req_id, truth: len(truth) % 7 == 3
+    published = _collect_logprobs(h)
+    h.run()
+
+    controller = h.runner.async_decode
+    assert controller._chain_drains["sampling"] == 0
+    chained = {
+        req_id
+        for record in h.device.records
+        if record.chained
+        for req_id in record.rows
+    }
+    assert {"l0", "l5", "s3", "s20"} <= chained
+    for req_id, asked in (("l0", 0), ("l5", 5), ("s3", 3), ("s20", 20)):
+        # The runner publishes a verify's whole commit; vLLM cuts it at
+        # max_tokens afterwards.
+        entries = published[req_id]
+        assert len(entries) >= 24, req_id
+        from_device = 0
+        for prefix, token, ids, logprobs, rank in entries:
+            assert ids[0] == token, (req_id, ids)
+            assert len(ids) >= asked + 1, (req_id, ids)
+            if logprobs[0] == 0.0:
+                continue  # the host sampler's, on an ordinary decode
+            from_device += 1
+            assert logprobs[0] == pytest.approx(_device_logprob(prefix, token))
+            assert rank == _device_rank(prefix, token)
+            top_ids, top_logprobs = _device_top(prefix)
+            n = len(ids) - 1
+            assert ids[1:] == top_ids[:n], req_id
+            assert logprobs[1:] == pytest.approx(top_logprobs[:n]), req_id
+        assert from_device >= 16, (req_id, from_device)
+    reference = _AsyncHarness(
+        SAMPLED_BLOCKS, mode=mode, asynchronous=False, sampled_ids=True
+    )
+    reference.add("g0", 1019, max_tokens=24)
+    reference.add("l0", 1022, max_tokens=24)
+    reference.add("l5", 2045, max_tokens=24)
+    reference.run()
+    for req_id in ("g0", "l0", "l5"):
+        assert h.outputs[req_id] == reference.outputs[req_id], req_id
+
+
+@pytest.mark.parametrize(
+    "logprobs, extra",
+    [
+        # More than the payload holds.
+        (21, {}),
+        # Every token of the vocabulary.
+        (-1, {}),
+    ],
+)
+def test_a_logprobs_request_the_payload_cannot_serve_stays_uncertifiable(
+    logprobs, extra
+):
+    """A request whose logprobs the payload does not hold is not certifiable
+    by the id walk even on a device declaring the capability: on this launch,
+    which offers ``argmax_ids`` only, it is offered no drafts and its steps
+    are ordinary decodes sampled on the host."""
+    h = _AsyncHarness(
+        SAMPLED_BLOCKS,
+        mode="none",
+        asynchronous=True,
+        chained=True,
+        sampled_ids=True,
+        device_logprobs=True,
+    )
+    h.add("g0", 1019, max_tokens=16)
+    h.add("x", 800, max_tokens=12, logprobs=logprobs, **extra)
+    verified: list[list[str]] = []
+    verify = h.device._verify
+
+    def record_verify(live, tokens, start_pos, mamba_state, kwargs):
+        verified.append(list(live))
+        return verify(live, tokens, start_pos, mamba_state, kwargs)
+
+    h.device._verify = record_verify
+    h.run()
+    assert not any("x" in rows for rows in verified)
+    assert len(h.outputs["x"]) == 12
+
+
+def test_a_host_sampled_verify_returns_the_payload_of_its_greedy_rows():
+    """On a launch that samples nothing on the device a greedy logprobs row
+    is still certifiable: its verify samples on the host and its read
+    returns ``(ids, payload)``, from which the walk publishes the logprobs."""
+    h = _AsyncHarness(48, mode="none", asynchronous=True, chained=True)
+    h.device.model_capabilities["supports_spec_device_logprobs"] = True
+    h.add("g0", 1019, max_tokens=16)
+    h.add("l2", 1022, max_tokens=16, logprobs=2)
+    published = _collect_logprobs(h)
+    h.run()
+
+    assert h.runner.sample_on_device_mode is None
+    assert any("l2" in r.rows for r in h.device.records if r.chained)
+    from_device = [
+        (prefix, token, logprobs[0])
+        for prefix, token, _ids, logprobs, _rank in published["l2"]
+        if logprobs[0] != 0.0
+    ]
+    assert len(from_device) >= 10
+    for prefix, token, value in from_device:
+        assert value == pytest.approx(_device_logprob(prefix, token))
+
+
+ALLOWED = tuple(range(0, VOCAB, 2))
+
+
+def _masked_scenario(h: _AsyncHarness) -> None:
+    """``_sampled_scenario`` with an allowlist on one greedy and one seeded
+    sampled request, which a verify carries in its token mask."""
+    _sampled_scenario(h, unseeded=False)
+    h.add("ga", 1300, max_tokens=24, allowed_token_ids=list(ALLOWED))
+    h.add(
+        "sa",
+        2500,
+        max_tokens=24,
+        temperature=0.8,
+        top_k=5,
+        seed=21,
+        allowed_token_ids=list(ALLOWED),
+    )
+
+
+@pytest.mark.parametrize("mode", ["none", "align"])
+def test_token_masked_rows_chain_to_their_unchained_output(mode):
+    """On a model chaining token-masked verifies, a row with an allowlist no
+    longer drains the chain: its chained verify defers its draws to
+    sample_tokens, under the mask its predecessor's commit gives it. Greedy
+    outputs equal those of unchained token-masked verifies, and every
+    allowlisted token is allowed. A seeded row is compared only for its
+    allowlist: an ordinary decode that holds an allowlisted row samples on
+    the host, and which steps are ordinary decodes depends on chaining."""
+    reference = _AsyncHarness(
+        SAMPLED_BLOCKS, mode=mode, asynchronous=True, sampled_ids=True, token_masks=True
+    )
+    _masked_scenario(reference)
+    reference.run()
+
+    h = _AsyncHarness(
+        SAMPLED_BLOCKS,
+        mode=mode,
+        asynchronous=True,
+        chained=True,
+        sampled_ids=True,
+        token_masks=True,
+    )
+    _masked_scenario(h)
+    h.run()
+
+    for req_id in ("g0", "g1", "g2", "ga"):
+        assert h.outputs[req_id] == reference.outputs[req_id], req_id
+    for req_id in ("ga", "sa"):
+        assert len(h.outputs[req_id]) == 24
+        assert set(h.outputs[req_id]) <= set(ALLOWED), req_id
+    controller = h.runner.async_decode
+    assert controller._chain_drains["sampling"] == 0
+    assert reference.device.masked_verifies and not reference.device.chained_masked
+    assert h.device.chained_masked > 0
+    assert controller._token_masked_verify_submissions == h.device.masked_verifies
+
+
+def test_without_chained_masks_a_token_masked_row_drains_the_chain():
+    """The capability pair is required: a model that chains but draws no
+    token mask keeps an allowlisted row out of every verify."""
+    h = _AsyncHarness(
+        SAMPLED_BLOCKS, mode="none", asynchronous=True, chained=True, sampled_ids=True
+    )
+    _masked_scenario(h)
+    h.run()
+    assert set(h.outputs["ga"]) <= set(ALLOWED)
+    assert h.device.masked_verifies == 0
+    assert not any("ga" in record.rows for record in h.device.records)
+    assert h.device.chained > 0
+
+
+@pytest.mark.parametrize("mode", ["none", "align"])
+def test_a_token_masked_verify_serves_logprobs_rows_and_not_a_masked_one(mode):
+    """On a model declaring ``supports_spec_device_mask``,
+    ``supports_spec_device_logprobs`` and ``supports_chained_spec_verify``, a
+    token-masked verify carries a logprobs row next to an allowlisted one:
+    both chain, the verify is sent ``spec_num_logprobs`` (the device checks
+    the rows) and the logprobs row's tokens are published with the payload's
+    logprobs. A request with an allowlist and logprobs is served by neither
+    payload (it would describe the masked logits, where vLLM's raw logprobs
+    precede the allowlist): it never reaches a verify, and its tokens stay
+    allowlisted."""
+    h = _AsyncHarness(
+        SAMPLED_BLOCKS,
+        mode=mode,
+        asynchronous=True,
+        chained=True,
+        sampled_ids=True,
+        device_logprobs=True,
+        token_masks=True,
+    )
+    h.add("ga", 1300, max_tokens=24, allowed_token_ids=list(ALLOWED))
+    h.add("l5", 2045, max_tokens=24, logprobs=5)
+    h.add("x", 900, max_tokens=6, logprobs=2, allowed_token_ids=list(ALLOWED))
+    published = _collect_logprobs(h)
+    h.run()
+
+    assert not any("x" in record.rows for record in h.device.records)
+    assert set(h.outputs["x"]) <= set(ALLOWED) and len(h.outputs["x"]) == 6
+    assert set(h.outputs["ga"]) <= set(ALLOWED)
+    together = [r for r in h.device.records if {"ga", "l5"} <= set(r.rows)]
+    assert together and any(r.chained for r in together)
+    assert h.device.masked_verifies >= len(together)
+    from_device = [e for e in published["l5"] if e[3][0] != 0.0]
+    assert len(from_device) >= 12
+    for prefix, token, ids, logprobs, rank in from_device:
+        assert logprobs[0] == pytest.approx(_device_logprob(prefix, token))
+        assert ids[1:] == _device_top(prefix)[0][:5]
+
+
+def test_a_token_masked_verify_carries_penalised_rows_and_not_a_penalised_logprobs_row(
+    monkeypatch,
+):
+    """With ``supports_spec_device_mask``, ``supports_spec_device_penalties``,
+    ``supports_spec_device_logprobs`` and chaining declared: an allowlisted
+    greedy row with a repetition penalty verifies under the token mask and
+    chains, and its deferred verify brings each penalised row's prompt and
+    output at submission. A penalised request that asks for logprobs is served
+    by no payload (it would describe the penalized logits, where vLLM's raw
+    logprobs precede the penalties): it never reaches a verify."""
+    monkeypatch.setitem(globals(), "_prompt", _vocab_prompt)
+    h = _AsyncHarness(
+        SAMPLED_BLOCKS,
+        mode="align",
+        asynchronous=True,
+        chained=True,
+        sampled_ids=True,
+        device_logprobs=True,
+        token_masks=True,
+    )
+    h.device.model_capabilities["supports_spec_device_penalties"] = True
+    h.add("g0", 1019, max_tokens=24)
+    h.add(
+        "pa",
+        1100,
+        max_tokens=24,
+        repetition_penalty=1.3,
+        allowed_token_ids=list(ALLOWED),
+    )
+    h.add("l5", 900, max_tokens=24, logprobs=5)
+    h.add("pl", 700, max_tokens=6, repetition_penalty=1.2, logprobs=3)
+    device, deferred = h.device, []
+    decode = device.decode_forward
+
+    def record(*, tokens, start_pos, mamba_state, **kwargs):
+        live = device._live()
+        if kwargs.get("defer_device_sampling") and "pa" in live:
+            row = live.index("pa")
+            prompt = _history(kwargs["prompt_tokens"], row)
+            deferred.append(prompt == list(h.requests["pa"].prompt_token_ids))
+        return decode(
+            tokens=tokens, start_pos=start_pos, mamba_state=mamba_state, **kwargs
+        )
+
+    device.decode_forward = record
+    h.run()
+
+    assert not any("pl" in record.rows for record in device.records)
+    assert len(h.outputs["pl"]) == 6
+    assert set(h.outputs["pa"]) <= set(ALLOWED) and len(h.outputs["pa"]) == 24
+    masked = [r for r in device.records if "pa" in r.rows]
+    assert masked and any(r.chained for r in masked)
+    assert deferred and all(deferred), (
+        "a deferred verify lacked a penalised row's prompt"
+    )
+    assert device.masked_verifies >= len(masked)

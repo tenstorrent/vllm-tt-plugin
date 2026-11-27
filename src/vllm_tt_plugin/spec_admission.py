@@ -332,6 +332,29 @@ def validate_chained_spec_verify(
         )
 
 
+SUPPORTS_SPEC_DEVICE_MASK = "supports_spec_device_mask"
+
+
+def validate_spec_device_mask(
+    model_capabilities: Mapping[str, Any] | None, model_name: str
+) -> None:
+    """Raise for a ``supports_spec_device_mask`` declaration the plugin cannot
+    honor: not a bool, or without ``spec_ids_are_sampled``, whose device draws
+    the masked draws of a verify are."""
+    value = (model_capabilities or {}).get(SUPPORTS_SPEC_DEVICE_MASK, False)
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"TT model {model_name} declares {SUPPORTS_SPEC_DEVICE_MASK}="
+            f"{value!r}; the capability is a bool"
+        )
+    if value and (model_capabilities or {}).get("spec_ids_are_sampled") is not True:
+        raise ValueError(
+            f"TT model {model_name} declares {SUPPORTS_SPEC_DEVICE_MASK} without "
+            "spec_ids_are_sampled; a masked verify answers argmax_ids with the "
+            "device sampler's draws"
+        )
+
+
 SUPPORTS_PREFILL_OVER_PENDING_SPEC = "supports_prefill_over_pending_spec"
 SUPPORTS_SPEC_DEVICE_PENALTIES = "supports_spec_device_penalties"
 
@@ -358,6 +381,23 @@ def validate_prefill_over_pending_spec(
             "verify whose readback is deferred"
         )
     return value
+
+
+SUPPORTS_SPEC_DEVICE_LOGPROBS = "supports_spec_device_logprobs"
+
+
+def validate_spec_device_logprobs(
+    model_capabilities: Mapping[str, Any] | None, model_name: str
+) -> None:
+    """Raise for a ``supports_spec_device_logprobs`` declaration that is not
+    a bool. The runner reads it at every step that decides certifiability,
+    so a string such as ``"false"`` would read as true there."""
+    value = (model_capabilities or {}).get(SUPPORTS_SPEC_DEVICE_LOGPROBS, False)
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"TT model {model_name} declares {SUPPORTS_SPEC_DEVICE_LOGPROBS}="
+            f"{value!r}; the capability is a bool"
+        )
 
 
 def validate_spec_device_penalties(
@@ -391,11 +431,15 @@ def spec_device_penalties(model: Any) -> bool:
 __all__ = [
     "SUPPORTS_CHAINED_SPEC_VERIFY",
     "SUPPORTS_PREFILL_OVER_PENDING_SPEC",
+    "SUPPORTS_SPEC_DEVICE_LOGPROBS",
+    "SUPPORTS_SPEC_DEVICE_MASK",
     "SUPPORTS_SPEC_DEVICE_PENALTIES",
     "method_requirements",
     "resolve_speculative_plan",
     "spec_device_penalties",
     "validate_chained_spec_verify",
     "validate_prefill_over_pending_spec",
+    "validate_spec_device_logprobs",
+    "validate_spec_device_mask",
     "validate_spec_device_penalties",
 ]
