@@ -106,10 +106,10 @@ The scheduler runs in one of three topologies:
 1. Single-process non-DP: one engine, one scheduler, and one TT worker.
 2. Single-process lane-DP: one engine coordinates multiple lane schedulers and
    submits one merged TT batch. A model selects this mode by declaring
-   `model_capabilities["folds_dp_into_lanes"]`; the legacy Galaxy generators
-   (Llama3 70B, Qwen3-32B) and GPT-OSS fold without declaring it. With the
-   declaration absent or `False`, `--data_parallel_size N` is standard
-   multi-process DP.
+   `model_capabilities["folds_dp_into_lanes"]`, as the legacy Galaxy
+   generators (Llama3 70B, Qwen3-32B) do; GPT-OSS folds without declaring it.
+   With the declaration absent or `False`, `--data_parallel_size N` is
+   standard multi-process DP.
 3. Standard multi-process DP: each rank has an independent engine, scheduler,
    KV cache, TT worker, and TT submesh.
 
@@ -733,8 +733,8 @@ and requirements for declaring `supports_async_decode` are specified in
 Single-process lane-DP uses one vLLM engine process and one TT worker: that
 process owns the whole device mesh, so the `N` lanes of
 `--data_parallel_size N` share one mesh instead of one submesh per rank
-(`folds_dp_into_lanes` in [MODEL_CAPABILITIES.md](MODEL_CAPABILITIES.md); the
-legacy Galaxy generators and GPT-OSS fold without declaring it).
+(`folds_dp_into_lanes` in [MODEL_CAPABILITIES.md](MODEL_CAPABILITIES.md);
+GPT-OSS folds without declaring it).
 `TTLaneCoordinator` owns one independent `TTScheduler` per lane. Each lane has
 its own `waiting` and `running` queues, admission decisions, KV cache manager,
 and lane-local block ID space.
@@ -779,7 +779,8 @@ if any lane breaks them pending async decode work is drained before the next
 step.
 
 For single-execute models, `--data_parallel_size N` is transparently folded
-into `N` in-process lanes. This covers Galaxy generators selected with
+into `N` in-process lanes. This covers models that declare
+`folds_dp_into_lanes`, such as the Galaxy generators selected with
 `TT_LLAMA_TEXT_VER=llama3_70b_galaxy` or
 `TT_QWEN3_TEXT_VER=qwen3_32b_galaxy`, and GPT-OSS selected by its model
 architecture. The user-provided `--max_num_seqs M` remains the capacity per

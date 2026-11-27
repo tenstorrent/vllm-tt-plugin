@@ -4,8 +4,9 @@
 
 Single-execute models are served on one device mesh, so ``--data_parallel_size
 N`` is folded into ``N`` in-process TT lanes by
-``platform._convert_dp_to_lanes``. This covers the Galaxy generators
-(llama3_70b_galaxy, qwen3_32b_galaxy) and GPT-OSS under user-row sharding.
+``platform._convert_dp_to_lanes``. This covers classes declaring
+``model_capabilities["folds_dp_into_lanes"]``, such as the Galaxy generators,
+and GPT-OSS under user-row sharding.
 """
 
 from types import SimpleNamespace
@@ -42,39 +43,26 @@ def _model_class(name):
     return type(name, (), {})
 
 
-def test_galaxy_dp_converted_to_lanes(monkeypatch):
-    monkeypatch.setenv("TT_LLAMA_TEXT_VER", "llama3_70b_galaxy")
-    config = _vllm_config(data_parallel_size=4, max_num_seqs=8)
+def _capability_model_class(name, *, folds, raises=False, as_callable=True):
+    """A stand-in model class declaring the lane fold in ``model_capabilities``."""
 
-    tt_platform._convert_dp_to_lanes(config)
+    def _folds():
+        if raises:
+            raise RuntimeError("declaration exploded")
+        return folds
 
-    # Multi-process DP collapsed to a single in-process engine with 4 lanes.
-    assert config.parallel_config.data_parallel_size == 1
-    assert tt_config.get_tt_data_parallel_size(config) == 4
-    assert tt_config.uses_tt_lane_coordinator(config)
-    # Global capacity scaled so per-lane capacity stays the requested 8.
-    assert config.scheduler_config.max_num_seqs == 32
-    assert tt_config.get_tt_per_lane_max_num_seqs(config) == 8
+    capabilities = {"folds_dp_into_lanes": _folds if as_callable else folds}
+    return type(name, (), {"model_capabilities": capabilities})
 
 
-def test_qwen3_galaxy_dp_converted_to_lanes(monkeypatch):
-    monkeypatch.setenv("TT_QWEN3_TEXT_VER", "qwen3_32b_galaxy")
-    config = _vllm_config(data_parallel_size=2, max_num_seqs=16)
-
-    tt_platform._convert_dp_to_lanes(config)
-
-    assert config.parallel_config.data_parallel_size == 1
-    assert tt_config.get_tt_data_parallel_size(config) == 2
-    assert config.scheduler_config.max_num_seqs == 32
-
-
-def test_collapse_resets_derived_parallel_fields(monkeypatch):
-    monkeypatch.setenv("TT_LLAMA_TEXT_VER", "llama3_70b_galaxy")
+def test_collapse_resets_derived_parallel_fields():
     config = _vllm_config(data_parallel_size=4, max_num_seqs=8)
     config.parallel_config.data_parallel_size_local = 4
     config.parallel_config.data_parallel_external_lb = True
 
-    tt_platform._convert_dp_to_lanes(config)
+    tt_platform._convert_dp_to_lanes(
+        config, _capability_model_class("Folds", folds=True)
+    )
 
     pc = config.parallel_config
     assert pc.data_parallel_size_local == 1
@@ -88,9 +76,7 @@ def test_collapse_resets_derived_parallel_fields(monkeypatch):
     assert pc.data_parallel_hybrid_lb is False
 
 
-def test_no_conversion_for_non_single_execute_model(monkeypatch):
-    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
-    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
+def test_no_conversion_for_non_single_execute_model():
     config = _vllm_config(data_parallel_size=4, max_num_seqs=8)
 
     tt_platform._convert_dp_to_lanes(config)
@@ -101,23 +87,27 @@ def test_no_conversion_for_non_single_execute_model(monkeypatch):
     assert tt_config._RESOLVED_LANE_COUNT_KEY not in config.additional_config
 
 
-def test_conversion_is_noop_without_dp(monkeypatch):
-    monkeypatch.setenv("TT_LLAMA_TEXT_VER", "llama3_70b_galaxy")
+def test_conversion_is_noop_without_dp():
     config = _vllm_config(data_parallel_size=1, max_num_seqs=8)
 
-    tt_platform._convert_dp_to_lanes(config)
+    tt_platform._convert_dp_to_lanes(
+        config, _capability_model_class("Folds", folds=True)
+    )
 
     assert config.parallel_config.data_parallel_size == 1
     assert config.scheduler_config.max_num_seqs == 8
     assert tt_config._RESOLVED_LANE_COUNT_KEY not in config.additional_config
 
 
-def test_conversion_is_idempotent(monkeypatch):
-    monkeypatch.setenv("TT_LLAMA_TEXT_VER", "llama3_70b_galaxy")
+def test_conversion_is_idempotent():
     config = _vllm_config(data_parallel_size=4, max_num_seqs=8)
 
-    tt_platform._convert_dp_to_lanes(config)
-    tt_platform._convert_dp_to_lanes(config)
+    tt_platform._convert_dp_to_lanes(
+        config, _capability_model_class("Folds", folds=True)
+    )
+    tt_platform._convert_dp_to_lanes(
+        config, _capability_model_class("Folds", folds=True)
+    )
 
     # Second call short-circuits (data_parallel_size already 1); no double scale.
     assert config.parallel_config.data_parallel_size == 1
@@ -125,11 +115,9 @@ def test_conversion_is_idempotent(monkeypatch):
     assert tt_config.get_tt_data_parallel_size(config) == 4
 
 
-def test_gpt_oss_dp_converted_to_lanes(monkeypatch):
+def test_gpt_oss_dp_converted_to_lanes():
     # GPT-OSS drives DP inside one process, so DP folds into lanes
     # regardless of mesh shape or batch size.
-    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
-    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
     config = _vllm_config(data_parallel_size=4, max_num_seqs=32)
 
     tt_platform._convert_dp_to_lanes(config, _model_class("GptOssForCausalLM"))
@@ -142,10 +130,8 @@ def test_gpt_oss_dp_converted_to_lanes(monkeypatch):
     assert tt_config.get_tt_per_lane_max_num_seqs(config) == 32
 
 
-def test_non_gpt_oss_model_not_converted(monkeypatch):
+def test_non_gpt_oss_model_not_converted():
     # A non-GPT-OSS, non-Galaxy model keeps standard multi-process DP.
-    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
-    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
     config = _vllm_config(data_parallel_size=4, max_num_seqs=32)
 
     tt_platform._convert_dp_to_lanes(config, _model_class("LlamaForCausalLM"))
@@ -154,21 +140,24 @@ def test_non_gpt_oss_model_not_converted(monkeypatch):
     assert tt_config._RESOLVED_LANE_COUNT_KEY not in config.additional_config
 
 
-def _capability_model_class(name, *, folds, raises=False, as_callable=True):
-    """A stand-in model class declaring the lane fold in ``model_capabilities``."""
+def test_galaxy_text_version_alone_keeps_standard_dp(monkeypatch):
+    """The lane fold comes from the model class, not the Galaxy selector env.
 
-    def _folds():
-        if raises:
-            raise RuntimeError("declaration exploded")
-        return folds
+    A class registered over the Galaxy one, e.g. by TT_MODEL_CLASS_OVERRIDES,
+    must keep standard DP unless it declares the fold itself.
+    """
+    monkeypatch.setenv("TT_LLAMA_TEXT_VER", "llama3_70b_galaxy")
+    monkeypatch.setenv("TT_QWEN3_TEXT_VER", "qwen3_32b_galaxy")
+    config = _vllm_config(data_parallel_size=4, max_num_seqs=8)
 
-    capabilities = {"folds_dp_into_lanes": _folds if as_callable else folds}
-    return type(name, (), {"model_capabilities": capabilities})
+    tt_platform._convert_dp_to_lanes(config, _model_class("LlamaForCausalLM"))
+
+    assert config.parallel_config.data_parallel_size == 4
+    assert config.scheduler_config.max_num_seqs == 8
+    assert tt_config._RESOLVED_LANE_COUNT_KEY not in config.additional_config
 
 
-def test_model_capability_folds_dp_into_lanes(monkeypatch):
-    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
-    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
+def test_model_capability_folds_dp_into_lanes():
     config = _vllm_config(data_parallel_size=4, max_num_seqs=32)
 
     tt_platform._convert_dp_to_lanes(
@@ -182,9 +171,7 @@ def test_model_capability_folds_dp_into_lanes(monkeypatch):
     assert tt_config.get_tt_per_lane_max_num_seqs(config) == 32
 
 
-def test_plain_boolean_capability_folds(monkeypatch):
-    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
-    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
+def test_plain_boolean_capability_folds():
     config = _vllm_config(data_parallel_size=2, max_num_seqs=4)
 
     tt_platform._convert_dp_to_lanes(
@@ -195,9 +182,7 @@ def test_plain_boolean_capability_folds(monkeypatch):
     assert config.scheduler_config.max_num_seqs == 8
 
 
-def test_false_capability_keeps_standard_dp(monkeypatch):
-    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
-    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
+def test_false_capability_keeps_standard_dp():
     config = _vllm_config(data_parallel_size=4, max_num_seqs=8)
 
     tt_platform._convert_dp_to_lanes(
@@ -209,11 +194,9 @@ def test_false_capability_keeps_standard_dp(monkeypatch):
     assert tt_config._RESOLVED_LANE_COUNT_KEY not in config.additional_config
 
 
-def test_raising_capability_fails_the_launch(monkeypatch):
+def test_raising_capability_fails_the_launch():
     """A broken declaration must not fall back to standard DP: that would run
     the model in the wrong execution mode."""
-    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
-    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
     config = _vllm_config(data_parallel_size=4, max_num_seqs=8)
 
     with pytest.raises(
