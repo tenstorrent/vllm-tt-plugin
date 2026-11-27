@@ -656,7 +656,9 @@ def test_device_penalties_follow_model_capability(declared, has_penalties):
             no_allowed_token_ids=True,
             max_num_logprobs=None,
             sampling=SimpleNamespace(
-                bad_words_token_ids={}, has_active_logitsprocs=lambda: False
+                bad_words_token_ids={},
+                logprob_token_ids={},
+                has_active_logitsprocs=lambda: False,
             ),
         ),
     )
