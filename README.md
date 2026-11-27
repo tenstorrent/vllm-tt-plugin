@@ -687,8 +687,9 @@ The registration environment variables, in the order they are consulted:
 (`TT_VLLM_BUILTIN_MODELS=0` disables it). `TT_LLAMA_TEXT_VER`,
 `TT_QWEN3_TEXT_VER` and `TT_QWEN35_TEXT_VER` select a version WITHIN a built-in
 family and are unrelated to the above. `TT_LLAMA_TEXT_VER` and
-`TT_QWEN3_TEXT_VER` default to `ttt_compat` and no longer accept
-`tt_transformers`; unset them or set `ttt_compat` instead.
+`TT_QWEN3_TEXT_VER` default to `ttt_compat`. Their value `tt_transformers` is
+deprecated and will be removed in a future release: it still selects
+`ttt_compat` but logs a warning. Unset these variables instead.
 
 ## Speculative Decoding
 

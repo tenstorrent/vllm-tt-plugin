@@ -1482,6 +1482,35 @@ def _register_models_from_extra_dir(ModelRegistry) -> int:
     return count
 
 
+def _text_version(env_var: str) -> str:
+    """Reads a ``TT_*_TEXT_VER`` selector, defaulting to ``ttt_compat``.
+
+    The deprecated value ``tt_transformers`` maps to ``ttt_compat`` with a
+    warning, because tt-metal CI and tt-inference-server still set it. It will
+    be removed in a future release; callers should unset the selector.
+
+    Parameters
+    ----------
+    env_var
+        Name of the selector, ``TT_LLAMA_TEXT_VER`` or ``TT_QWEN3_TEXT_VER``.
+
+    Returns
+    -------
+    str
+        The selected version; never ``tt_transformers``.
+    """
+    version = os.getenv(env_var, "ttt_compat")
+    if version == "tt_transformers":
+        logger.warning_once(
+            "%s=tt_transformers is deprecated and will be removed in a future "
+            "release; it now selects ttt_compat. Unset %s instead.",
+            env_var,
+            env_var,
+        )
+        return "ttt_compat"
+    return version
+
+
 def _builtin_models_enabled() -> bool:
     """Whether to register the built-in (hard-coded) TT model map.
 
@@ -1540,7 +1569,7 @@ def register_tt_models(register_test_models=False) -> None:
             register_tt_test_models()
         return
 
-    llama_text_version = os.getenv("TT_LLAMA_TEXT_VER", "ttt_compat")
+    llama_text_version = _text_version("TT_LLAMA_TEXT_VER")
     if llama_text_version == "ttt_compat":
         path_llama_text = "models.ttt_compat.tt.generator_vllm:LlamaForCausalLM"
     elif llama_text_version == "llama3_70b_galaxy":
@@ -1577,7 +1606,7 @@ def register_tt_models(register_test_models=False) -> None:
     _register_model_if_missing(ModelRegistry, "TTQwen2ForCausalLM", path_qwen_text)
 
     # Qwen3 - Text
-    qwen3_text_version = os.getenv("TT_QWEN3_TEXT_VER", "ttt_compat")
+    qwen3_text_version = _text_version("TT_QWEN3_TEXT_VER")
     if qwen3_text_version == "ttt_compat":
         path_qwen3_text = "models.ttt_compat.tt.generator_vllm:QwenForCausalLM"
     elif qwen3_text_version == "qwen3_32b_galaxy":
