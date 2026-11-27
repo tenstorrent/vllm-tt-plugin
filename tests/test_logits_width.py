@@ -89,6 +89,7 @@ def _model_input() -> SimpleNamespace:
         max_num_logprobs=[None],
         allowed_token_ids_mask_list=[None],
         bad_words_token_ids_list=[None],
+        logprob_token_ids_list=[{}],
         logitsprocs_list=[None],
         generators_list=[{}],
     )
