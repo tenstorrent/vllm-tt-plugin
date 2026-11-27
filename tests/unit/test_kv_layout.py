@@ -1,0 +1,157 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+"""KV transfer layouts: the default one and the one a model declares."""
+
+import importlib.util
+import sys
+import types
+
+import pytest
+import torch
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
+
+from tests.support.kv_cache import TILE_BYTES, FakeKVCache
+from vllm_tt_plugin import kv_layout
+from vllm_tt_plugin.kv_layout import KVPart, default_kv_layout, kv_transfer_layout
+
+BLOCKS, BLOCK_SIZE, HEAD_DIM = 6, 32, 32
+
+
+def _cache(heads: int, chips: int) -> FakeKVCache:
+    """A ``[BLOCKS, heads, BLOCK_SIZE, HEAD_DIM]`` bfloat8_b cache on ``chips``."""
+    return FakeKVCache(
+        blocks=BLOCKS,
+        heads=heads,
+        chips=chips,
+        block_size=BLOCK_SIZE,
+        head_dim=HEAD_DIM,
+    )
+
+
+def _config(names: list[str], num_kv_heads: int) -> KVCacheConfig:
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=num_kv_heads,
+        head_size=HEAD_DIM,
+        dtype=torch.float32,
+    )
+    return KVCacheConfig(
+        num_blocks=BLOCKS,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(names, spec)],
+    )
+
+
+class TestDefaultLayout:
+    def test_heads_split_over_the_chips_are_one_shard_per_chip(self):
+        k, v = _cache(heads=2, chips=4), _cache(heads=2, chips=4)
+        layout = default_kv_layout([[k, v]], _config(["model.layers.0.attn"], 8))
+
+        part_k, part_v = layout.layers["model.layers.0.attn"]
+        assert part_k.shards == ((0,), (1,), (2,), (3,))
+        assert part_k.block_bytes == 2 * TILE_BYTES
+        assert layout.block_bytes("model.layers.0.attn") == 2 * 4 * 2 * TILE_BYTES
+
+    def test_heads_copied_to_every_chip_are_one_shard_on_all(self):
+        k, v = _cache(heads=8, chips=4), _cache(heads=8, chips=4)
+        layout = default_kv_layout([[k, v]], _config(["model.layers.0.attn"], 8))
+
+        part_k, _ = layout.layers["model.layers.0.attn"]
+        assert part_k.shards == ((0, 1, 2, 3),)
+        assert layout.block_bytes("model.layers.0.attn") == 2 * 8 * TILE_BYTES
+
+    def test_a_partial_split_must_be_declared_by_the_model(self):
+        # 8 heads on an 8-chip mesh split 4 ways and copied 2 ways.
+        k, v = _cache(heads=2, chips=8), _cache(heads=2, chips=8)
+        with pytest.raises(ValueError, match="get_kv_transfer_layout"):
+            default_kv_layout([[k, v]], _config(["model.layers.0.attn"], 8))
+
+    @pytest.mark.parametrize(
+        ("shape", "found"),
+        [
+            pytest.param(
+                (BLOCKS + 1, 2, BLOCK_SIZE, HEAD_DIM), "num_blocks=7", id="blocks"
+            ),
+            pytest.param(
+                (BLOCKS, 2, 2 * BLOCK_SIZE, HEAD_DIM), "block_size=64", id="block_size"
+            ),
+            pytest.param(
+                (BLOCKS, 2, BLOCK_SIZE, 2 * HEAD_DIM), "head_size=64", id="head_size"
+            ),
+            pytest.param((BLOCKS, 2, BLOCK_SIZE * HEAD_DIM), "not", id="not_4d"),
+        ],
+    )
+    def test_a_cache_the_kv_cache_config_does_not_describe_is_refused(
+        self, shape, found
+    ):
+        # The copy takes block b of the cache to be vLLM's block b, holding the
+        # spec's block_size tokens of head_size values per head.
+        k, v = _cache(heads=2, chips=4), _cache(heads=2, chips=4)
+        k.shape = shape
+        with pytest.raises(ValueError, match=f"{found}.*get_kv_transfer_layout"):
+            default_kv_layout([[k, v]], _config(["model.layers.0.attn"], 8))
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            pytest.param(lambda k, v: [k], id="one_cache_in_a_list"),
+            pytest.param(lambda k, v: k, id="a_bare_cache"),
+            pytest.param(lambda k, v: [k, v, k], id="three_caches"),
+        ],
+    )
+    def test_an_entry_that_is_not_a_k_v_pair_is_refused(self, entry):
+        k, v = _cache(heads=2, chips=4), _cache(heads=2, chips=4)
+        with pytest.raises(ValueError, match="not a \\[k, v\\] pair"):
+            default_kv_layout([entry(k, v)], _config(["model.layers.0.attn"], 8))
+
+
+class TestDeclaredLayout:
+    def test_a_model_declares_extra_parts_and_layers(self):
+        """An MLA latent copied to all chips, and an MTP drafter's own layer."""
+        latent = _cache(heads=1, chips=2)
+        drafter_k, drafter_v = _cache(heads=1, chips=2), _cache(heads=1, chips=2)
+        names = ["model.layers.0.attn", "drafter.layers.0.attn"]
+
+        class Model:
+            def get_kv_transfer_layout(self, kv_caches, kv_cache_config):
+                return {
+                    names[0]: [(latent, latent.block_bytes, [[0, 1]])],
+                    names[1]: [
+                        (drafter_k, drafter_k.block_bytes, [[0], [1]]),
+                        (drafter_v, drafter_v.block_bytes, [[0], [1]]),
+                    ],
+                }
+
+        layout = kv_transfer_layout(Model(), None, _config(names, 2))
+
+        assert layout.layers[names[0]] == (KVPart(latent, TILE_BYTES, ((0, 1),)),)
+        assert layout.block_bytes(names[1]) == 4 * TILE_BYTES
+
+    def test_a_declared_layout_covers_every_layer(self):
+        class Model:
+            def get_kv_transfer_layout(self, kv_caches, kv_cache_config):
+                return {}
+
+        with pytest.raises(ValueError, match="does not describe layers"):
+            kv_transfer_layout(Model(), None, _config(["model.layers.0.attn"], 2))
+
+    def test_a_declared_layer_without_parts_is_refused(self):
+        # Naming a layer without any tensor would describe zero bytes of KV
+        # for it, and a transfer would move nothing for that layer.
+        class Model:
+            def get_kv_transfer_layout(self, kv_caches, kv_cache_config):
+                return {"model.layers.0.attn": []}
+
+        with pytest.raises(ValueError, match="model.layers.0.attn.*no part"):
+            kv_transfer_layout(Model(), None, _config(["model.layers.0.attn"], 2))
+
+
+def test_importing_the_module_needs_no_ttnn_dtypes(monkeypatch):
+    # Model test suites import the plugin with their own partial ttnn stubs.
+    monkeypatch.setitem(sys.modules, "ttnn", types.ModuleType("ttnn"))
+    spec = importlib.util.spec_from_file_location("kv_layout_copy", kv_layout.__file__)
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))

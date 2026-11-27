@@ -1,8 +1,9 @@
 # Tests
 
-Tests follow the component and boundary they exercise. Logprobs, logging, and
-model-output parsers use this layout; existing tests at the root and under
-`spec/` remain in place until their owning area is reorganized.
+Tests follow the component and boundary they exercise. Logprobs, logging,
+model-output parsers, and KV transfer layouts use this layout;
+existing tests at the root and under `spec/` remain in place until their owning
+area is reorganized.
 
 | Location | Scope |
 |---|---|
@@ -13,6 +14,8 @@ model-output parsers use this layout; existing tests at the root and under
 | [integration/test_decode_logprobs.py](integration/test_decode_logprobs.py) | Decode controller and runner cooperating on host logprob payloads |
 | [integration/test_logprob_token_ids.py](integration/test_logprob_token_ids.py) | `SamplingParams.logprob_token_ids` through the input batches, host-sampling routing, and `TTHostSampler`, including batches that mix named-id rows with top-N rows |
 | [support/logprobs.py](support/logprobs.py) | Ranked-payload test data shared by those two modules |
+| [unit/test_kv_layout.py](unit/test_kv_layout.py) | Default and model-declared KV transfer layouts, and the caches the default refuses |
+| [support/kv_cache.py](support/kv_cache.py) | A fake paged KV cache, shared by the KV tests |
 | [tt/test_logprobs.py](tt/test_logprobs.py) | Logprobs returned by a live server on TT hardware |
 | [tt/test_systemone.py](tt/test_systemone.py) | `/v1/systemone` structured decisions on a live server; skips on models vLLM does not serve it for |
 

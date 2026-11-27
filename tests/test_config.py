@@ -191,6 +191,10 @@ def test_supports_device_grammar_rejects_non_boolean(invalid):
         tt_config.store_tt_supports_device_grammar(_vllm_config(), invalid)
 
 
+# A connector the plugin does not refuse by name.
+_CONNECTOR = SimpleNamespace(kv_connector="ExampleConnector")
+
+
 @pytest.mark.parametrize(
     ("data_parallel_size", "lane_count"),
     [(2, None), (1, 2)],
@@ -200,18 +204,42 @@ def test_kv_transfer_config_is_refused_with_data_parallelism(
     data_parallel_size, lane_count
 ):
     cfg = _vllm_config(data_parallel_size=data_parallel_size, lane_count=lane_count)
-    cfg.kv_transfer_config = object()
+    cfg.kv_transfer_config = _CONNECTOR
 
     with pytest.raises(ValueError, match="kv-transfer-config"):
-        tt_config.validate_tt_kv_transfer_config(cfg)
+        tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
 
     # The same parallelism is fine when no connector is configured.
     cfg.kv_transfer_config = None
-    tt_config.validate_tt_kv_transfer_config(cfg)
+    tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
 
 
 def test_kv_transfer_config_is_accepted_without_data_parallelism():
     cfg = _vllm_config()
-    cfg.kv_transfer_config = object()
+    cfg.kv_transfer_config = _CONNECTOR
 
-    tt_config.validate_tt_kv_transfer_config(cfg)
+    tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
+
+
+def test_kv_transfer_config_needs_a_model_that_resumes_a_prefill():
+    # A request that loads KV from a connector resumes its prefill after that
+    # KV, as after a prefix-cache hit. A model without prefix caching would
+    # compute on KV or state that never arrived.
+    cfg = _vllm_config()
+    cfg.kv_transfer_config = _CONNECTOR
+
+    with pytest.raises(ValueError, match="supports_prefix_caching"):
+        tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=False)
+
+    cfg.kv_transfer_config = None
+    tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=False)
+
+
+def test_nixl_connector_is_refused_until_tt_can_register_its_kv():
+    # vLLM's own check fails only after the model has loaded, with
+    # "tt is not supported."; the launch check names the reason first.
+    cfg = _vllm_config()
+    cfg.kv_transfer_config = SimpleNamespace(kv_connector="NixlConnector")
+
+    with pytest.raises(ValueError, match="NixlConnector"):
+        tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)

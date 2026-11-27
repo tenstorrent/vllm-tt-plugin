@@ -472,6 +472,10 @@ class TTWorker(WorkerBase):
     def _build_default_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Single-layer spec used by the legacy non-hybrid path. Downstream
         sizing is overridden via ``cache_config.num_gpu_blocks_override``.
+
+        With a KV connector the same spec is listed once per attention layer,
+        because a connector transfers and names each layer's KV separately.
+        Equal specs still form one KV cache group with one block table.
         """
         model_config = self.model_config
         parallel_config = self.parallel_config
@@ -505,7 +509,12 @@ class TTWorker(WorkerBase):
                 dtype=dtype,
                 sliding_window=sliding_window,
             )
-        return {"foo": attn_spec}
+        if self.vllm_config.kv_transfer_config is None:
+            return {"foo": attn_spec}
+        num_layers = model_config.get_num_layers_by_block_type(
+            parallel_config, "attention"
+        )
+        return {f"model.layers.{i}.self_attn": attn_spec for i in range(num_layers)}
 
     def determine_available_memory(self) -> int:
         """

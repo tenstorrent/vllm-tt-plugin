@@ -107,3 +107,11 @@ GetDefaultDevice = _no_device("GetDefaultDevice")
 ReadDeviceProfiler = _no_device("ReadDeviceProfiler")
 event_synchronize = _no_device("event_synchronize")
 copy_host_to_device_tensor = _no_device("copy_host_to_device_tensor")
+
+# The plugin only compares a tensor's dtype and layout against these.
+bfloat8_b = "bfloat8_b"
+bfloat16 = "bfloat16"
+bfloat4_b = "bfloat4_b"
+float32 = "float32"
+TILE_LAYOUT = "TILE_LAYOUT"
+ROW_MAJOR_LAYOUT = "ROW_MAJOR_LAYOUT"

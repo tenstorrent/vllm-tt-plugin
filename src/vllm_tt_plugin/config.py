@@ -637,12 +637,27 @@ def uses_tt_lane_coordinator(vllm_config: "VllmConfig") -> bool:
     )
 
 
-def validate_tt_kv_transfer_config(vllm_config: "VllmConfig") -> None:
-    """Validate that vllm server runs without data parallelism when
-    ``--kv-transfer-config`` is set.
+def validate_tt_kv_transfer_config(
+    vllm_config: "VllmConfig", *, supports_prefix_caching: bool
+) -> None:
+    """Check that the launch can run ``--kv-transfer-config``.
 
-    Lane-DP runs with ``data_parallel_size == 1``, so the lane count is checked
-    as well.
+    Parameters
+    ----------
+    vllm_config
+        The launch configuration; nothing is checked without a
+        ``kv_transfer_config``.
+    supports_prefix_caching
+        The model's ``model_capabilities['supports_prefix_caching']``. A
+        request that loads KV from a connector resumes its prefill after that
+        KV, as after a prefix-cache hit, so the model must support that resume.
+
+    Raises
+    ------
+    ValueError
+        With data parallelism (standard DP, or lanes, which run with
+        ``data_parallel_size == 1``), for a model without prefix caching, or
+        for ``NixlConnector``, which cannot yet register TT KV.
     """
     if vllm_config.kv_transfer_config is None:
         return
@@ -652,6 +667,18 @@ def validate_tt_kv_transfer_config(vllm_config: "VllmConfig") -> None:
         raise ValueError(
             "--kv-transfer-config is supported only without data parallelism on "
             f"TT; got data_parallel_size={data_parallel_size}, TT lanes={lanes}."
+        )
+    if not supports_prefix_caching:
+        raise ValueError(
+            "--kv-transfer-config needs a model that declares "
+            "model_capabilities['supports_prefix_caching']=True: a request that "
+            "loads KV from a connector resumes its prefill after that KV, as "
+            "after a prefix-cache hit."
+        )
+    if vllm_config.kv_transfer_config.kv_connector == "NixlConnector":
+        raise ValueError(
+            "NixlConnector cannot run on TT yet: its NIXL agent must register "
+            "the KV in TT DRAM, which this plugin does not do yet."
         )
 
 

@@ -2730,7 +2730,9 @@ class TTPlatform(Platform):
                 )
         store_tt_spec_plan(vllm_config, spec_plan)
 
-        validate_tt_kv_transfer_config(vllm_config)
+        validate_tt_kv_transfer_config(
+            vllm_config, supports_prefix_caching=supports_prefix_caching
+        )
         is_lane_mode = uses_tt_lane_coordinator(vllm_config)
         if (
             getattr(model_config, "is_moe", False)
