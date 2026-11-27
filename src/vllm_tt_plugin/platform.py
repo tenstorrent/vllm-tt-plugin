@@ -921,6 +921,22 @@ def _install_tt_harmony_truncation_patch() -> None:
         renderer_registry.cached_tokenizer_from_config = cached_tokenizer_from_config_tt
 
 
+def _install_tool_call_patches() -> None:
+    """Fix the tool-call arguments that vLLM's parser engine returns.
+
+    ``parsers.tool_schema`` types arguments by ``$ref`` and ``allOf`` schemas
+    and keeps a string-union value as written; ``parsers.qwen3_arguments``
+    keeps an unclosed last parameter and literal ``</parameter>`` and
+    ``</function>`` text inside Qwen3 values. Both are idempotent.
+
+    TODO: remove once fixed in vLLM core; each module names its vLLM issues.
+    """
+    from vllm_tt_plugin.parsers import qwen3_arguments, tool_schema
+
+    tool_schema.install_patches()
+    qwen3_arguments.install_patches()
+
+
 # What upstream's xgrammar backend passes for ``disable_any_whitespace``, and
 # what TT passes instead.
 _XGRAMMAR_COMPACT_JSON_SEPARATORS = (",", ":")
@@ -1878,6 +1894,9 @@ class TTPlatform(Platform):
         _install_api_lifespan_gc_patch()
         _install_torch_accelerator_cleanup_patch()
         _install_tt_harmony_truncation_patch()
+        # The API server parses tool calls. Every API server process runs this
+        # hook, from the CLI parser or from ``create_engine_config``.
+        _install_tool_call_patches()
         # Before ``EngineArgs.create_engine_config`` builds the VllmConfig,
         # which is where upstream decides asynchronous scheduling against the
         # speculative method name. This hook is that call's first statement.
