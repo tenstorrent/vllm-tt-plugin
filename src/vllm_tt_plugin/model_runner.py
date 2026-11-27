@@ -97,6 +97,7 @@ from vllm_tt_plugin.spec_admission import (
     SUPPORTS_SPEC_DEVICE_LOGPROBS,
     SUPPORTS_SPEC_DEVICE_TOP_P,
     method_requirements,
+    spec_device_penalties,
 )
 from vllm_tt_plugin.spec_chain import (
     ChainPlan,
@@ -117,6 +118,14 @@ from vllm_tt_plugin.spec_decode import (
     SpecLogprobs,
     accept_greedy_drafts,
     check_spec_logprobs,
+)
+from vllm_tt_plugin.spec_token_mask import (
+    chains_token_masks,
+    compose_token_mask,
+    fill_token_masked_successor,
+    mask_may_allow_nothing,
+    spec_masks_on_device,
+    step_static_token_mask,
 )
 from vllm_tt_plugin.stage_outputs import TTStageFrame, set_tt_stage_outputs
 from vllm_tt_plugin.structured_output import (
@@ -186,6 +195,16 @@ def _declares(runner: Any, capability: str) -> bool:
     return (capabilities or {}).get(capability, False) is True
 
 
+def _has_penalty(params: Any) -> bool:
+    """Whether vLLM ``SamplingParams`` carry a presence, frequency or
+    repetition penalty that changes the logits."""
+    return bool(
+        getattr(params, "presence_penalty", 0.0) != 0.0
+        or getattr(params, "frequency_penalty", 0.0) != 0.0
+        or getattr(params, "repetition_penalty", 1.0) != 1.0
+    )
+
+
 def _has_unresolved_commit(accepted_counts: torch.Tensor, num_rows: int) -> bool:
     """Whether a live row's previous step committed more than one token.
 
@@ -228,6 +247,10 @@ class SpecDecodeRows(NamedTuple):
     accepted_counts: torch.Tensor | None = None
     spec_mode: str | None = None
     spec_min_tokens: dict[int, tuple[int, tuple[int, ...]]] | None = None
+    # An ``argmax_ids`` verify whose draws a device token mask constrains
+    # (``supports_spec_device_mask``): it samples on the device, deferred to
+    # ``sample_tokens``.
+    token_mask: bool = False
 
 
 def _step_verifies(
@@ -1766,7 +1789,9 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         else:
             self._proposed_draft_token_ids.pop(req_id, None)
 
-    def _request_is_speculable(self, req_id: str, device_sampled: bool = False) -> bool:
+    def _request_is_speculable(
+        self, req_id: str, device_sampled: bool = False, masked: bool = False
+    ) -> bool:
         """False when no accept walk this launch drives can certify the request.
 
         A model that serves ``logits`` lets a verify walk acceptance against
@@ -1776,14 +1801,16 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         speculating launch, whichever proposer drafted. Without it only the
         greedy walk exists, which also certifies a sampled request on a model
         declaring ``spec_ids_are_sampled`` when the step samples on the device
-        (``device_sampled``; see ``_request_is_argmax_certifiable``).
+        (``device_sampled``), and a request with token controls when the step's
+        verify carries a device token mask (``masked``; see
+        ``_request_is_argmax_certifiable``).
         """
         if ACCEPT_MODE_LOGITS in getattr(self, "_spec_accept_modes", ()):
             return True
-        return self._request_is_argmax_certifiable(req_id, device_sampled)
+        return self._request_is_argmax_certifiable(req_id, device_sampled, masked)
 
     def _spec_mode_for_step(
-        self, row_req_ids: list[str], device_sampled: bool = False
+        self, row_req_ids: list[str], device_sampled: bool = False, masked: bool = False
     ) -> str:
         """The accept mode one verify asks for, from the rows it carries.
 
@@ -1793,7 +1820,9 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         distribution makes the whole step ``logits``: the mode is per step, and
         that row would otherwise commit the argmax even with no draft of its
         own. ``device_sampled`` says whether the step samples on the device if
-        it is not a ``logits`` verify (``_decode_device_sampled``).
+        it is not a ``logits`` verify (``_decode_device_sampled``), and
+        ``masked`` whether its ``argmax_ids`` verify would carry a device token
+        mask (``_decode_mask_sampled``).
         """
         modes = getattr(self, "_spec_accept_modes", ()) or (ACCEPT_MODE_ARGMAX_IDS,)
         # ``fused_sample`` certifies exactly the rows ``argmax_ids`` does (the
@@ -1814,14 +1843,14 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         ):
             return ACCEPT_MODE_LOGITS
         if all(
-            self._request_is_argmax_certifiable(req_id, device_sampled)
+            self._request_is_argmax_certifiable(req_id, device_sampled, masked)
             for req_id in row_req_ids
         ):
             return id_mode
         return ACCEPT_MODE_LOGITS
 
     def _request_is_argmax_certifiable(
-        self, req_id: str, device_sampled: bool = False
+        self, req_id: str, device_sampled: bool = False, masked: bool = False
     ) -> bool:
         """False when this request's sampling cannot be certified by id equality.
 
@@ -1841,17 +1870,35 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         decode's own draw. Against the drafts the id walk is then exact
         rejection sampling, so on such a step (``device_sampled``) a sampled
         request is certifiable; on a host-sampled step it is not, because the
-        ids would be the argmax. A penalised request stays uncertifiable
-        either way: the draws carry no penalty history.
+        ids would be the argmax. A penalised request is certifiable on such a
+        step only when the model also declares
+        ``supports_spec_device_penalties``: its verify applies the presence,
+        frequency and repetition penalties to every column it picks, a greedy
+        row's included, over the row's committed output and earlier drafts.
+        Otherwise the draws carry no penalty history and it stays
+        uncertifiable either way.
 
         A greedy request is still not certifiable when a control moves its
         argmax or asks for more than ids: a grammar, an allowlist, a bad word
         or a pending ``min_tokens`` rules out the token the unfiltered argmax
         might be, and logprobs need the logits themselves unless the verify
-        returns them (``_spec_serves_logprobs``). Admission refuses all of
+        returns them (``_spec_payload_serves``). Admission refuses all of
         these on a launch without ``logits``, so in practice they only make
         ``_spec_mode_for_step`` pick ``logits`` on a launch that serves both
         modes.
+
+        ``masked`` is True for a step whose ``argmax_ids`` verify carries a
+        device token mask (``_decode_mask_sampled``: a model declaring
+        ``supports_spec_device_mask``, a device-sampled step). The model then
+        draws every column of a row the mask constrains from the masked
+        distribution, a greedy row the masked argmax, so a grammar, an
+        allowlist, a bad word and a pending ``min_tokens`` are certifiable,
+        unless the row's mask can allow no token at some column
+        (``mask_may_allow_nothing``). A row with such a control that asks for
+        logprobs is not (``_spec_payload_serves``). A penalised row is, on a
+        model that also declares ``supports_spec_device_penalties``: its
+        verify applies the penalties after the mask, as vLLM applies them
+        after the bitmask and the token filters.
         """
         batch = self.input_batch
         draws_ids = bool(device_sampled) and bool(
@@ -1861,31 +1908,43 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         # any batch the runner is handed. A batch that tracks none of these
         # sets has no sampled request to withhold drafts from, so the answer is
         # the same as an empty set -- speculable.
-        # Under ``draws_ids`` only the temperature rule is lifted: the draws
-        # follow the row's temperature, top-k, top-p and seed, not a penalty
-        # history, so the three penalty sets keep withholding.
+        # Under ``draws_ids`` the temperature rule is lifted: the draws follow
+        # the row's temperature, top-k, top-p and seed. They follow a penalty
+        # history only on a model declaring ``supports_spec_device_penalties``;
+        # on any other the three penalty sets keep withholding.
         if not draws_ids and req_id in getattr(batch, "random_reqs", ()):
             return False
+        penalties_drawn = draws_ids and spec_device_penalties(self.model)
         for attr in (
             "presence_penalties_reqs",
             "frequency_penalties_reqs",
             "repetition_penalties_reqs",
         ):
-            if req_id in getattr(batch, attr, ()):
+            if req_id in getattr(batch, attr, ()) and not penalties_drawn:
                 return False
         req_state = getattr(self, "requests", {}).get(req_id)
         params = getattr(req_state, "sampling_params", None)
         if params is None:
             return True
+        min_tokens_pending = params.min_tokens > len(
+            req_state.output_token_ids
+        ) and bool(params.all_stop_token_ids)
+        if params.logprobs is not None and not self._spec_payload_serves(req_id):
+            return False
+        if masked:
+            return not mask_may_allow_nothing(
+                structured=params.structured_outputs is not None,
+                allowed_ids=params.allowed_token_ids,
+                bad_words=params.bad_words_token_ids or (),
+                stop_ids=params.all_stop_token_ids or (),
+                min_tokens_pending=min_tokens_pending,
+                vocab_size=self.vocab_size,
+            )
         return not (
-            (params.logprobs is not None and not self._spec_serves_logprobs(params))
-            or params.structured_outputs is not None
+            params.structured_outputs is not None
             or bool(params.allowed_token_ids)
             or bool(params.bad_words_token_ids)
-            or (
-                params.min_tokens > len(req_state.output_token_ids)
-                and bool(params.all_stop_token_ids)
-            )
+            or min_tokens_pending
         )
 
     def _spec_serves_logprobs(self, params: SamplingParams) -> bool:
@@ -1913,6 +1972,28 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             params.logprobs is not None
             and 0 <= params.logprobs <= MAX_SPEC_DEVICE_LOGPROBS
             and not getattr(params, "logprob_token_ids", None)
+        )
+
+    def _spec_payload_serves(self, req_id: str) -> bool:
+        """Whether an ``argmax_ids`` verify's payload answers this request's logprobs.
+
+        The request must be one ``_spec_serves_logprobs`` serves, with no
+        control that edits its logits before the device draws: a token mask
+        (``_needs_token_mask``) or a penalty. The payload describes the logits
+        the device drew from, after the composed mask and the penalties, while
+        vLLM's raw logprobs follow the grammar bitmask alone (``spec_accept``),
+        and a penalised draw need not be among the raw logits' candidates the
+        payload reads; no approved semantics covers that difference, so such a
+        request keeps the ``logits`` verify, as without
+        ``supports_spec_device_logprobs``.
+        """
+        req_state = self.requests.get(req_id)
+        params = getattr(req_state, "sampling_params", None)
+        return (
+            params is not None
+            and self._spec_serves_logprobs(params)
+            and not self._needs_token_mask(req_id)
+            and not _has_penalty(params)
         )
 
     def _declares_spec_device_logprobs(self) -> bool:
@@ -2166,14 +2247,17 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                     "skipped at their predecessor's commit"
                 )
             chain_successor.fill_chained(
-                fill_chained_input(
-                    successor,
-                    model_input,
-                    committed,
-                    counts,
-                    draft_token_ids,
-                    offered_by_row,
-                    max_model_len,
+                fill_token_masked_successor(
+                    self,
+                    fill_chained_input(
+                        successor,
+                        model_input,
+                        committed,
+                        counts,
+                        draft_token_ids,
+                        offered_by_row,
+                        max_model_len,
+                    ),
                 )
             )
             for req_id in chained:
@@ -2386,7 +2470,11 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         rows, with the structured-output rule the submission applies (a
         grammar in the batch that this step does not schedule keeps the step
         on the host). The ``logits``-mode override is not included, because the
-        mode is what this value helps decide (``_spec_decode_rows``).
+        mode is what this value helps decide (``_spec_decode_rows``). On a
+        speculating launch whose model declares
+        ``supports_spec_device_penalties`` a penalty keeps the step on the
+        device: the model applies it to every column it picks, on a verify and
+        on the ordinary decode alike.
 
         ``verify`` says the step may be an ``argmax_ids`` verify, which is
         decided after this value: its logprobs rows are answered by the
@@ -2402,12 +2490,64 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             self.requests, scheduler_output
         ):
             return False
+        spec_penalties = bool(getattr(self, "_num_speculative_tokens", 0)) and (
+            spec_device_penalties(self.model)
+        )
         return bool(
             self.check_perform_device_sampling(
                 is_decode=True,
                 has_structured_outputs=has_structured,
                 sampling_rows=req_indices,
+                spec_penalties=spec_penalties,
                 spec_verify=verify and bool(self._num_speculative_tokens),
+            )
+        )
+
+    def _decode_mask_sampled(
+        self, scheduler_output: SchedulerOutput, req_indices: list[int]
+    ) -> bool:
+        """Whether a decode step's verify can carry a device token mask.
+
+        True on a launch whose model declares ``supports_spec_device_mask``
+        (``spec_masks_on_device``) when a live row has a control the mask
+        carries (a grammar, ``allowed_token_ids``, ``bad_words`` or a pending
+        ``min_tokens``) and the step samples on the device once those controls
+        leave the host (``check_perform_device_sampling`` with
+        ``token_masks``). ``_spec_decode_rows`` then asks for a masked
+        ``argmax_ids`` verify where every row is certifiable under the mask.
+        Read before the block, like ``_decode_device_sampled``.
+        """
+        if not spec_masks_on_device(self):
+            return False
+        if not any(
+            self._needs_token_mask(self.input_batch.req_ids[row]) for row in req_indices
+        ):
+            return False
+        return bool(
+            self.check_perform_device_sampling(
+                is_decode=True,
+                has_structured_outputs=False,
+                sampling_rows=req_indices,
+                token_masks=True,
+                spec_verify=True,
+                spec_penalties=bool(getattr(self, "_num_speculative_tokens", 0))
+                and spec_device_penalties(self.model),
+            )
+        )
+
+    def _needs_token_mask(self, req_id: str) -> bool:
+        """Whether a request has a control a device token mask carries."""
+        req_state = self.requests.get(req_id)
+        params = getattr(req_state, "sampling_params", None)
+        if params is None:
+            return False
+        return bool(
+            params.structured_outputs is not None
+            or params.allowed_token_ids
+            or params.bad_words_token_ids
+            or (
+                params.min_tokens > len(req_state.output_token_ids)
+                and params.all_stop_token_ids
             )
         )
 
@@ -2420,6 +2560,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         live_rows: Sequence[int] | None = None,
         device_sampled: bool = False,
         chain: ChainPlan | None = None,
+        mask_sampled: bool = False,
     ) -> SpecDecodeRows:
         """Turn a plain decode's rows into this step's speculative rows.
 
@@ -2450,6 +2591,12 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         decides the cap or the call shape. On an ordinary decode inside a
         speculating launch the rows stay narrow and only an unresolved
         ``accepted_counts`` is kept.
+
+        ``mask_sampled`` (``_decode_mask_sampled``) says the step's verify may
+        carry a device token mask: when every live row is certifiable under
+        the mask, the step is an ``argmax_ids`` verify that samples on the
+        device (``SpecDecodeRows.token_mask``). An ordinary decode never
+        carries a mask, so a row with a token control keeps it on the host.
         """
         if not self._num_speculative_tokens:
             return SpecDecodeRows(input_tokens, input_positions)
@@ -2485,7 +2632,9 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                     f"{ {r: d for r, d in scheduled_drafts.items() if d} } or "
                     f"padding rows among {row_req_ids}"
                 )
-            check_chained_rows_certifiable(self, row_req_ids, device_sampled)
+            check_chained_rows_certifiable(
+                self, row_req_ids, device_sampled or mask_sampled, mask_sampled
+            )
             spec_plan = getattr(self, "_spec_plan", None)
             cap = (
                 spec_plan.draft_cap(num_live)
@@ -2496,7 +2645,13 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 input_positions, self._num_speculative_tokens, cap
             )
             return SpecDecodeRows(
-                tokens, positions, drafts, num_valid, counts, ACCEPT_MODE_ARGMAX_IDS
+                tokens,
+                positions,
+                drafts,
+                num_valid,
+                counts,
+                ACCEPT_MODE_ARGMAX_IDS,
+                token_mask=mask_sampled,
             )
         if (
             self._spec_supports_narrow_decode
@@ -2538,17 +2693,20 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         num_valid_drafts[rows] = live_num_valid
         accepted_counts = torch.ones(num_rows, dtype=torch.int32)
         accepted_counts[rows] = live_counts
+        # A masked verify samples on the device whatever kept the plain
+        # decision on the host: only the token controls can have.
+        sampled = device_sampled or mask_sampled
         if _step_verifies(
             self._spec_supports_narrow_decode,
             all(
-                self._request_is_speculable(req_id, device_sampled)
+                self._request_is_speculable(req_id, sampled, mask_sampled)
                 for req_id in row_req_ids
             ),
             live_num_valid,
             live_counts,
             num_live,
         ):
-            spec_mode = self._spec_mode_for_step(row_req_ids, device_sampled)
+            spec_mode = self._spec_mode_for_step(row_req_ids, sampled, mask_sampled)
             # Uniformly 1+K wide, so a model needs one verify shape rather
             # than two.
             input_tokens, input_positions = self._spec_candidate_block(
@@ -2573,6 +2731,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                     if spec_mode == ACCEPT_MODE_LOGITS
                     else None
                 ),
+                token_mask=mask_sampled and spec_mode == ACCEPT_MODE_ARGMAX_IDS,
             )
         # Either this step has nothing to verify, or a row that is not
         # speculable shares it (see ``_step_verifies``). It runs as the
@@ -2730,6 +2889,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         spec_drafts: torch.Tensor | None = None
         spec_mode: str | None = None
         spec_min_tokens: dict[int, tuple[int, tuple[int, ...]]] | None = None
+        token_mask = False
         if is_prompt:
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
@@ -2800,7 +2960,14 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 input_positions,
                 device_sampled=device_sampled,
                 chain=chain,
+                mask_sampled=(
+                    (chain is None or chains_token_masks(self))
+                    and spec_masks_on_device(self)
+                    and self._decode_mask_sampled(scheduler_output, req_indices)
+                ),
             )
+            token_mask = spec.token_mask
+            device_sampled = device_sampled or token_mask
             input_tokens, input_positions = spec.input_tokens, spec.input_positions
             spec_drafts = spec.draft_token_ids
             num_valid_drafts = spec.num_valid_drafts
@@ -2987,7 +3154,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             perform_device_sampling = False
         defer_device_sampling = (
             perform_device_sampling and has_scheduled_structured and not is_prompt
-        )
+        ) or token_mask
 
         # Populate prompt_tokens and output_tokens if penalties are needed
         # (decode only). Bad words need output_tokens too: vLLM's bad-words op
@@ -3138,6 +3305,11 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             spec_mode=spec_mode if spec_drafts is not None else None,
             grammar_rows_per_request=grammar_rows_per_request,
             spec_min_tokens=spec_min_tokens,
+            spec_token_mask=(
+                step_static_token_mask(self, row_req_ids, spec_drafts, num_valid_drafts)
+                if token_mask and chain is None
+                else None
+            ),
         )
 
     def _structured_drafts(
@@ -3652,14 +3824,24 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         is_decode = model_input.prompt_lens is None
+        # A token-masked verify defers its sampling to ``sample_tokens`` but
+        # still reads back on the asynchronous path (``_finish_async_decode``).
         async_decode = (
             self.async_decode_scheduling
             and is_decode
-            and not model_input.defer_device_sampling
+            and (
+                not model_input.defer_device_sampling
+                or model_input.spec_mode is not None
+            )
         )
-        if chain is not None and not async_decode:
+        if chain is not None and (
+            not async_decode
+            or (model_input.defer_device_sampling and not chains_token_masks(self))
+        ):
             # Only the asynchronous decode path calls complete_chain, which
-            # commits the predecessor verify into the chained rows.
+            # commits the predecessor verify into the chained rows, and a
+            # chained verify defers its sampling only on a model that chains
+            # token-masked verifies.
             raise RuntimeError(
                 "plan_chain chained a step that builds for a path without "
                 f"complete_chain: async_decode_scheduling="
@@ -3843,6 +4025,19 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             lane_total=lane_total,
             require_complete=False,
         )
+        if model_input.spec_mode is not None and model_input.defer_device_sampling:
+            # A chained verify's rows are its predecessor's commit, which
+            # ``complete_chain`` filled into the wrapper's input.
+            ran = wrapper.model_input
+            wrapper.sample_deferred(
+                compose_token_mask(ran.spec_token_mask, bitmask),
+                (
+                    ran.num_valid_drafts
+                    if bitmask is None
+                    else self._grammar_validated_drafts(ran, grammar_output)
+                ),
+            )
+            return wrapper
         if bitmask is None:
             return wrapper
         if model_input.spec_mode is None:
@@ -3855,6 +4050,38 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             ),
         )
         return wrapper
+
+    def _sample_token_masked_verify(self, fwd: _SyncForward) -> _SyncForward:
+        """Sample a token-masked verify on the synchronous tail and read it.
+
+        The step's mask is its build-time controls (``spec_token_mask``) and
+        the grammar bitmask ``_apply_grammar_to_input`` attached; the drafts
+        are the scheduler's, which it validated against each grammar, so every
+        submitted count stands.
+        """
+        model_input = fwd.model_input
+        if fwd.decode_submission is None:
+            raise RuntimeError("a token-masked verify is missing its device submission")
+        submission = self.async_decode.complete_deferred_spec_sampling(
+            fwd.decode_submission,
+            model_input,
+            compose_token_mask(
+                model_input.spec_token_mask, model_input.grammar_bitmask[0]
+            ),
+            model_input.num_valid_drafts,
+            async_read=False,
+        )
+        finalized = self.async_decode.finalize_decode(submission)
+        if finalized is None:
+            raise RuntimeError("a token-masked verify produced no output")
+        return replace(
+            fwd,
+            tt_out=finalized.tt_out,
+            tt_log_probs=finalized.tt_log_probs,
+            decode_submission=submission,
+            spec_hidden=submission.spec_hidden,
+            model_input=replace(model_input, defer_device_sampling=False),
+        )
 
     def _grammar_validated_drafts(
         self, model_input: TTModelInput, grammar_output: GrammarOutput
@@ -4431,6 +4658,8 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             ),
         )
         if fwd.model_input.spec_mode is not None:
+            if fwd.model_input.defer_device_sampling:
+                fwd = self._sample_token_masked_verify(fwd)
             return self._finish_spec_decode(fwd)
 
         if (
@@ -4588,7 +4817,9 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         has_structured_outputs: bool,
         *,
         sampling_rows: list[int] | None = None,
+        token_masks: bool = False,
         spec_verify: bool = False,
+        spec_penalties: bool = False,
     ) -> bool:
         """Return whether this step's rows can be sampled on device.
 
@@ -4597,12 +4828,24 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         forward before submitting the next. Stable device-sampled continuations
         can overlap readback; transitions requiring host state drain first.
 
+        ``token_masks`` asks for a verify that carries a device token mask
+        (``_decode_mask_sampled``): ``allowed_token_ids``, ``bad_words`` and
+        ``min_tokens`` then do not keep the step on the host, because the mask
+        applies them. The caller passes ``has_structured_outputs=False`` for
+        the same reason.
+
         ``spec_verify`` asks for the decision of an ``argmax_ids`` verify:
         when the verify's payload serves every logprobs request among the
-        rows (``_spec_serves_logprobs``), the device-logprobs rules, which
+        rows (``_spec_payload_serves``), the device-logprobs rules, which
         describe the device sampler's own logprobs, do not apply; on a model
         declaring ``supports_spec_device_top_p`` a sampled row with top-k off
         and ``top_p`` below 1 does not exceed ``max_device_top_k``.
+
+        ``spec_penalties``: a decode step of a speculating launch whose model
+        declares ``supports_spec_device_penalties``
+        (``_decode_device_sampled``, ``_decode_mask_sampled``); the model
+        applies the step's penalties itself, so they do not need
+        ``supports_device_penalties``.
         """
         want_device_sampling = self.sample_on_device_mode == "all" or (
             self.sample_on_device_mode == "decode_only" and is_decode
@@ -4651,17 +4894,28 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 needs_unbounded_or_larger_k &= ~(top_k_off & (sampling.top_p[rows] < 1))
             if needs_unbounded_or_larger_k.any():
                 return False
-        if not input_batch.no_penalties and not self.model.model_capabilities.get(
-            "supports_device_penalties", True
+        if (
+            not input_batch.no_penalties
+            and not spec_penalties
+            and not self.model.model_capabilities.get("supports_device_penalties", True)
         ):
             return False
         has_always_host_only_sampling_params = (
-            not input_batch.no_allowed_token_ids  # allowed_token_ids set
-            or input_batch.sampling.bad_words_token_ids  # bad_words set
+            (
+                not token_masks
+                and (
+                    not input_batch.no_allowed_token_ids  # allowed_token_ids set
+                    or input_batch.sampling.bad_words_token_ids  # bad_words set
+                )
+            )
             # logprob_token_ids: the device sampler returns no full-vocab logprobs
             or input_batch.sampling.logprob_token_ids
-            or input_batch.sampling.has_active_logitsprocs()  # min_p, logit_bias,
-            # min_tokens
+            # min_p, logit_bias, min_tokens (unless the token mask carries it)
+            or (
+                input_batch.sampling.has_active_logitsprocs(include_min_tokens=False)
+                if token_masks
+                else input_batch.sampling.has_active_logitsprocs()
+            )
             or bool(self.model_config.logits_processors)  # custom logitsprocs
         )
         if has_always_host_only_sampling_params:
@@ -4717,7 +4971,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             if int(batch.sampling.num_logprobs[row]) >= 0
         ]
         return all(
-            self._spec_serves_logprobs(self.requests[req_id].sampling_params)
+            self._spec_payload_serves(req_id)
             for req_id in asking
             if req_id is not None and req_id in self.requests
         )

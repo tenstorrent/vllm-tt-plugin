@@ -200,7 +200,8 @@ def _sampling_runner(declared: bool, asked: list[int]) -> TTModelRunner:
     runner.model_config.logits_processors = None
     requests = {
         f"r{i}": SimpleNamespace(
-            sampling_params=SamplingParams(logprobs=None if n < 0 else n)
+            sampling_params=SamplingParams(logprobs=None if n < 0 else n),
+            output_token_ids=[],
         )
         for i, n in enumerate(asked)
     }

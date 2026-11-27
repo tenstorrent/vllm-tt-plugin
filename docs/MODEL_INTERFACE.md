@@ -76,7 +76,7 @@ ordinary verify; a chained verify differs as follows.
 | Item | Chained verify |
 |---|---|
 | `spec_predecessor` | Keyword argument of `decode_forward`: the `VerifyOutput` the model returned for the verify submitted just before, still unread. Absent on every other call. |
-| `spec_num_logprobs` | As on an unchained verify of a model declaring `supports_spec_device_logprobs`: the live rows' logprobs requests, by the call's own rows; the payload describes the chained verify's ids ([section 4j](SPEC_DECODE_CONTRACT.md#4j-logprobs-from-an-argmax_ids-verify-supports_spec_device_logprobs)). |
+| `spec_num_logprobs` | As on an unchained verify of a model declaring `supports_spec_device_logprobs`: the live rows' logprobs requests, by the call's own rows; the payload describes the chained verify's ids ([section 4k](SPEC_DECODE_CONTRACT.md#4k-logprobs-from-an-argmax_ids-verify-supports_spec_device_logprobs)). |
 | Live rows | Every live row `i` of the call is the live row `slot_remap[i]` of the predecessor (row `i` when `slot_remap` is absent). A predecessor row whose request finished, or that the step does not schedule, is not a live row of the call. |
 | `slot_remap` | As on every decode: the gather permutation of the step (row `i` reads state slot `slot_remap[i]`). After a decode `TTModelRunner` keeps each request's state slot at its row, so on a chained verify `slot_remap[i]` is also the predecessor row that row `i` continues. A row moves when a predecessor row leaves and `InputBatch.condense` moves the last row into its place. |
 | `tokens`, `start_pos` | Placeholders on live rows: `PLACEHOLDER_TOKEN_ID` in every column, and the positions of a predecessor that accepted all its drafts (its column-0 position plus `1 + K + j` in column `j`). Padding rows as on any verify. |
@@ -108,7 +108,8 @@ the chained verify's rows from that proposal and walks the chained verify's
 rows, and sampled rows as below) whose request takes the scheduler's full
 `1 + K` tokens, with room for two more steps below
 `max_model_len`; a prefill, a new or resumed request, a preemption, a forced
-prefix-cache reset, structured output, a request that is not a row of the
+prefix-cache reset, structured output (unless the model also declares
+`supports_spec_device_mask`, below), a request that is not a row of the
 predecessor or a second unread verify drains the predecessor first. A row
 that moved because a predecessor row left does not: `slot_remap` names its
 predecessor row. In `mamba_cache_mode` `align` a chained row can
@@ -135,11 +136,45 @@ does not certify every chained row. The call then carries the step's
 | Draws | Each column of the row is a draw under the row's own temperature, top-k, top-p and seed, as on an unchained device-sampled verify. |
 | Seeds | A seeded row's seed for each column follows from the position the device computed (the predecessor's column-0 position plus `c`, plus the column), so the draw at a position equals the draw an unchained verify of the request makes at that position. An unseeded row takes fresh randomness on every step. |
 
-A host-sampled step, and a row the draws do not certify (a penalty, logprobs,
-structured output, a token filter, a pending `min_tokens`), drain the
-predecessor first. Sources:
+A host-sampled step, and a row the draws do not certify (logprobs the verify
+payload does not serve, structured output, a token filter, a pending
+`min_tokens`, and a penalty unless the model declares
+`supports_spec_device_penalties`), drain the predecessor first. A model
+declaring `supports_spec_device_penalties` also chains penalised rows: the
+step's `output_tokens` lack the predecessor's commit, and the model adds that
+commit to the row's penalty history itself
+([penalties on the verify](SPEC_DECODE_CONTRACT.md#4l-penalties-on-the-verify-supports_spec_device_penalties)).
+
+A model that also declares `supports_spec_device_mask` chains the rows a token
+mask certifies (structured output, `allowed_token_ids`, `bad_words`, a pending
+`min_tokens`). Such a chained verify is a [token-masked verify](#token-masked-verify):
+
+| Item | Chained token-masked verify |
+|---|---|
+| `decode_forward` | Carries `spec_predecessor`, `defer_device_sampling=True` and the step's `sampling_params`. The model queues the chain program and the verify forward and returns its payload. Every row the model will draw (each live row may be masked) it decides now: the chain program writes the drawing rows' seeds and acceptance inputs. On a model declaring `supports_spec_device_penalties` the step's `prompt_tokens` and `output_tokens` come too, and a greedy penalised row does not draw: its ids are the argmax of its penalized logits, which the model computes after the mask. |
+| `sample_deferred_decode` | Called at `sample_tokens`, after the runner committed the predecessor and vLLM computed the step's bitmask from that commit. Takes the same `sampling_params`, the mask, and the valid drafts the chain program counted (a different count raises). The model queues the masked draws, the acceptance the next chained verify reads, and the drafter, and returns the unread `VerifyOutput`. |
+
+Sources:
 [spec_chain.py](../src/vllm_tt_plugin/spec_chain.py) and
 [mamba_state.py](../src/vllm_tt_plugin/mamba_state.py).
+
+## Token-masked verify
+
+A model that declares `supports_spec_device_mask` (see
+[model capabilities](MODEL_CAPABILITIES.md)) takes an `argmax_ids` verify of a
+device-sampled step whose rows carry a grammar, `allowed_token_ids`,
+`bad_words` or a pending `min_tokens` in two calls:
+
+| Call | When | What the model does |
+|---|---|---|
+| `decode_forward(..., spec_mode="argmax_ids", defer_device_sampling=True, read_from_device=False)` | `execute_model` | Enqueues the verify forward and returns an opaque payload. No `sampling_params`. At most one payload is pending; another verify or a prefill before it is sampled raises. |
+| `sample_deferred_decode(payload, sampling_params=..., grammar_bitmask=..., num_valid_drafts=...)` | `sample_tokens` | Validates, then draws every column of a row the mask `int32 [rows, 1+K, ceil(V/32)]` constrains from the masked target (a greedy row: the masked argmax), and returns the unread `VerifyOutput` that `decode_forward(..., read_from_device=False)` returns for a verify. `num_valid_drafts` is at most the submitted counts. |
+
+`read_decode_output` and `process_decode_output_host` then read the
+`VerifyOutput` as for any verify. The mask, the rows it covers and the
+runner's routing are in
+[SPEC_DECODE_CONTRACT.md, section 4j](SPEC_DECODE_CONTRACT.md#4j-token-masked-verifies-supports_spec_device_mask).
+Source: [spec_token_mask.py](../src/vllm_tt_plugin/spec_token_mask.py).
 
 ## Prefill behind an unread verify
 

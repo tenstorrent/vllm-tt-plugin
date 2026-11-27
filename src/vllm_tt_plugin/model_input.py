@@ -264,6 +264,15 @@ class TTModelInput:
     # request's output has grown.
     spec_min_tokens: dict[int, tuple[int, tuple[int, ...]]] | None = None
 
+    # Token-masked ``argmax_ids`` verify only (``supports_spec_device_mask``):
+    # every control of the block's rows but the grammar, ``[rows, 1+K, W]``
+    # int32 in xgrammar's packing over every row of the padded block, all ones
+    # where nothing applies; ``None`` when no row has such a control. Built at
+    # build time (``spec_token_mask.step_static_token_mask``) because the
+    # controls read the committed output; ``sample_tokens`` ANDs the grammar
+    # into it before the model samples.
+    spec_token_mask: torch.Tensor | None = None
+
     # Chained verify only (``supports_chained_spec_verify``), else ``None``:
     # the unread ``VerifyOutput`` of the verify submitted just before, which
     # ``submit_decode`` passes to the model as ``spec_predecessor``. The live
