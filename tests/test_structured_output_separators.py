@@ -81,7 +81,7 @@ def test_config_hook_installs_the_separator_patch(
     assert not accepts(True, SPACED)
 
     dummy_model_class = type(
-        "DummyModel", (), {"__module__": "models.tt_transformers.tt.generator_vllm"}
+        "DummyModel", (), {"__module__": "models.ttt_compat.tt.generator_vllm"}
     )
     test_dp_modes.TestDPModes.register_dummy_model(
         monkeypatch, vllm_config, dummy_model_class
