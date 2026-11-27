@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+from dataclasses import replace
+
+import pytest
+
 from tests.tt.utils import (
     RequestConfig,
     assert_deterministic_allow_near_tie,
@@ -334,4 +338,52 @@ class TestFrequencyPenalty:
         )
         assert_deterministic_allow_near_tie(
             with_penalty, "With penalty requests should be identical."
+        )
+
+
+class TestPenalisedSpeculation:
+    """A greedy penalised request against its logprobs twin on a speculating
+    launch.
+
+    The twin's logprobs keep it off the ``argmax_ids`` verify: it speculates in
+    ``logits`` mode and the runner applies vLLM's penalties on the host. The
+    request itself does the same, unless the model declares
+    ``supports_spec_device_penalties``, in which case its verifies stay
+    ``argmax_ids`` and the device applies the penalties (float32, with the
+    argmax of the penalized logits for a greedy row). Either way the two must
+    commit the same tokens; the verifies group the positions differently, so a
+    near tie may part them after a shared prefix.
+    """
+
+    @pytest.mark.parametrize(
+        "penalty",
+        [
+            {"repetition_penalty": 1.3},
+            {"frequency_penalty": 0.6},
+            {"presence_penalty": 0.8},
+        ],
+        ids=["repetition", "frequency", "presence"],
+    )
+    def test_a_greedy_penalised_request_matches_its_logprobs_twin(
+        self, tt_server, tt_model_name, server_speculates, penalty
+    ):
+        if not server_speculates:
+            pytest.skip("needs a speculating launch")
+        config = RequestConfig(
+            prompt="List the colours of the rainbow, then list them again, twice:",
+            max_tokens=48,
+            temperature=0,
+            **penalty,
+        )
+        # One request at a time: the twin's logits verify would carry any
+        # request sharing its steps.
+        results = [
+            run_concurrent_batch(tt_server, tt_model_name, [c])[0]
+            for c in (config, replace(config, logprobs=0), config)
+        ]
+        assert_deterministic_allow_near_tie(
+            results,
+            "The penalised request, its logprobs twin and the request again "
+            "should commit the same tokens.",
+            min_common_prefix=8,
         )

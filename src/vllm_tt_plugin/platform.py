@@ -58,6 +58,7 @@ from vllm_tt_plugin.spec_admission import (
     validate_prefill_over_pending_spec,
     validate_spec_device_logprobs,
     validate_spec_device_mask,
+    validate_spec_device_penalties,
 )
 from vllm_tt_plugin.spec_decode import ACCEPT_MODE_FUSED_SAMPLE, ACCEPT_MODE_LOGITS
 from vllm_tt_plugin.utils.dp_discovery import (
@@ -2643,6 +2644,7 @@ class TTPlatform(Platform):
         validate_chained_spec_verify(model_capabilities, model_class.__name__)
         validate_spec_device_logprobs(model_capabilities, model_class.__name__)
         validate_spec_device_mask(model_capabilities, model_class.__name__)
+        validate_spec_device_penalties(model_capabilities, model_class.__name__)
         store_tt_prefill_over_pending_spec(
             vllm_config,
             validate_prefill_over_pending_spec(

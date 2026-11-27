@@ -1548,6 +1548,102 @@ def test_a_build_that_samples_on_the_host_refuses_a_chained_sampled_row():
         h.run()
 
 
+# Penalties on the verify (``supports_spec_device_penalties`` with
+# ``spec_ids_are_sampled`` and ``supports_chained_spec_verify``).
+
+PENALISED = {
+    "p0": {"repetition_penalty": 1.3},
+    "p1": {"temperature": 0.8, "top_k": 5, "seed": 21, "presence_penalty": 0.5},
+}
+
+
+def _penalised_scenario(h: _AsyncHarness) -> None:
+    """Two greedy requests next to a greedy penalised and a sampled penalised
+    one; the drafter declines a row after every seventh position."""
+    for i, prompt_len in enumerate((1019, 700)):
+        h.add(f"g{i}", prompt_len, max_tokens=24)
+    for (req_id, sampling), prompt_len in zip(PENALISED.items(), (1100, 900)):
+        h.add(req_id, prompt_len, max_tokens=24, **sampling)
+    h.device.decline = lambda req_id, truth: len(truth) % 7 == 3
+
+
+def _history(tokens, row: int) -> list[int]:
+    return [t for t in tokens[row].tolist() if t != -1]
+
+
+def _vocab_prompt(seed: int, length: int) -> list[int]:
+    """A prompt of ids the host sampler's penalties can index (below VOCAB)."""
+    g = torch.Generator().manual_seed(seed)
+    return torch.randint(FIRST_ID, VOCAB, (length,), generator=g).tolist()
+
+
+@pytest.mark.parametrize("declared", [True, False], ids=["declared", "not-declared"])
+def test_penalised_rows_verify_and_chain_with_their_histories(monkeypatch, declared):
+    """A model declaring ``supports_spec_device_penalties`` applies the
+    penalties itself, so a decode step with a penalised row samples on the
+    device: the penalised rows verify in ``argmax_ids`` and chain (no
+    ``sampling`` drain), and every such step hands the model each row's prompt
+    and committed output. On a chained verify that output lacks exactly the
+    predecessor's commit, which the model adds itself. Without the declaration
+    the penalised rows never reach a verify and their steps sample on the
+    host. Greedy outputs equal a synchronous run's."""
+    monkeypatch.setitem(globals(), "_prompt", _vocab_prompt)
+    h = _AsyncHarness(
+        SAMPLED_BLOCKS, mode="align", asynchronous=True, chained=True, sampled_ids=True
+    )
+    h.device.model_capabilities["supports_spec_device_penalties"] = declared
+    _penalised_scenario(h)
+    device, steps = h.device, []
+    decode = device.decode_forward
+
+    def record(*, tokens, start_pos, mamba_state, **kwargs):
+        live = device._live()
+        rows = [row for row, req_id in enumerate(live) if req_id in PENALISED]
+        if rows:
+            verify = kwargs.get("spec_mode") is not None
+            predecessor = kwargs.get("spec_predecessor")
+            sampled = kwargs.get("sampling_params") is not None
+            steps.append((verify, predecessor is not None, sampled))
+            if sampled:
+                remap = kwargs.get("slot_remap")
+                for row in rows:
+                    req_id = live[row]
+                    prompt = _history(kwargs["prompt_tokens"], row)
+                    output = _history(kwargs["output_tokens"], row)
+                    assert prompt == list(h.requests[req_id].prompt_token_ids)
+                    truth = device.truth[req_id]
+                    if predecessor is not None:
+                        source = row if remap is None else int(remap[row])
+                        record = predecessor.argmax_ids.record
+                        truth = truth[: len(truth) - record.counts[source]]
+                    assert prompt + output == truth, (req_id, len(output))
+        return decode(
+            tokens=tokens, start_pos=start_pos, mamba_state=mamba_state, **kwargs
+        )
+
+    device.decode_forward = record
+    h.run()
+
+    reference = _AsyncHarness(
+        SAMPLED_BLOCKS, mode="align", asynchronous=False, sampled_ids=True
+    )
+    _penalised_scenario(reference)
+    reference.run()
+    for req_id in ("g0", "g1", "p0"):
+        assert h.outputs[req_id] == reference.outputs[req_id], req_id
+    assert len(h.outputs["p1"]) == 24
+    verifies = [s for s in steps if s[0]]
+    if declared:
+        assert all(sampled for _, _, sampled in steps), (
+            "a penalised step sampled on the host"
+        )
+        assert any(chained for _, chained, _ in verifies), "no penalised row chained"
+        assert h.runner.async_decode._chain_drains["sampling"] == 0
+    else:
+        assert not verifies, "a penalised row reached a verify"
+        assert not any(sampled for _, _, sampled in steps)
+
+
 def test_a_chained_step_built_for_another_path_raises():
     """Only the asynchronous decode path completes a chained verify
     (``complete_chain``). ``plan_chain`` drains each step that would build for
@@ -1868,3 +1964,61 @@ def test_a_token_masked_verify_serves_logprobs_rows_and_not_a_masked_one(mode):
     for prefix, token, ids, logprobs, rank in from_device:
         assert logprobs[0] == pytest.approx(_device_logprob(prefix, token))
         assert ids[1:] == _device_top(prefix)[0][:5]
+
+
+def test_a_token_masked_verify_carries_penalised_rows_and_not_a_penalised_logprobs_row(
+    monkeypatch,
+):
+    """With ``supports_spec_device_mask``, ``supports_spec_device_penalties``,
+    ``supports_spec_device_logprobs`` and chaining declared: an allowlisted
+    greedy row with a repetition penalty verifies under the token mask and
+    chains, and its deferred verify brings each penalised row's prompt and
+    output at submission. A penalised request that asks for logprobs is served
+    by no payload (it would describe the penalized logits, where vLLM's raw
+    logprobs precede the penalties): it never reaches a verify."""
+    monkeypatch.setitem(globals(), "_prompt", _vocab_prompt)
+    h = _AsyncHarness(
+        SAMPLED_BLOCKS,
+        mode="align",
+        asynchronous=True,
+        chained=True,
+        sampled_ids=True,
+        device_logprobs=True,
+        token_masks=True,
+    )
+    h.device.model_capabilities["supports_spec_device_penalties"] = True
+    h.add("g0", 1019, max_tokens=24)
+    h.add(
+        "pa",
+        1100,
+        max_tokens=24,
+        repetition_penalty=1.3,
+        allowed_token_ids=list(ALLOWED),
+    )
+    h.add("l5", 900, max_tokens=24, logprobs=5)
+    h.add("pl", 700, max_tokens=6, repetition_penalty=1.2, logprobs=3)
+    device, deferred = h.device, []
+    decode = device.decode_forward
+
+    def record(*, tokens, start_pos, mamba_state, **kwargs):
+        live = device._live()
+        if kwargs.get("defer_device_sampling") and "pa" in live:
+            row = live.index("pa")
+            prompt = _history(kwargs["prompt_tokens"], row)
+            deferred.append(prompt == list(h.requests["pa"].prompt_token_ids))
+        return decode(
+            tokens=tokens, start_pos=start_pos, mamba_state=mamba_state, **kwargs
+        )
+
+    device.decode_forward = record
+    h.run()
+
+    assert not any("pl" in record.rows for record in device.records)
+    assert len(h.outputs["pl"]) == 6
+    assert set(h.outputs["pa"]) <= set(ALLOWED) and len(h.outputs["pa"]) == 24
+    masked = [r for r in device.records if "pa" in r.rows]
+    assert masked and any(r.chained for r in masked)
+    assert deferred and all(deferred), (
+        "a deferred verify lacked a penalised row's prompt"
+    )
+    assert device.masked_verifies >= len(masked)

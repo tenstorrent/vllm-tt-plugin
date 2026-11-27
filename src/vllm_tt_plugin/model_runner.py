@@ -96,6 +96,7 @@ from vllm_tt_plugin.spec_accept import accept_sampled_drafts, spec_sampling_inpu
 from vllm_tt_plugin.spec_admission import (
     SUPPORTS_SPEC_DEVICE_LOGPROBS,
     method_requirements,
+    spec_device_penalties,
 )
 from vllm_tt_plugin.spec_chain import (
     ChainPlan,
@@ -185,6 +186,16 @@ class _SyncForward:
     decode_submission: TTDecodeSubmission | None = None
     # The verify's hidden handle, for a model whose drafter consumes it.
     spec_hidden: Any | None = None
+
+
+def _has_penalty(params: Any) -> bool:
+    """Whether vLLM ``SamplingParams`` carry a presence, frequency or
+    repetition penalty that changes the logits."""
+    return bool(
+        getattr(params, "presence_penalty", 0.0) != 0.0
+        or getattr(params, "frequency_penalty", 0.0) != 0.0
+        or getattr(params, "repetition_penalty", 1.0) != 1.0
+    )
 
 
 def _has_unresolved_commit(accepted_counts: torch.Tensor, num_rows: int) -> bool:
@@ -1852,8 +1863,13 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         decode's own draw. Against the drafts the id walk is then exact
         rejection sampling, so on such a step (``device_sampled``) a sampled
         request is certifiable; on a host-sampled step it is not, because the
-        ids would be the argmax. A penalised request stays uncertifiable
-        either way: the draws carry no penalty history.
+        ids would be the argmax. A penalised request is certifiable on such a
+        step only when the model also declares
+        ``supports_spec_device_penalties``: its verify applies the presence,
+        frequency and repetition penalties to every column it picks, a greedy
+        row's included, over the row's committed output and earlier drafts.
+        Otherwise the draws carry no penalty history and it stays
+        uncertifiable either way.
 
         A greedy request is still not certifiable when a control moves its
         argmax or asks for more than ids: a grammar, an allowlist, a bad word
@@ -1872,8 +1888,10 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         allowlist, a bad word and a pending ``min_tokens`` are certifiable,
         unless the row's mask can allow no token at some column
         (``mask_may_allow_nothing``). A row with such a control that asks for
-        logprobs is not (``_spec_payload_serves``), and neither is a
-        penalty.
+        logprobs is not (``_spec_payload_serves``). A penalised row is, on a
+        model that also declares ``supports_spec_device_penalties``: its
+        verify applies the penalties after the mask, as vLLM applies them
+        after the bitmask and the token filters.
         """
         batch = self.input_batch
         draws_ids = bool(device_sampled) and bool(
@@ -1883,17 +1901,19 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         # any batch the runner is handed. A batch that tracks none of these
         # sets has no sampled request to withhold drafts from, so the answer is
         # the same as an empty set -- speculable.
-        # Under ``draws_ids`` only the temperature rule is lifted: the draws
-        # follow the row's temperature, top-k, top-p and seed, not a penalty
-        # history, so the three penalty sets keep withholding.
+        # Under ``draws_ids`` the temperature rule is lifted: the draws follow
+        # the row's temperature, top-k, top-p and seed. They follow a penalty
+        # history only on a model declaring ``supports_spec_device_penalties``;
+        # on any other the three penalty sets keep withholding.
         if not draws_ids and req_id in getattr(batch, "random_reqs", ()):
             return False
+        penalties_drawn = draws_ids and spec_device_penalties(self.model)
         for attr in (
             "presence_penalties_reqs",
             "frequency_penalties_reqs",
             "repetition_penalties_reqs",
         ):
-            if req_id in getattr(batch, attr, ()):
+            if req_id in getattr(batch, attr, ()) and not penalties_drawn:
                 return False
         req_state = getattr(self, "requests", {}).get(req_id)
         params = getattr(req_state, "sampling_params", None)
@@ -1952,11 +1972,13 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
 
         The request must be one ``_spec_serves_logprobs`` serves, with no
         control that edits its logits before the device draws: a token mask
-        (``_needs_token_mask``). The payload describes the logits the device
-        drew from, after the composed mask, while vLLM's raw logprobs follow
-        the grammar bitmask alone (``spec_accept``); no approved semantics
-        covers that difference, so such a request keeps the ``logits``
-        verify, as without ``supports_spec_device_logprobs``.
+        (``_needs_token_mask``) or a penalty. The payload describes the logits
+        the device drew from, after the composed mask and the penalties, while
+        vLLM's raw logprobs follow the grammar bitmask alone (``spec_accept``),
+        and a penalised draw need not be among the raw logits' candidates the
+        payload reads; no approved semantics covers that difference, so such a
+        request keeps the ``logits`` verify, as without
+        ``supports_spec_device_logprobs``.
         """
         req_state = self.requests.get(req_id)
         params = getattr(req_state, "sampling_params", None)
@@ -1964,6 +1986,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             params is not None
             and self._spec_serves_logprobs(params)
             and not self._needs_token_mask(req_id)
+            and not _has_penalty(params)
         )
 
     def _declares_spec_device_logprobs(self) -> bool:
@@ -2440,7 +2463,11 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         rows, with the structured-output rule the submission applies (a
         grammar in the batch that this step does not schedule keeps the step
         on the host). The ``logits``-mode override is not included, because the
-        mode is what this value helps decide (``_spec_decode_rows``).
+        mode is what this value helps decide (``_spec_decode_rows``). On a
+        speculating launch whose model declares
+        ``supports_spec_device_penalties`` a penalty keeps the step on the
+        device: the model applies it to every column it picks, on a verify and
+        on the ordinary decode alike.
 
         ``verify`` says the step may be an ``argmax_ids`` verify, which is
         decided after this value: its logprobs rows are answered by the
@@ -2456,11 +2483,15 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             self.requests, scheduler_output
         ):
             return False
+        spec_penalties = bool(getattr(self, "_num_speculative_tokens", 0)) and (
+            spec_device_penalties(self.model)
+        )
         return bool(
             self.check_perform_device_sampling(
                 is_decode=True,
                 has_structured_outputs=has_structured,
                 sampling_rows=req_indices,
+                spec_penalties=spec_penalties,
                 spec_verify=verify and bool(self._num_speculative_tokens),
             )
         )
@@ -2492,6 +2523,8 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 sampling_rows=req_indices,
                 token_masks=True,
                 spec_verify=True,
+                spec_penalties=bool(getattr(self, "_num_speculative_tokens", 0))
+                and spec_device_penalties(self.model),
             )
         )
 
@@ -4776,6 +4809,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         sampling_rows: list[int] | None = None,
         token_masks: bool = False,
         spec_verify: bool = False,
+        spec_penalties: bool = False,
     ) -> bool:
         """Return whether this step's rows can be sampled on device.
 
@@ -4794,6 +4828,12 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         when the verify's payload serves every logprobs request among the
         rows (``_spec_payload_serves``), the device-logprobs rules, which
         describe the device sampler's own logprobs, do not apply.
+
+        ``spec_penalties``: a decode step of a speculating launch whose model
+        declares ``supports_spec_device_penalties``
+        (``_decode_device_sampled``, ``_decode_mask_sampled``); the model
+        applies the step's penalties itself, so they do not need
+        ``supports_device_penalties``.
         """
         want_device_sampling = self.sample_on_device_mode == "all" or (
             self.sample_on_device_mode == "decode_only" and is_decode
@@ -4839,8 +4879,10 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             )
             if needs_unbounded_or_larger_k.any():
                 return False
-        if not input_batch.no_penalties and not self.model.model_capabilities.get(
-            "supports_device_penalties", True
+        if (
+            not input_batch.no_penalties
+            and not spec_penalties
+            and not self.model.model_capabilities.get("supports_device_penalties", True)
         ):
             return False
         has_always_host_only_sampling_params = (

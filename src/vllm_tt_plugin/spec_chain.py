@@ -30,7 +30,9 @@ can submit step n + 1 over an unread verify n:
 A greedy row's ids are the target argmax. On a model that also declares
 ``spec_ids_are_sampled``, a sampled row chains when step n and step n + 1
 both sample on the device; its ids are then the device sampler's draws, and
-the model counts acceptance over them as the runner's walk does. Either way
+the model counts acceptance over them as the runner's walk does. On a model
+that also declares ``supports_spec_device_penalties`` a penalised row chains
+the same way; the model adds step n's commit to the row's penalty history. Either way
 the runner's walk of step n's ids gives the count the device used, and the
 model raises from that propose when the runner's commit differs from its own.
 """

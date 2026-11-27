@@ -136,9 +136,14 @@ does not certify every chained row. The call then carries the step's
 | Draws | Each column of the row is a draw under the row's own temperature, top-k, top-p and seed, as on an unchained device-sampled verify. |
 | Seeds | A seeded row's seed for each column follows from the position the device computed (the predecessor's column-0 position plus `c`, plus the column), so the draw at a position equals the draw an unchained verify of the request makes at that position. An unseeded row takes fresh randomness on every step. |
 
-A host-sampled step, and a row the draws do not certify (a penalty, logprobs,
-structured output, a token filter, a pending `min_tokens`), drain the
-predecessor first.
+A host-sampled step, and a row the draws do not certify (logprobs the verify
+payload does not serve, structured output, a token filter, a pending
+`min_tokens`, and a penalty unless the model declares
+`supports_spec_device_penalties`), drain the predecessor first. A model
+declaring `supports_spec_device_penalties` also chains penalised rows: the
+step's `output_tokens` lack the predecessor's commit, and the model adds that
+commit to the row's penalty history itself
+([penalties on the verify](SPEC_DECODE_CONTRACT.md#4l-penalties-on-the-verify-supports_spec_device_penalties)).
 
 A model that also declares `supports_spec_device_mask` chains the rows a token
 mask certifies (structured output, `allowed_token_ids`, `bad_words`, a pending
@@ -146,7 +151,7 @@ mask certifies (structured output, `allowed_token_ids`, `bad_words`, a pending
 
 | Item | Chained token-masked verify |
 |---|---|
-| `decode_forward` | Carries `spec_predecessor`, `defer_device_sampling=True` and the step's `sampling_params`. The model queues the chain program and the verify forward and returns its payload. Every row the model will draw (each live row may be masked) it decides now: the chain program writes the drawing rows' seeds and acceptance inputs. |
+| `decode_forward` | Carries `spec_predecessor`, `defer_device_sampling=True` and the step's `sampling_params`. The model queues the chain program and the verify forward and returns its payload. Every row the model will draw (each live row may be masked) it decides now: the chain program writes the drawing rows' seeds and acceptance inputs. On a model declaring `supports_spec_device_penalties` the step's `prompt_tokens` and `output_tokens` come too, and a greedy penalised row does not draw: its ids are the argmax of its penalized logits, which the model computes after the mask. |
 | `sample_deferred_decode` | Called at `sample_tokens`, after the runner committed the predecessor and vLLM computed the step's bitmask from that commit. Takes the same `sampling_params`, the mask, and the valid drafts the chain program counted (a different count raises). The model queues the masked draws, the acceptance the next chained verify reads, and the drafter, and returns the unread `VerifyOutput`. |
 
 Sources:

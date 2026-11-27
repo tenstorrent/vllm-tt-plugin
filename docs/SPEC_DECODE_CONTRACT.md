@@ -118,8 +118,9 @@ launches without `speculative_config`.
 | `spec_requirements` | `[]` | What the drafter can serve: `device_propose`, `hidden_feed`, `drafter_scores`, `paged_drafter_cache`. |
 | `spec_hidden_handoff` | `[]` | How the target hidden state reaches a device drafter: `on_device`, `roundtrip`. Required when `speculative_config.method` needs `hidden_feed`. |
 | `output_tokens_per_step` | `1` | Must stay `1`. A value above 1 selects the block-output rail, which cannot be combined with speculation. |
-| `spec_ids_are_sampled` | `False` | On a device-sampled step an `argmax_ids` verify returns the device sampler's draws: for a drafted row one draw per candidate column under the row's own temperature, top-k, top-p and seed, for an undrafted row the plain decode's own draw. The id walk is then exact rejection sampling against the drafts, so a sampled request is speculable on such a step (a penalised one stays plain: the draws carry no penalty history). On a model that serves both modes the device draws take precedence over the host `logits` walk on a device-sampled step: `_spec_mode_for_step` picks `argmax_ids` where it picked `logits` before (section 4d, rule 2). Greedy rows stay the target argmax; a host-sampled step certifies nothing it did not before. |
+| `spec_ids_are_sampled` | `False` | On a device-sampled step an `argmax_ids` verify returns the device sampler's draws: for a drafted row one draw per candidate column under the row's own temperature, top-k, top-p and seed, for an undrafted row the plain decode's own draw. The id walk is then exact rejection sampling against the drafts, so a sampled request is speculable on such a step (a penalised one stays plain unless the model also declares `supports_spec_device_penalties`: the draws carry no penalty history otherwise). On a model that serves both modes the device draws take precedence over the host `logits` walk on a device-sampled step: `_spec_mode_for_step` picks `argmax_ids` where it picked `logits` before (section 4d, rule 2). Greedy rows stay the target argmax; a host-sampled step certifies nothing it did not before. |
 | `supports_spec_device_mask` | `False` | An `argmax_ids` verify of a device-sampled step may defer its sampling to `sample_tokens` and draw every column of a row from the target masked by a packed token mask: the grammar bitmask with `allowed_token_ids`, `bad_words` and a pending `min_tokens`. Such rows are then certifiable by the id walk. Section 4j. |
+| `supports_spec_device_penalties` | `False` | Requires `spec_ids_are_sampled`. On a device-sampled step the model applies a row's presence, frequency and repetition penalties to every column it answers, drawn or greedy, scoring column `t` after the row's committed output and its first `t` drafts, so a penalised request is speculable on such a step and its verify stays `argmax_ids` (section 4l). |
 | `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
 | `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. |
 | `supports_spec_device_logprobs` | `False` | An `argmax_ids` verify sent `spec_num_logprobs` returns a `SpecLogprobs` payload with its ids, so a request with `logprobs` 0 to 20 stays on `argmax_ids` verifies and chains: see section 4k. |
@@ -648,7 +649,8 @@ order, and the first one that holds decides.
    row would commit the argmax, not a token drawn with its request's
    temperature and penalties. The step is an ordinary decode instead, whatever
    the other rows carry. On a model declaring `spec_ids_are_sampled` a request whose only
-   such control is its temperature (a penalty keeps it plain) is
+   such control is its temperature (a penalty keeps it plain, unless the model
+   also declares `supports_spec_device_penalties`: section 4l) is
    speculable on a step that samples on the device
    (`TTModelRunner._decode_device_sampled`, read before the block is built):
    that model's `argmax_ids` verify of such a step returns the device
@@ -1043,7 +1045,8 @@ reached yet. The mode is per step, and that row would otherwise commit the
 target argmax even with no draft of its own. Padding rows do not decide the
 mode. On a model declaring `spec_ids_are_sampled`, a non-zero temperature
 no longer rules a row out on a device-sampled step (section 4d, rule 2; a
-penalty still does): the `argmax_ids` answer carries the device sampler's draws for it.
+penalty still does, unless the model declares `supports_spec_device_penalties`:
+section 4l): the `argmax_ids` answer carries the device sampler's draws for it.
 On a model declaring `supports_spec_device_mask`, structured output,
 `allowed_token_ids`, `bad_words` and a pending `min_tokens` no longer rule a
 row out on a device-sampled step either: the verify carries a token mask
@@ -1230,7 +1233,8 @@ with `supports_sample_on_device`.
 **Boundaries.** Only the temperature rule is lifted. A request with a
 presence, frequency or repetition penalty stays plain (the draws carry no
 penalty history, and `TTModelRunner._request_is_argmax_certifiable` keeps the
-penalty sets out). The token controls of section 4d are unchanged: on a model
+penalty sets out), unless the model also declares
+`supports_spec_device_penalties` (section 4l). The token controls of section 4d are unchanged: on a model
 serving only `argmax_ids`, logprobs, structured output, `allowed_token_ids`,
 `bad_words` and a nonzero `min_tokens` are still refused per request, and
 `logit_bias` on every speculative launch. `min_p`, `top_p` and `top_k` never
@@ -1297,7 +1301,8 @@ custom logits processors and an unservable `top_k` still keep it there). The
 block is then built as a device-sampled step, and `_spec_mode_for_step` asks
 for `argmax_ids` where every live row is certifiable under the mask. A row
 stays uncertifiable, and the step verifies in `logits` mode as before, when it
-asks for logprobs, carries a penalty, or its mask can allow no token at some
+asks for logprobs (section 4k), carries a penalty on a model without
+`supports_spec_device_penalties` (section 4l), or its mask can allow no token at some
 column (`spec_token_mask.mask_may_allow_nothing`, at the worst case: every bad
 word fires; a structured row with any other control; an allowlist that the
 bad words and a pending `min_tokens` empty). An ordinary decode never carries
@@ -1427,6 +1432,56 @@ logprobs, `n` the largest `logprobs` of the step's live rows, through
 `build_device_logprobs`; `spec_committed_logprobs` then cuts them to the
 published prefixes as for a `logits` verify. A verify sent
 `spec_num_logprobs` that returns no payload raises.
+
+## 4l. Penalties on the verify: `supports_spec_device_penalties`
+
+**The promise.** A model declaring `supports_spec_device_penalties` (which
+requires `spec_ids_are_sampled`; the platform rejects it otherwise, and a value
+that is not a boolean) applies presence, frequency and repetition penalties
+whenever it answers a device-sampled decode step. For row `u` and column `t`
+it scores the token after column `t` as vLLM's `apply_penalties` does, over the
+history the host walk of section 4h uses: the request's committed output plus
+the row's first `t` drafts, with the prompt for the repetition penalty. A
+drawn row draws from the penalized distribution; a greedy row (or one with
+`top_k` 1) answers the argmax of its penalized logits. An undrafted row and an
+ordinary decode answer column 0 the same way.
+
+**What the runner does with it.** `TTModelRunner._decode_device_sampled` keeps
+a decode step with a penalty on the device on a speculating launch, although
+the model may declare `supports_device_penalties` False, which keeps governing
+the prefill's first token. `TTModelRunner._request_is_argmax_certifiable` then
+certifies a penalised request on such a step, so it is speculable, its verify
+asks for `argmax_ids` instead of `logits`, and `spec_chain.plan_chain` chains it
+instead of draining with reason `sampling`.
+
+**What the model receives.** The step's `sampling_params` carry each row's
+penalties, and `prompt_tokens` and `output_tokens` carry each row's prompt and
+committed output (`-1` padded), as on any device-sampled step with a penalty.
+On a chained verify `output_tokens` lacks the predecessor's commit, which the
+runner has not read yet; the model counts that commit itself, from the count it
+continues the row from. The model keeps the penalty state of a request across
+commits, `slot_remap` row moves, `release_request` and a new prefill into the
+slot.
+
+**With a token mask.** On a model that also declares
+`supports_spec_device_mask`, a penalised row with structured output or a token
+filter is certifiable on a token-masked verify (section 4j). The model applies
+the penalties after the mask, as vLLM applies them after the grammar bitmask
+and the token filters: a masked token stays ruled out, a drawn row draws from
+the masked penalized distribution, and a greedy row (or one with `top_k` 1)
+does not draw under the mask but answers the argmax of its masked penalized
+logits. On an unchained token-masked verify `prompt_tokens` and
+`output_tokens` come with `decode_forward` and the penalties with
+`sampling_params` at `sample_deferred_decode`; on a chained one all of them
+come with `decode_forward`, and the model counts the predecessor's commit
+before its chain program builds the rows.
+
+**Boundaries.** A penalised row that asks for logprobs keeps the `logits`
+verify: the payload of section 4k would describe the penalized logits, while
+vLLM's raw logprobs precede the penalties, and a penalised draw need not be
+among the raw logits' candidates (`_spec_payload_serves`). Admission is
+unchanged: on a launch whose plan keeps no `supports_narrow_decode` and serves
+no `logits`, a penalised request is still refused per request.
 
 ## 5. One request, from prefill to release
 
