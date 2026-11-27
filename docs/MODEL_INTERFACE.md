@@ -107,7 +107,8 @@ the chained verify's rows from that proposal and walks the chained verify's
 rows, and sampled rows as below) whose request takes the scheduler's full
 `1 + K` tokens, with room for two more steps below
 `max_model_len`; a prefill, a new or resumed request, a preemption, a forced
-prefix-cache reset, structured output, a request that is not a row of the
+prefix-cache reset, structured output (unless the model also declares
+`supports_spec_device_mask`, below), a request that is not a row of the
 predecessor or a second unread verify drains the predecessor first. A row
 that moved because a predecessor row left does not: `slot_remap` names its
 predecessor row. In `mamba_cache_mode` `align` a chained row can
@@ -136,7 +137,18 @@ does not certify every chained row. The call then carries the step's
 
 A host-sampled step, and a row the draws do not certify (a penalty, logprobs,
 structured output, a token filter, a pending `min_tokens`), drain the
-predecessor first. Sources:
+predecessor first.
+
+A model that also declares `supports_spec_device_mask` chains the rows a token
+mask certifies (structured output, `allowed_token_ids`, `bad_words`, a pending
+`min_tokens`). Such a chained verify is a [token-masked verify](#token-masked-verify):
+
+| Item | Chained token-masked verify |
+|---|---|
+| `decode_forward` | Carries `spec_predecessor`, `defer_device_sampling=True` and the step's `sampling_params`. The model queues the chain program and the verify forward and returns its payload. Every row the model will draw (each live row may be masked) it decides now: the chain program writes the drawing rows' seeds and acceptance inputs. |
+| `sample_deferred_decode` | Called at `sample_tokens`, after the runner committed the predecessor and vLLM computed the step's bitmask from that commit. Takes the same `sampling_params`, the mask, and the valid drafts the chain program counted (a different count raises). The model queues the masked draws, the acceptance the next chained verify reads, and the drafter, and returns the unread `VerifyOutput`. |
+
+Sources:
 [spec_chain.py](../src/vllm_tt_plugin/spec_chain.py) and
 [mamba_state.py](../src/vllm_tt_plugin/mamba_state.py).
 

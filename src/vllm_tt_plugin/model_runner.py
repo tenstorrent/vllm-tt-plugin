@@ -111,7 +111,9 @@ from vllm_tt_plugin.spec_decode import (
     accept_greedy_drafts,
 )
 from vllm_tt_plugin.spec_token_mask import (
+    chains_token_masks,
     compose_token_mask,
+    fill_token_masked_successor,
     mask_may_allow_nothing,
     spec_masks_on_device,
     step_static_token_mask,
@@ -2153,14 +2155,17 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                     "skipped at their predecessor's commit"
                 )
             chain_successor.fill_chained(
-                fill_chained_input(
-                    successor,
-                    model_input,
-                    committed,
-                    counts,
-                    draft_token_ids,
-                    offered_by_row,
-                    max_model_len,
+                fill_token_masked_successor(
+                    self,
+                    fill_chained_input(
+                        successor,
+                        model_input,
+                        committed,
+                        counts,
+                        draft_token_ids,
+                        offered_by_row,
+                        max_model_len,
+                    ),
                 )
             )
             for req_id in chained:
@@ -2516,7 +2521,9 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                     f"{ {r: d for r, d in scheduled_drafts.items() if d} } or "
                     f"padding rows among {row_req_ids}"
                 )
-            check_chained_rows_certifiable(self, row_req_ids, device_sampled)
+            check_chained_rows_certifiable(
+                self, row_req_ids, device_sampled or mask_sampled, mask_sampled
+            )
             spec_plan = getattr(self, "_spec_plan", None)
             cap = (
                 spec_plan.draft_cap(num_live)
@@ -2527,7 +2534,13 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 input_positions, self._num_speculative_tokens, cap
             )
             return SpecDecodeRows(
-                tokens, positions, drafts, num_valid, counts, ACCEPT_MODE_ARGMAX_IDS
+                tokens,
+                positions,
+                drafts,
+                num_valid,
+                counts,
+                ACCEPT_MODE_ARGMAX_IDS,
+                token_mask=mask_sampled,
             )
         if (
             self._spec_supports_narrow_decode
@@ -2837,7 +2850,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 device_sampled=device_sampled,
                 chain=chain,
                 mask_sampled=(
-                    chain is None
+                    (chain is None or chains_token_masks(self))
                     and spec_masks_on_device(self)
                     and self._decode_mask_sampled(scheduler_output, req_indices)
                 ),
@@ -3170,7 +3183,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             spec_min_tokens=spec_min_tokens,
             spec_token_mask=(
                 step_static_token_mask(self, row_req_ids, spec_drafts, num_valid_drafts)
-                if token_mask
+                if token_mask and chain is None
                 else None
             ),
         )
@@ -3698,11 +3711,13 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             )
         )
         if chain is not None and (
-            not async_decode or model_input.defer_device_sampling
+            not async_decode
+            or (model_input.defer_device_sampling and not chains_token_masks(self))
         ):
             # Only the asynchronous decode path calls complete_chain, which
-            # commits the predecessor verify into the chained rows, and only
-            # for a verify that samples at submission.
+            # commits the predecessor verify into the chained rows, and a
+            # chained verify defers its sampling only on a model that chains
+            # token-masked verifies.
             raise RuntimeError(
                 "plan_chain chained a step that builds for a path without "
                 f"complete_chain: async_decode_scheduling="
@@ -3887,12 +3902,15 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             require_complete=False,
         )
         if model_input.spec_mode is not None and model_input.defer_device_sampling:
+            # A chained verify's rows are its predecessor's commit, which
+            # ``complete_chain`` filled into the wrapper's input.
+            ran = wrapper.model_input
             wrapper.sample_deferred(
-                compose_token_mask(model_input.spec_token_mask, bitmask),
+                compose_token_mask(ran.spec_token_mask, bitmask),
                 (
-                    model_input.num_valid_drafts
+                    ran.num_valid_drafts
                     if bitmask is None
-                    else self._grammar_validated_drafts(model_input, grammar_output)
+                    else self._grammar_validated_drafts(ran, grammar_output)
                 ),
             )
             return wrapper
