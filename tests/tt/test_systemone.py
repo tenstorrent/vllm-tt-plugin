@@ -6,7 +6,8 @@ The endpoint sends each question as a ``max_tokens=1`` request whose
 ``SamplingParams.logprob_token_ids`` are the label tokens, and turns their
 full-vocabulary logprobs into per-label probabilities. vLLM serves it only for
 the architectures in its ``READ_STRATEGIES`` table and answers 501 otherwise,
-so these tests skip on other models.
+so these tests skip on other models. A speculating launch refuses
+``logprob_token_ids`` with 400, so they skip there too.
 """
 
 import asyncio
@@ -77,6 +78,14 @@ def systemone_url(tt_server_url, tt_model_name):
     )
     if probe.status_code == 501:
         pytest.skip(f"/v1/systemone is not served for {tt_model_name}")
+    if (
+        probe.status_code == 400
+        and "Speculative decoding" in probe.text
+        and "logprob_token_ids" in probe.text
+    ):
+        pytest.skip(
+            f"this speculating launch of {tt_model_name} refuses logprob_token_ids"
+        )
     return tt_server_url.rstrip("/")
 
 
