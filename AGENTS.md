@@ -117,7 +117,7 @@ or newer; CI covers Python 3.12.
 export VIRTUAL_ENV="$PWD/.venv"
 export UV_TORCH_BACKEND=cpu
 uv venv --python 3.12 "$VIRTUAL_ENV"
-uv pip install torch                # stands in for what tt-metal owns
+uv pip install "torch==2.11.0"      # tt-metal's pin; pairs with torchvision in docs/install-vllm-tt.sh
 source docs/install-vllm-tt.sh      # note: sourced, not executed
 uv pip install "pytest>=8,<9" pre-commit
 PYTHONPATH=tests/host-stubs "$VIRTUAL_ENV/bin/python" -m pytest tests/ --ignore=tests/tt
