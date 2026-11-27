@@ -8,8 +8,9 @@ See the [interface guide](MODEL_INTERFACE.md) for setup and execution calls.
 
 ## Warmup and trace capture
 
-`TTWorker.compile_or_warm_up_model` runs `TTModelRunner.warmup_model` when
-`tt.enable_model_warmup` is true, which is the default. The adapter supplies:
+`TTWorker.compile_or_warm_up_model` runs `TTWorker.compile_model` and then
+`TTWorker.capture_model` when `tt.enable_model_warmup` is true, which is the
+default. The adapter supplies:
 
 ```python
 warmup_model_prefill(kv_cache=..., can_sample_on_device=..., enable_trace=...)
@@ -21,14 +22,14 @@ warmup_model_decode(kv_cache=..., max_batch_size=..., num_blocks=...,
 maximum block-table width per request. When effective device grammar support
 is enabled, decode warmup also receives `can_sample_device_grammar=True`.
 
-1. `TTModelRunner.warmup_model` calls `warmup_model_prefill` and then
+1. `TTModelRunner.compile_model` calls `warmup_model_prefill` and then
    `warmup_model_decode` with `enable_trace=False`.
-2. `TTModelRunner.warmup_model` resets `already_warmed_up_prefill=False` if
+2. `TTModelRunner.compile_model` resets `already_warmed_up_prefill=False` if
    the adapter exposes `already_warmed_up_prefill`.
-3. For `tt.trace_mode="all"`, `TTModelRunner.warmup_model` calls
+3. For `tt.trace_mode="all"`, `TTModelRunner.capture_model` calls
    `warmup_model_prefill(enable_trace=True)`.
 4. For `tt.trace_mode="all"` or `"decode_only"`,
-   `TTModelRunner.warmup_model` calls `warmup_model_decode(enable_trace=True)`.
+   `TTModelRunner.capture_model` calls `warmup_model_decode(enable_trace=True)`.
 
 The adapter must prepare the operators and persistent buffers that traced
 execution uses. Eager warmup must cover traced operators, and prefill warmup
@@ -36,7 +37,15 @@ must cover supported sequence lengths. Compilation or incompatible buffer
 allocation after trace capture can invalidate retained trace storage.
 `tt.trace_mode="none"` skips trace capture but still runs enabled eager warmup.
 
-Source: `TTModelRunner.warmup_model` in
+A host that runs several engines in one process can call
+`TTWorker.compile_model` on every engine before it calls
+`TTWorker.capture_model` on any, so that no engine's warmup compiles after
+another engine has captured its traces. Both steps take their arguments from
+the runner's own configuration, not from `TTPlatform`, so engines configured in
+between do not change them. The adapter receives the same calls in the same
+order as in a `compile_or_warm_up_model` call.
+
+Source: `TTModelRunner.compile_model` and `TTModelRunner.capture_model` in
 [model_runner.py](../src/vllm_tt_plugin/model_runner.py).
 
 ## Request state

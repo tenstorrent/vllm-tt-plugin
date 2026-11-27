@@ -45,8 +45,11 @@ class _Runner:
         self.calls.append("kv")
         self.kv_cache_config = kv_cache_config
 
-    def warmup_model(self):
-        self.calls.append("warmup")
+    def compile_model(self):
+        self.calls.append("compile")
+
+    def capture_model(self):
+        self.calls.append("capture")
 
     def execute_model(self, scheduler_output):
         self.calls.append("execute")
@@ -194,7 +197,7 @@ def test_a_worker_without_token_kv_runs_the_whole_lifecycle(monkeypatch):
     assert kv_cache_config.kv_cache_groups == []
     assert kv_cache_config.kv_cache_tensors == []
     assert runner.kv_cache_config is kv_cache_config
-    assert runner.calls == ["kv", "warmup", "execute", "shutdown"]
+    assert runner.calls == ["kv", "compile", "capture", "execute", "shutdown"]
     assert worker_instance.mesh_device is None
 
 
@@ -210,7 +213,7 @@ def test_a_worker_with_token_kv_keeps_its_pool_and_spec(monkeypatch):
     assert worker_instance.cache_config.num_gpu_blocks_override == NUM_TT_BLOCKS
     assert kv_cache_config.num_blocks == NUM_TT_BLOCKS
     assert [group.layer_names for group in kv_cache_config.kv_cache_groups] == [["foo"]]
-    assert runner.calls == ["kv", "warmup", "execute", "shutdown"]
+    assert runner.calls == ["kv", "compile", "capture", "execute", "shutdown"]
     assert worker_instance.mesh_device is None
 
 

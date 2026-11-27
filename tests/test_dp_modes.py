@@ -304,12 +304,13 @@ class TestDPModes:
         )
         warmup_calls: list[str] = []
         worker.model_runner = SimpleNamespace(
-            warmup_model=lambda: warmup_calls.append("warmup")
+            compile_model=lambda: warmup_calls.append("compile"),
+            capture_model=lambda: warmup_calls.append("capture"),
         )
 
         timings = TTWorker.compile_or_warm_up_model(worker)
 
-        assert warmup_calls == ["warmup"]
+        assert warmup_calls == ["compile", "capture"]
         assert timings.language_model >= 0.0
 
     @pytest.mark.parametrize("set_by_vllm", [True, False])

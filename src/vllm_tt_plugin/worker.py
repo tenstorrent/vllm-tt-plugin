@@ -573,6 +573,28 @@ class TTWorker(WorkerBase):
         # sufficient; it keeps no separate cached copy.
         self.model_config.max_model_len = max_model_len
 
+    def compile_model(self) -> None:
+        """First half of ``compile_or_warm_up_model``: warm up with tracing off.
+
+        Compiles the model's programs and allocates its lazily created
+        buffers. With ``capture_model`` this lets a host that runs several
+        engines in one process compile every model before any model captures
+        traces: a program compiled after a trace is captured can corrupt that
+        trace. Does nothing when ``tt.enable_model_warmup`` is false.
+        """
+        if self.enable_model_warmup:
+            self.model_runner.compile_model()
+
+    def capture_model(self) -> None:
+        """Second half of ``compile_or_warm_up_model``: capture the traces.
+
+        Captures what ``trace_mode`` asks for; call it after
+        ``compile_model``. Does nothing when ``tt.enable_model_warmup`` is
+        false.
+        """
+        if self.enable_model_warmup:
+            self.model_runner.capture_model()
+
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # The executor reduces per-worker timings returned here into
         # compilation_config.compilation_time. TT does device warmup rather than
@@ -583,7 +605,8 @@ class TTWorker(WorkerBase):
             elapsed = 0.0
         else:
             start = time.perf_counter()
-            self.model_runner.warmup_model()
+            self.compile_model()
+            self.capture_model()
             elapsed = time.perf_counter() - start
 
         # vLLM sizes multiproc workers' torch threads for startup only.
