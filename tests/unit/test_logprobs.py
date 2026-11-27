@@ -10,6 +10,7 @@ import torch
 
 from tests.support.logprobs import ReportedLogprobs
 from vllm_tt_plugin.logprobs import build_device_logprobs, build_logprobs_from_topk
+from vllm_tt_plugin.spec_decode import SpecLogprobs
 
 
 class TopkPayload(NamedTuple):
@@ -253,6 +254,23 @@ class TestBuildDeviceLogprobs:
                 ),
                 id="unknown-rank-tensor",
             ),
+            pytest.param(
+                SpecLogprobs(
+                    torch.tensor([-0.25, -1.0, -4.0]),
+                    torch.tensor([4, 9, 7], dtype=torch.int32),
+                    torch.tensor([[-0.1, -0.2, -0.3], [-1, -2, -3], [-3.5, -3.75, -4]]),
+                    torch.tensor(
+                        [[10, 12, 14], [20, 22, 24], [33, 32, 31]], dtype=torch.int32
+                    ),
+                ),
+                2,
+                ExpectedLogprobs(
+                    token_ids=[[31, 33, 32], [10, 10, 12]],
+                    values=[[-4.0, -3.5, -3.75], [-0.25, -0.1, -0.2]],
+                    ranks=[7, 4],
+                ),
+                id="reported-rank-with-top",
+            ),
         ],
     )
     def test_selects_payload_rows_without_reindexing_sampled_ids(
@@ -291,3 +309,18 @@ class TestBuildDeviceLogprobs:
         )
         for actual, snapshot in zip(inputs, snapshots, strict=True):
             torch.testing.assert_close(actual, snapshot)
+
+    def test_a_ranked_payload_with_fewer_top_logprobs_than_asked_raises(self) -> None:
+        """A request's top count past the payload's candidates is refused
+        rather than published short."""
+        payload = SpecLogprobs(
+            torch.tensor([-0.5]),
+            torch.tensor([1], dtype=torch.int32),
+            torch.tensor([[-0.5, -1.0]]),
+            torch.tensor([[3, 4]], dtype=torch.int32),
+        )
+
+        with pytest.raises(ValueError, match="exceeds the 2 top logprobs"):
+            build_device_logprobs(
+                payload, torch.tensor([3]), torch.tensor([0]), max_num_logprobs=3
+            )

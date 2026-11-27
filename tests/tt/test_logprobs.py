@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
+import math
+
 import openai
 import pytest
 
@@ -120,3 +122,39 @@ class TestLogprobs:
                 f"token {i}: expected many top_logprobs for all-vocab, "
                 f"got {len(token_lp.top_logprobs)}"
             )
+
+
+def test_greedy_logprobs_are_a_distribution_led_by_the_token(
+    tt_server, tt_model_name, max_batch_size
+):
+    """Greedy requests asking for top-5 logprobs, a full batch at once: each
+    generated token is its own top-1 alternative with the same logprob, the
+    alternatives are sorted and at most 0, and their probabilities sum to at
+    most 1. On a speculating launch whose model returns the logprobs with an
+    argmax_ids verify (supports_spec_device_logprobs) these come from that
+    payload; a payload with a wrong log-sum-exp or wrong top ids fails here."""
+    configs = [
+        RequestConfig(
+            prompt=f"Write the numbers from {i} to {i + 30}: ",
+            max_tokens=24,
+            temperature=0.0,
+            logprobs=5,
+            return_tokens_as_token_ids=True,
+        )
+        for i in range(max(1, max_batch_size))
+    ]
+    results = run_concurrent_batch(
+        tt_server, tt_model_name, configs, return_full_response=True
+    )
+    for i, response in enumerate(results):
+        logprobs = response.choices[0].logprobs
+        assert logprobs is not None and logprobs.top_logprobs, f"request {i}"
+        for j, (token, value, top) in enumerate(
+            zip(logprobs.tokens, logprobs.token_logprobs, logprobs.top_logprobs)
+        ):
+            where = f"request {i}, token {j}"
+            ranked = sorted(top.items(), key=lambda kv: kv[1], reverse=True)
+            assert ranked[0][1] == pytest.approx(value, abs=1e-3), where
+            assert top.get(token) == pytest.approx(value, abs=1e-3), where
+            assert all(v <= 1e-3 for v in top.values()), where
+            assert sum(math.exp(v) for v in top.values()) <= 1.0 + 1e-3, where

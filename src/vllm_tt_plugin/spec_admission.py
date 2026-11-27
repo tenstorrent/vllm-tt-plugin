@@ -382,13 +382,32 @@ def validate_prefill_over_pending_spec(
     return value
 
 
+SUPPORTS_SPEC_DEVICE_LOGPROBS = "supports_spec_device_logprobs"
+
+
+def validate_spec_device_logprobs(
+    model_capabilities: Mapping[str, Any] | None, model_name: str
+) -> None:
+    """Raise for a ``supports_spec_device_logprobs`` declaration that is not
+    a bool. The runner reads it at every step that decides certifiability,
+    so a string such as ``"false"`` would read as true there."""
+    value = (model_capabilities or {}).get(SUPPORTS_SPEC_DEVICE_LOGPROBS, False)
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"TT model {model_name} declares {SUPPORTS_SPEC_DEVICE_LOGPROBS}="
+            f"{value!r}; the capability is a bool"
+        )
+
+
 __all__ = [
     "SUPPORTS_CHAINED_SPEC_VERIFY",
     "SUPPORTS_PREFILL_OVER_PENDING_SPEC",
+    "SUPPORTS_SPEC_DEVICE_LOGPROBS",
     "SUPPORTS_SPEC_DEVICE_MASK",
     "method_requirements",
     "resolve_speculative_plan",
     "validate_chained_spec_verify",
     "validate_prefill_over_pending_spec",
+    "validate_spec_device_logprobs",
     "validate_spec_device_mask",
 ]

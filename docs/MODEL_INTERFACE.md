@@ -76,6 +76,7 @@ ordinary verify; a chained verify differs as follows.
 | Item | Chained verify |
 |---|---|
 | `spec_predecessor` | Keyword argument of `decode_forward`: the `VerifyOutput` the model returned for the verify submitted just before, still unread. Absent on every other call. |
+| `spec_num_logprobs` | As on an unchained verify of a model declaring `supports_spec_device_logprobs`: the live rows' logprobs requests, by the call's own rows; the payload describes the chained verify's ids ([section 4k](SPEC_DECODE_CONTRACT.md#4k-logprobs-from-an-argmax_ids-verify-supports_spec_device_logprobs)). |
 | Live rows | Every live row `i` of the call is the live row `slot_remap[i]` of the predecessor (row `i` when `slot_remap` is absent). A predecessor row whose request finished, or that the step does not schedule, is not a live row of the call. |
 | `slot_remap` | As on every decode: the gather permutation of the step (row `i` reads state slot `slot_remap[i]`). After a decode `TTModelRunner` keeps each request's state slot at its row, so on a chained verify `slot_remap[i]` is also the predecessor row that row `i` continues. A row moves when a predecessor row leaves and `InputBatch.condense` moves the last row into its place. |
 | `tokens`, `start_pos` | Placeholders on live rows: `PLACEHOLDER_TOKEN_ID` in every column, and the positions of a predecessor that accepted all its drafts (its column-0 position plus `1 + K + j` in column `j`). Padding rows as on any verify. |

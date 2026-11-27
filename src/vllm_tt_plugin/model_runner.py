@@ -88,11 +88,15 @@ from vllm_tt_plugin.model_input import (
     penalty_history,
     penalty_prompt_ids,
     slice_tt_sampling_params,
+    spec_verify_num_logprobs,
 )
 from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.pooling import execute_pooling_step, supported_pooling_tasks
 from vllm_tt_plugin.spec_accept import accept_sampled_drafts, spec_sampling_inputs
-from vllm_tt_plugin.spec_admission import method_requirements
+from vllm_tt_plugin.spec_admission import (
+    SUPPORTS_SPEC_DEVICE_LOGPROBS,
+    method_requirements,
+)
 from vllm_tt_plugin.spec_chain import (
     ChainPlan,
     chained_rows,
@@ -105,10 +109,13 @@ from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_FUSED_SAMPLE,
     ACCEPT_MODE_LOGITS,
+    MAX_SPEC_DEVICE_LOGPROBS,
     PLACEHOLDER_TOKEN_ID,
     SPEC_REQUIREMENT_DEVICE_PROPOSE,
     DraftOutput,
+    SpecLogprobs,
     accept_greedy_drafts,
+    check_spec_logprobs,
 )
 from vllm_tt_plugin.spec_token_mask import (
     chains_token_masks,
@@ -129,6 +136,7 @@ from vllm_tt_plugin.structured_output import (
 )
 
 if TYPE_CHECKING:
+    from vllm.sampling_params import SamplingParams
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 import numpy as np
@@ -1850,10 +1858,11 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         A greedy request is still not certifiable when a control moves its
         argmax or asks for more than ids: a grammar, an allowlist, a bad word
         or a pending ``min_tokens`` rules out the token the unfiltered argmax
-        might be, and logprobs need the logits themselves. Admission refuses
-        all of these on a launch without ``logits``, so in practice they only
-        make ``_spec_mode_for_step`` pick ``logits`` on a launch that serves
-        both modes.
+        might be, and logprobs need the logits themselves unless the verify
+        returns them (``_spec_payload_serves``). Admission refuses all of
+        these on a launch without ``logits``, so in practice they only make
+        ``_spec_mode_for_step`` pick ``logits`` on a launch that serves both
+        modes.
 
         ``masked`` is True for a step whose ``argmax_ids`` verify carries a
         device token mask (``_decode_mask_sampled``: a model declaring
@@ -1862,7 +1871,9 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         distribution, a greedy row the masked argmax, so a grammar, an
         allowlist, a bad word and a pending ``min_tokens`` are certifiable,
         unless the row's mask can allow no token at some column
-        (``mask_may_allow_nothing``). Logprobs and penalties are not.
+        (``mask_may_allow_nothing``). A row with such a control that asks for
+        logprobs is not (``_spec_payload_serves``), and neither is a
+        penalty.
         """
         batch = self.input_batch
         draws_ids = bool(device_sampled) and bool(
@@ -1891,7 +1902,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         min_tokens_pending = params.min_tokens > len(
             req_state.output_token_ids
         ) and bool(params.all_stop_token_ids)
-        if params.logprobs is not None:
+        if params.logprobs is not None and not self._spec_payload_serves(req_id):
             return False
         if masked:
             return not mask_may_allow_nothing(
@@ -1908,6 +1919,57 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             or bool(params.bad_words_token_ids)
             or min_tokens_pending
         )
+
+    def _spec_serves_logprobs(self, params: SamplingParams) -> bool:
+        """Whether an ``argmax_ids`` verify returns this request's logprobs.
+
+        A model declaring ``supports_spec_device_logprobs`` returns, with the
+        ids of every ``argmax_ids`` verify sent ``spec_num_logprobs``, each
+        column's raw logprob, rank and top ``MAX_SPEC_DEVICE_LOGPROBS``
+        (``SpecLogprobs``). That answers a request asking for ``logprobs`` in
+        ``[0, MAX_SPEC_DEVICE_LOGPROBS]`` under vLLM's ``raw_logprobs`` mode.
+        Every other request keeps the ``logits`` verify: all-vocabulary
+        logprobs (``-1``), more than the payload holds, specific
+        ``logprob_token_ids``, another ``logprobs_mode``, and any request on a
+        launch whose id mode is ``fused_sample``, which returns no payload.
+        """
+        if not self._declares_spec_device_logprobs():
+            return False
+        if ACCEPT_MODE_FUSED_SAMPLE in getattr(self, "_spec_accept_modes", ()):
+            return False
+        if getattr(self.model_config, "logprobs_mode", "raw_logprobs") != (
+            "raw_logprobs"
+        ):
+            return False
+        return (
+            params.logprobs is not None
+            and 0 <= params.logprobs <= MAX_SPEC_DEVICE_LOGPROBS
+            and not getattr(params, "logprob_token_ids", None)
+        )
+
+    def _spec_payload_serves(self, req_id: str) -> bool:
+        """Whether an ``argmax_ids`` verify's payload answers this request's logprobs.
+
+        The request must be one ``_spec_serves_logprobs`` serves, with no
+        control that edits its logits before the device draws: a token mask
+        (``_needs_token_mask``). The payload describes the logits the device
+        drew from, after the composed mask, while vLLM's raw logprobs follow
+        the grammar bitmask alone (``spec_accept``); no approved semantics
+        covers that difference, so such a request keeps the ``logits``
+        verify, as without ``supports_spec_device_logprobs``.
+        """
+        req_state = self.requests.get(req_id)
+        params = getattr(req_state, "sampling_params", None)
+        return (
+            params is not None
+            and self._spec_serves_logprobs(params)
+            and not self._needs_token_mask(req_id)
+        )
+
+    def _declares_spec_device_logprobs(self) -> bool:
+        """Whether the loaded model declares ``supports_spec_device_logprobs``."""
+        capabilities = getattr(getattr(self, "model", None), "model_capabilities", None)
+        return (capabilities or {}).get(SUPPORTS_SPEC_DEVICE_LOGPROBS, False) is True
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         """Hand the drafts proposed since the last call to the engine.
@@ -2369,6 +2431,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         scheduler_output: SchedulerOutput,
         grammar_output: GrammarOutput | None,
         req_indices: list[int],
+        verify: bool = True,
     ) -> bool:
         """Whether a decode step samples on the device unless it becomes a
         ``logits`` verify.
@@ -2378,6 +2441,12 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         grammar in the batch that this step does not schedule keeps the step
         on the host). The ``logits``-mode override is not included, because the
         mode is what this value helps decide (``_spec_decode_rows``).
+
+        ``verify`` says the step may be an ``argmax_ids`` verify, which is
+        decided after this value: its logprobs rows are answered by the
+        verify's payload rather than by the device sampler
+        (``check_perform_device_sampling(spec_verify=True)``). A step built as
+        an ordinary decode decides again with ``verify=False``.
         """
         bitmask = grammar_output.grammar_bitmask if grammar_output is not None else None
         has_structured = has_structured_outputs(
@@ -2392,6 +2461,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 is_decode=True,
                 has_structured_outputs=has_structured,
                 sampling_rows=req_indices,
+                spec_verify=verify and bool(self._num_speculative_tokens),
             )
         )
 
@@ -2421,6 +2491,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 has_structured_outputs=False,
                 sampling_rows=req_indices,
                 token_masks=True,
+                spec_verify=True,
             )
         )
 
@@ -2863,6 +2934,16 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             accepted_counts = spec.accepted_counts
             spec_mode = spec.spec_mode
             spec_min_tokens = spec.spec_min_tokens
+            if (
+                spec_mode is None
+                and device_sampled
+                and input_batch.max_num_logprobs is not None
+            ):
+                # An ordinary decode returns the device sampler's logprobs,
+                # not a verify's payload, so its own rules decide.
+                device_sampled = self._decode_device_sampled(
+                    scheduler_output, grammar_output, req_indices, verify=False
+                )
 
             # TODO: Remove once TT models can support arbitrary batch sizes.
             # Pad decode to the lane/rank wire capacity.
@@ -3953,6 +4034,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         return replace(
             fwd,
             tt_out=finalized.tt_out,
+            tt_log_probs=finalized.tt_log_probs,
             decode_submission=submission,
             spec_hidden=submission.spec_hidden,
             model_input=replace(model_input, defer_device_sampling=False),
@@ -3993,7 +4075,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         three at the readback boundary, which is why the walk and the commit
         are separate methods rather than one.
         """
-        walk = self.walk_spec_acceptance(fwd.model_input, fwd.tt_out)
+        walk = self.walk_spec_acceptance(fwd.model_input, fwd.tt_out, fwd.tt_log_probs)
         prefixes = self.spec_committed_prefixes(
             fwd.model_input, walk.committed, walk.counts
         )
@@ -4006,7 +4088,12 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             self.spec_committed_logprobs(walk.logprobs, prefixes),
         )
 
-    def walk_spec_acceptance(self, model_input: TTModelInput, tt_out: Any) -> SpecWalk:
+    def walk_spec_acceptance(
+        self,
+        model_input: TTModelInput,
+        tt_out: Any,
+        logprobs: SpecLogprobs | None = None,
+    ) -> SpecWalk:
         """Acceptance over one verify's return. Touches no runner state.
 
         Separate from the commit because the asynchronous path runs this on
@@ -4014,7 +4101,9 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         one step behind and must not be read or written. Everything this needs
         is the step's own: the block it submitted, the sampling it was built
         with, and what came back. ``tt_out`` is the tensor the step's mode
-        returns, already unwrapped from its ``VerifyOutput``.
+        returns, already unwrapped from its ``VerifyOutput``, and ``logprobs``
+        the ``SpecLogprobs`` payload an ``argmax_ids`` verify returned with
+        its ids, or ``None``.
 
         An ``argmax_ids`` walk is pure. A ``logits`` walk draws: it advances
         the generators of the step's seeded requests and the global torch
@@ -4095,7 +4184,12 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 "a verify in argmax_ids mode must return a token id tensor, got "
                 f"{type(argmax_ids).__name__}"
             )
-        if model_input.max_num_logprobs[0] is not None:
+        num_logprobs = spec_verify_num_logprobs(model_input)
+        if (
+            num_logprobs is None
+            and model_input.max_num_logprobs[0] is not None
+            and not self._declares_spec_device_logprobs()
+        ):
             raise RuntimeError(
                 "an argmax_ids verify carries a row that asked for logprobs, "
                 "which ids cannot answer; _spec_mode_for_step asks for logits "
@@ -4111,13 +4205,60 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         # ran on: its per-row state is indexed by row, and a device graph has
         # one shape. A padding row carries no draft, so the walk commits its
         # column 0 and counts 1, and only the live rows reach a request.
-        return SpecWalk(
+        walk = SpecWalk(
             *accept_greedy_drafts(
                 argmax_ids,
                 model_input.draft_token_ids[:, :verified_drafts],
                 model_input.num_valid_drafts,
             )
         )
+        if num_logprobs is None:
+            return walk
+        if logprobs is None:
+            raise RuntimeError(
+                "an argmax_ids verify sent spec_num_logprobs "
+                f"{num_logprobs.tolist()} returned no SpecLogprobs payload with "
+                "its ids; a model declaring supports_spec_device_logprobs "
+                "returns one"
+            )
+        return walk._replace(
+            logprobs=self._spec_payload_logprobs(
+                model_input, walk, logprobs, num_logprobs
+            )
+        )
+
+    @staticmethod
+    def _spec_payload_logprobs(
+        model_input: TTModelInput,
+        walk: SpecWalk,
+        payload: SpecLogprobs,
+        num_logprobs: torch.Tensor,
+    ) -> LogprobsTensors:
+        """The committed tokens' logprobs, from an ``argmax_ids`` verify's
+        ``SpecLogprobs`` payload, laid out as the ``logits`` walk lays them.
+
+        The id walk commits ``argmax_ids[r, t]`` at every committed column
+        ``t``, so column ``t`` of the payload is the committed token's. Rows
+        are the live rows' committed columns, row-major in live-row order,
+        each with the step's top ``N``, ``N`` the largest ``num_logprobs`` of
+        its live rows: vLLM keeps each request's own count.
+        """
+        rows, width = (int(size) for size in walk.committed.shape)
+        payload = check_spec_logprobs(payload, rows, width)
+        live = live_row_index(model_input)
+        counts = walk.counts[live].to(torch.int64)
+        columns = torch.arange(width).unsqueeze(0)
+        within = columns < counts.unsqueeze(1)
+        flat = (live.unsqueeze(1) * width + columns)[within]
+        result = build_device_logprobs(
+            SpecLogprobs(
+                *(value.reshape(rows * width, *value.shape[2:]) for value in payload)
+            ),
+            walk.committed.reshape(-1)[flat],
+            flat,
+            int(num_logprobs[live].max()),
+        )
+        return result._replace(cu_num_generated_tokens=[0, *counts.cumsum(0).tolist()])
 
     def _walk_sampled_acceptance(
         self, model_input: TTModelInput, logits: Any
@@ -4634,6 +4775,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         *,
         sampling_rows: list[int] | None = None,
         token_masks: bool = False,
+        spec_verify: bool = False,
     ) -> bool:
         """Return whether this step's rows can be sampled on device.
 
@@ -4647,6 +4789,11 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         ``min_tokens`` then do not keep the step on the host, because the mask
         applies them. The caller passes ``has_structured_outputs=False`` for
         the same reason.
+
+        ``spec_verify`` asks for the decision of an ``argmax_ids`` verify:
+        when the verify's payload serves every logprobs request among the
+        rows (``_spec_payload_serves``), the device-logprobs rules, which
+        describe the device sampler's own logprobs, do not apply.
         """
         want_device_sampling = self.sample_on_device_mode == "all" or (
             self.sample_on_device_mode == "decode_only" and is_decode
@@ -4738,6 +4885,12 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             # contract. Keep vLLM's host path rather than publish incomplete
             # or force-argmax placeholder metadata.
             return False
+        if (
+            max_lp is not None
+            and spec_verify
+            and self._spec_verify_serves_logprobs(sampling_rows)
+        ):
+            return True
         if max_lp is not None:
             if num_devices not in (8, 32):
                 return False
@@ -4745,6 +4898,26 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 return False
 
         return True
+
+    def _spec_verify_serves_logprobs(self, rows: list[int] | None) -> bool:
+        """Whether an ``argmax_ids`` verify's payload serves every logprobs
+        request among the persistent batch's ``rows`` (all rows for
+        ``None``), on a model declaring ``supports_spec_device_logprobs``."""
+        if not self._declares_spec_device_logprobs():
+            return False
+        batch = self.input_batch
+        if rows is None:
+            rows = list(batch.req_id_to_index.values())
+        asking = [
+            batch.req_ids[row]
+            for row in rows
+            if int(batch.sampling.num_logprobs[row]) >= 0
+        ]
+        return all(
+            self._spec_payload_serves(req_id)
+            for req_id in asking
+            if req_id is not None and req_id in self.requests
+        )
 
     def submit_prefill(
         self,
