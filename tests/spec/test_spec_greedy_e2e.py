@@ -718,7 +718,7 @@ def test_a_verify_answering_in_another_mode_is_refused():
     assert TTModelRunner._spec_mode_for_step(chooser, ["r"]) == ACCEPT_MODE_FUSED_SAMPLE
     chooser = SimpleNamespace(
         _spec_accept_modes=(ACCEPT_MODE_FUSED_SAMPLE, ACCEPT_MODE_LOGITS),
-        _request_is_argmax_certifiable=lambda req_id, sampled: req_id == "g",
+        _request_is_argmax_certifiable=lambda req_id, sampled, masked: req_id == "g",
     )
     assert TTModelRunner._spec_mode_for_step(chooser, ["g"]) == ACCEPT_MODE_FUSED_SAMPLE
     assert TTModelRunner._spec_mode_for_step(chooser, ["g", "s"]) == ACCEPT_MODE_LOGITS

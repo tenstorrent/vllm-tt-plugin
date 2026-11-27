@@ -491,6 +491,31 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
         self._model_input = replace(model_input, spec_predecessor=None)
         self.chain_filled = True
 
+    @property
+    def sampling_deferred(self) -> bool:
+        """Whether this token-masked verify still waits for ``sample_deferred``."""
+        return self._submission.deferred_device_sampling
+
+    def sample_deferred(
+        self, token_mask: torch.Tensor | None, num_valid_drafts: torch.Tensor
+    ) -> None:
+        """Sample this token-masked verify under ``token_mask`` and start its read.
+
+        Called once, at ``sample_tokens`` on the engine thread, before anything
+        resolves the step (``TTAsyncDecodeController.complete_deferred_spec_sampling``).
+        ``num_valid_drafts`` replaces the submitted counts for the walk.
+        """
+        self._submission = self._controller.complete_deferred_spec_sampling(
+            self._submission,
+            self._model_input,
+            token_mask,
+            num_valid_drafts,
+            async_read=True,
+        )
+        self._model_input = replace(
+            self._model_input, num_valid_drafts=num_valid_drafts
+        )
+
     def set_grammar_bitmask(
         self, bitmask: torch.Tensor, *, num_valid_drafts: torch.Tensor
     ) -> None:
@@ -517,6 +542,11 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
         )
 
     def _get_output_impl(self) -> ModelRunnerOutput:
+        if self.sampling_deferred:
+            raise RuntimeError(
+                "a token-masked verify was read before sample_tokens sampled it; "
+                "vLLM calls sample_tokens for a step before it reads the step"
+            )
         if not self.chain_filled:
             raise RuntimeError(
                 "a chained verify was read before its predecessor's commit "
@@ -571,6 +601,11 @@ class TTAsyncDecodeController:
         # Prefills submitted behind an unread verify
         # (``spec_chain.prefill_over_pending``).
         self._prefills_over_pending = 0
+        # Verifies by the accept mode they asked for, and the ``argmax_ids``
+        # verifies whose draws a device token mask constrained
+        # (``supports_spec_device_mask``).
+        self._verify_submissions_by_mode: Counter[str] = Counter()
+        self._token_masked_verify_submissions = 0
 
     @staticmethod
     def _page_table_inputs(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
@@ -966,6 +1001,10 @@ class TTAsyncDecodeController:
             self._chained_verify_submissions += (
                 getattr(model_input, "spec_predecessor", None) is not None
             )
+            self._verify_submissions_by_mode[model_input.spec_mode] += 1
+            self._token_masked_verify_submissions += bool(
+                getattr(model_input, "defer_device_sampling", False)
+            )
         total = self._ordinary_decode_submissions + self._verify_submissions
         if total % _SUBMISSION_LOG_INTERVAL == 0:
             logger.info(
@@ -975,6 +1014,13 @@ class TTAsyncDecodeController:
                 self._verify_submissions,
                 self._overlapped_submissions,
             )
+            if self._verify_submissions:
+                logger.info(
+                    "TT verifies by accept mode: %s; %d of them sampled under a "
+                    "device token mask",
+                    dict(sorted(self._verify_submissions_by_mode.items())),
+                    self._token_masked_verify_submissions,
+                )
             if self._chained_verify_submissions or self._chain_drains:
                 logger.info(
                     "TT chained verifies: %d of %d verifies; builds that "
@@ -1467,12 +1513,16 @@ class TTAsyncDecodeController:
 
         A ``chained`` verify (``spec_chain``) is the one built to be
         submitted over an outstanding step: the unread verify it continues.
+
+        A token-masked verify (``defer_device_sampling``) submits its forward
+        only; ``AsyncTTSpecDecodeOutput.sample_deferred`` samples it and starts
+        its read at ``sample_tokens``, before anything can resolve it.
         """
         event = threading.Event()
         submission = self.submit_decode(
             model_input,
             read_from_device=False,
-            async_read=True,
+            async_read=not model_input.defer_device_sampling,
         )
         if submission.tt_out is None:
             event.set()
@@ -1662,7 +1712,9 @@ class TTAsyncDecodeController:
             device_sampling_params = type(sampling_params)(**sampling_param_dict)
             if deferred_device_sampling:
                 kwargs["defer_device_sampling"] = True
-            else:
+            if not deferred_device_sampling or spec_predecessor is not None:
+                # A chained token-masked verify also takes them now: its chain
+                # program derives each drawing row's seeds on the device.
                 kwargs["sampling_params"] = device_sampling_params
             if model_input.prompt_tokens is not None:
                 assert model_input.output_tokens is not None
@@ -1729,7 +1781,12 @@ class TTAsyncDecodeController:
         spec_hidden = None
         verify_output = None
         requested_spec_mode = kwargs.get("spec_mode")
-        if requested_spec_mode is not None:
+        if requested_spec_mode is not None and deferred_device_sampling:
+            # A token-masked verify returns the model's opaque payload, which
+            # ``complete_deferred_spec_sampling`` hands back at sample time for
+            # the VerifyOutput.
+            pass
+        elif requested_spec_mode is not None:
             # A verify returns its mode's tensor inside a VerifyOutput, which
             # the read path below and every consumer above expect as a plain
             # host tensor. Unwrapped here, at the one boundary the model
@@ -1841,6 +1898,73 @@ class TTAsyncDecodeController:
         self._decode_chain_valid = False
         self._submitted_page_tables = None
         self.runner._poison_device_grammar()
+
+    def complete_deferred_spec_sampling(
+        self,
+        submission: TTDecodeSubmission,
+        model_input: TTModelInput,
+        token_mask: torch.Tensor | None,
+        num_valid_drafts: torch.Tensor,
+        *,
+        async_read: bool,
+    ) -> TTDecodeSubmission:
+        """Sample a token-masked verify and, with ``async_read``, start its read.
+
+        Calls the model's ``sample_deferred_decode`` with the submission's
+        payload and device sampling parameters, the step's ``token_mask``
+        (``[rows, 1+K, W]`` int32, or ``None`` when no row is constrained) and
+        ``num_valid_drafts`` (``[rows]``, at most the submitted counts). Returns
+        the submission with the verify's unwrapped ids handle, its
+        ``VerifyOutput`` and hidden handle, and no sampling left. Any failure
+        is terminal: the forward ran and the model's sampler state may be
+        partly advanced, so the runner is poisoned
+        (``fail_deferred_device_sampling``) and the exception propagates.
+        """
+        model = self.runner.model
+        if not submission.deferred_device_sampling or model_input.spec_mode is None:
+            raise ValueError(
+                "complete_deferred_spec_sampling takes a verify submitted with "
+                f"deferred sampling; deferred={submission.deferred_device_sampling}, "
+                f"spec_mode={model_input.spec_mode!r}"
+            )
+        sample = getattr(model, "sample_deferred_decode", None)
+        try:
+            if not callable(sample):
+                raise AttributeError(
+                    f"TT model {type(model).__name__} declares "
+                    "supports_spec_device_mask but has no sample_deferred_decode()"
+                )
+            verify = sample(
+                submission.tt_out,
+                sampling_params=submission.device_sampling_params,
+                grammar_bitmask=token_mask,
+                num_valid_drafts=num_valid_drafts,
+            )
+            tt_out = _verify_output_tensor(
+                verify, type(model).__name__, model_input.spec_mode
+            )
+            read_events = None
+            if async_read:
+                if hasattr(model, "read_decode_output"):
+                    tt_out, read_events = model.read_decode_output(
+                        tt_out, async_read=True
+                    )
+                elif not _is_host_decode_output(tt_out):
+                    raise AttributeError(
+                        "TT model must implement read_decode_output() "
+                        "unless sample_deferred_decode() returns host tensors"
+                    )
+        except Exception:
+            self.fail_deferred_device_sampling()
+            raise
+        return replace(
+            submission,
+            tt_out=tt_out,
+            read_events=read_events,
+            deferred_device_sampling=False,
+            verify_output=verify,
+            spec_hidden=verify.hidden,
+        )
 
     def complete_deferred_device_sampling(
         self,

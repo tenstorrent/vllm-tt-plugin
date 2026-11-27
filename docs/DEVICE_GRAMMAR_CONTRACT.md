@@ -208,7 +208,9 @@ device:
 - row-sharded sampling (`sampling_dp > 1`);
 - speculative decoding: a `logits` verify applies the grammar on the host, and
   a launch whose model serves only `argmax_ids` rejects structured requests at
-  admission;
+  admission. A model declaring `supports_spec_device_mask` takes the grammar
+  on its `argmax_ids` verifies through its own deferred call instead
+  ([SPEC_DECODE_CONTRACT.md, section 4j](SPEC_DECODE_CONTRACT.md#4j-token-masked-verifies-supports_spec_device_mask));
 - block-output models;
 - host-only options (`min_p`, `logit_bias`, `bad_words`, `allowed_token_ids`,
   `min_tokens`, custom logits processors).
