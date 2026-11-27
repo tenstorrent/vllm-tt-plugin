@@ -210,7 +210,7 @@ login()
 
 For the target model, follow any setup instructions in the corresponding
 tt-metal demo. For Llama 3.1, Llama 3.2, and Qwen 2.5 models, follow the
-[tt-transformers demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers)
+[ttt_compat demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/ttt_compat)
 for weights and environment variables.
 
 ## Running The Offline Inference Example
@@ -686,7 +686,10 @@ The registration environment variables, in the order they are consulted:
 `TT_MODEL_CLASS_OVERRIDES`, `EXTRA_MODELS_DIR`, then the built-in map
 (`TT_VLLM_BUILTIN_MODELS=0` disables it). `TT_LLAMA_TEXT_VER`,
 `TT_QWEN3_TEXT_VER` and `TT_QWEN35_TEXT_VER` select a version WITHIN a built-in
-family and are unrelated to the above.
+family and are unrelated to the above. `TT_LLAMA_TEXT_VER` and
+`TT_QWEN3_TEXT_VER` default to `ttt_compat`. Their value `tt_transformers` is
+deprecated and will be removed in a future release: it still selects
+`ttt_compat` but logs a warning. Unset these variables instead.
 
 ## Speculative Decoding
 

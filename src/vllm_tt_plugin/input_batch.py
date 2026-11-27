@@ -341,6 +341,11 @@ class SamplingInputBatch:
         # req_index -> bad_words_token_ids
         self.bad_words_token_ids: dict[int, list[list[int]]] = {}
 
+        # req_index -> SamplingParams.logprob_token_ids. Kept apart from
+        # num_logprobs, as upstream does: a row that names its tokens asks for
+        # their full-vocabulary logprobs, not for a top-N.
+        self.logprob_token_ids: dict[int, list[int]] = {}
+
     def has_active_logitsprocs(self) -> bool:
         """True if any logits processors have active per-request state."""
         for proc in self.logitsprocs.all:
@@ -612,6 +617,14 @@ class InputBatch:
         else:
             self.sampling.num_logprobs[req_index] = LOGPROBS_NONE_SENTINEL
 
+        # Pop on every add: a reused row must not keep the previous request's ids.
+        if not self.disable_logprobs and sampling_params.logprob_token_ids:
+            self.sampling.logprob_token_ids[req_index] = list(
+                sampling_params.logprob_token_ids
+            )
+        else:
+            self.sampling.logprob_token_ids.pop(req_index, None)
+
         # Allowed token IDs
         if sampling_params.allowed_token_ids:
             self.sampling.has_allowed_token_ids.add(req_id)
@@ -660,6 +673,7 @@ class InputBatch:
         self.sampling.generators.pop(req_index, None)
         self.sampling.has_allowed_token_ids.discard(req_id)
         self.sampling.bad_words_token_ids.pop(req_index, None)
+        self.sampling.logprob_token_ids.pop(req_index, None)
         # Clear the allowlist mask row so a stale "disallowed" set can never
         # survive into a request that later reuses this slot.
         if self.sampling.allowed_token_ids_mask is not None:
@@ -747,6 +761,11 @@ class InputBatch:
             if last_req_index in self.sampling.bad_words_token_ids:
                 self.sampling.bad_words_token_ids[empty_index] = (
                     self.sampling.bad_words_token_ids.pop(last_req_index)
+                )
+
+            if last_req_index in self.sampling.logprob_token_ids:
+                self.sampling.logprob_token_ids[empty_index] = (
+                    self.sampling.logprob_token_ids.pop(last_req_index)
                 )
 
             # Move allowed_token_ids_mask row
@@ -1300,6 +1319,11 @@ class TTLaneInputBatch(InputBatch):
             for i, row in enumerate(rows)
             if row in sampling.bad_words_token_ids
         }
+        logprob_token_ids = {
+            i: sampling.logprob_token_ids[row]
+            for i, row in enumerate(rows)
+            if row in sampling.logprob_token_ids
+        }
         if not no_penalties:
             prompt_token_ids = self.make_prompt_token_ids_tensor(rows).to(torch.int64)
             prompt_token_ids = prompt_token_ids.masked_fill(
@@ -1351,6 +1375,7 @@ class TTLaneInputBatch(InputBatch):
                 i: generators[row] for i, row in enumerate(rows) if row in generators
             },
             max_num_logprobs=self.max_num_logprobs,
+            logprob_token_ids=logprob_token_ids or None,
             no_penalties=no_penalties,
             prompt_token_ids=prompt_token_ids,
             frequency_penalties=frequency,
