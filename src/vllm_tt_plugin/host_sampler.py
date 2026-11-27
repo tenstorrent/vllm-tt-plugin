@@ -6,10 +6,11 @@
 import os
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import Lock
 
 import torch
+from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.ops.topk_topp_sampler import (
     TopKTopPSampler,
     apply_top_k_top_p,
@@ -169,7 +170,66 @@ class TTTopKTopPSampler(TopKTopPSampler):
         return tokens, scores
 
 
+class _MixedLogprobRows(dict):
+    """``SamplingMetadata.logprob_token_ids`` for a batch that also has top-N
+    rows. Carries the batch top-N width into
+    ``TTHostSampler.gather_specific_token_logprobs``."""
+
+    def __init__(self, logprob_token_ids: dict[int, list[int]], num_logprobs: int):
+        super().__init__(logprob_token_ids)
+        self.num_logprobs = num_logprobs
+
+
+def _pad_columns(t: torch.Tensor, width: int, value) -> torch.Tensor:
+    return torch.nn.functional.pad(t, (0, width - t.shape[1]), value=value)
+
+
 class TTHostSampler(Sampler):
+    def forward(
+        self,
+        logits,
+        sampling_metadata,
+        predict_bonus_token=False,
+        logprobs_mode_override=None,
+    ):
+        # Upstream V1 returns the named-token result for every row when any
+        # row names ids, so a top-N row gets its sampled token plus padding.
+        # Clearing max_num_logprobs makes upstream return the
+        # gather_specific_token_logprobs result as is, which here holds the
+        # right columns for each row.
+        num_logprobs = sampling_metadata.max_num_logprobs
+        if sampling_metadata.logprob_token_ids and num_logprobs is not None:
+            sampling_metadata = replace(
+                sampling_metadata,
+                max_num_logprobs=None,
+                logprob_token_ids=_MixedLogprobRows(
+                    sampling_metadata.logprob_token_ids, num_logprobs
+                ),
+            )
+        return super().forward(
+            logits, sampling_metadata, predict_bonus_token, logprobs_mode_override
+        )
+
+    def gather_specific_token_logprobs(self, logprobs, logprob_token_ids, sampled):
+        named = super().gather_specific_token_logprobs(
+            logprobs, logprob_token_ids, sampled
+        )
+        if not isinstance(logprob_token_ids, _MixedLogprobRows):
+            return named
+        top = self.gather_logprobs(
+            logprobs, logprob_token_ids.num_logprobs, token_ids=sampled
+        )
+        # Both results hold the sampled token in column 0 and its rank. The
+        # output processor keeps num_logprobs + 1 columns of each request, so
+        # the padding (token 0, -inf) of the wider layout never reaches it.
+        width = max(top.logprob_token_ids.shape[1], named.logprob_token_ids.shape[1])
+        token_ids = _pad_columns(top.logprob_token_ids, width, 0)
+        values = _pad_columns(top.logprobs, width, float("-inf"))
+        rows = torch.tensor(sorted(logprob_token_ids), device=logprobs.device)
+        token_ids[rows] = _pad_columns(named.logprob_token_ids, width, 0)[rows]
+        values[rows] = _pad_columns(named.logprobs, width, float("-inf"))[rows]
+        return LogprobsTensors(token_ids, values, top.selected_token_ranks)
+
     @staticmethod
     def apply_temperature(logits, temp, all_random):
         # CPU metadata needs no synchronization. Avoid touching the entire

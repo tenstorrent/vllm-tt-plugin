@@ -2950,6 +2950,10 @@ class TTPlatform(Platform):
         unsupported = []
         if params.logit_bias:
             unsupported.append("logit_bias")
+        # Refused in both accept modes: the logits verify walk reads
+        # SpecSamplingInputs, which carries top-N logprobs only.
+        if params.logprob_token_ids is not None:
+            unsupported.append("logprob_token_ids")
         # temperature and the penalties are absent: those requests speculate
         # in logits mode, or decode without speculation. ``sampled`` below
         # covers a launch that has neither.
