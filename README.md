@@ -648,7 +648,7 @@ under the plugin's `TT`-prefixed convention (`TT<HFArch>`) pointing at `main_cla
 Optional fields in `vllm_metadata.json`:
 
 - `register_bare_arch`: set to `true` to also register the unprefixed `arch` name
-  (using if-missing precedence, so `TT_MODEL_CLASS_OVERRIDES` still wins).
+  (replacing upstream `vllm.*` entries while preserving `TT_MODEL_CLASS_OVERRIDES`).
 - `hf_config`: register an out-of-tree Transformers `model_type` with `AutoConfig`
   (either `"<model_type>"` for a plain `PretrainedConfig`, or
   `{"model_type": "<model_type>", "config_class": "module:ConfigClass"}`).

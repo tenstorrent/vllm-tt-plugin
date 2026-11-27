@@ -150,9 +150,9 @@ def test_extra_dir_registers_custom_hf_config_class_from_bundle(
 
 
 def test_extra_dir_skips_invalid_hf_config_without_dropping_model(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):
-    _write_bundle(
+    folder = _write_bundle(
         tmp_path,
         "bad_cfg",
         {
@@ -161,9 +161,103 @@ def test_extra_dir_skips_invalid_hf_config_without_dropping_model(
             "hf_config": {"model_type": "bad_cfg_type", "config_class": "no_colon"},
         },
     )
+    _write_bundle(
+        tmp_path,
+        "null_cfg",
+        {
+            "arch": "NullCfgForCausalLM",
+            "main_class": "null_adapter:NullModel",
+            "hf_config": None,
+        },
+    )
+    mismatch_folder = _write_bundle(
+        tmp_path,
+        "mismatch_cfg",
+        {
+            "arch": "MismatchCfgForCausalLM",
+            "main_class": "mismatch_adapter:MismatchModel",
+            "hf_config": {
+                "model_type": "expected_model_type",
+                "config_class": "bundle_mismatch_cfg_mod:MismatchBundleConfig",
+            },
+        },
+    )
+    (mismatch_folder / "bundle_mismatch_cfg_mod.py").write_text(
+        "from transformers import PretrainedConfig\n"
+        "class MismatchBundleConfig(PretrainedConfig):\n"
+        "    model_type = 'different_model_type'\n"
+    )
+    assert folder.is_dir()
     monkeypatch.setenv("EXTRA_MODELS_DIR", str(tmp_path))
     monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.delitem(sys.modules, "bundle_mismatch_cfg_mod", raising=False)
 
     reg = _FakeRegistry()
-    assert tt_platform._register_models_from_extra_dir(reg) == 1
-    assert reg.models == {"TTBadCfgForCausalLM": "bad_adapter:BadModel"}
+    with caplog.at_level("WARNING"):
+        assert tt_platform._register_models_from_extra_dir(reg) == 3
+
+    assert reg.models == {
+        "TTBadCfgForCausalLM": "bad_adapter:BadModel",
+        "TTNullCfgForCausalLM": "null_adapter:NullModel",
+        "TTMismatchCfgForCausalLM": "mismatch_adapter:MismatchModel",
+    }
+    assert any("NoneType" in r.message for r in caplog.records)
+    assert any("AutoConfig.register failed" in r.message for r in caplog.records)
+
+
+def test_extra_dir_bare_arch_replaces_upstream_vllm_entry_and_serves_kolibri1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A bundle with register_bare_arch + hf_config replaces upstream's bare
+    vllm.* entry and makes Kolibri1 loadable even with built-ins disabled."""
+    from transformers import AutoConfig, PretrainedConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    kolibri_target = (
+        "models.autoports.aleph_alpha_kolibri_1_bf16.tt.generator_vllm:"
+        "KolibriForCausalLM"
+    )
+    _write_bundle(
+        tmp_path,
+        "kolibri1",
+        {
+            "arch": "Kolibri1ForCausalLM",
+            "main_class": kolibri_target,
+            "register_bare_arch": True,
+            "hf_config": "kolibri1",
+        },
+    )
+
+    saved_models = dict(ModelRegistry.models)
+    saved_extra = dict(CONFIG_MAPPING._extra_content)
+    monkeypatch.setattr(ModelRegistry, "models", saved_models)
+    monkeypatch.setattr(CONFIG_MAPPING, "_extra_content", saved_extra)
+    saved_extra.pop("kolibri1", None)
+    # Seed a vllm.* entry for the bare arch (matching upstream vLLM).
+    ModelRegistry.register_model(
+        "Kolibri1ForCausalLM",
+        "vllm.model_executor.models.transformers:TransformersForCausalLM",
+    )
+    saved_models.pop("TTKolibri1ForCausalLM", None)
+
+    monkeypatch.setenv("EXTRA_MODELS_DIR", str(tmp_path))
+    monkeypatch.setenv("TT_VLLM_BUILTIN_MODELS", "0")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+
+    tt_platform.register_tt_models()
+
+    for arch in ("Kolibri1ForCausalLM", "TTKolibri1ForCausalLM"):
+        entry = ModelRegistry.models[arch]
+        assert f"{entry.module_name}:{entry.class_name}" == kolibri_target
+
+    cfg = AutoConfig.for_model(
+        "kolibri1", num_hidden_layers=50, sliding_window=513, layer_types=["x"]
+    )
+    assert isinstance(cfg, PretrainedConfig)
+    assert cfg.model_type == "kolibri1"
+    assert (cfg.num_hidden_layers, cfg.sliding_window, cfg.layer_types) == (
+        50,
+        513,
+        ["x"],
+    )

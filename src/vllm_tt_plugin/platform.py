@@ -1492,7 +1492,16 @@ def _register_extra_hf_config(folder: str, hf_config_spec: object) -> None:
             return
         config_cls = candidate
 
-    AutoConfig.register(model_type, config_cls, exist_ok=True)
+    try:
+        AutoConfig.register(model_type, config_cls, exist_ok=True)
+    except Exception as exc:
+        logger.warning(
+            "Skipping hf_config '%s' in %s: AutoConfig.register failed (%s).",
+            model_type,
+            folder,
+            exc,
+        )
+        return
     logger.info(
         "Registered HF AutoConfig '%s' -> %s (from EXTRA_MODELS_DIR/%s)",
         model_type,
@@ -1577,15 +1586,14 @@ def _register_models_from_extra_dir(ModelRegistry) -> int:
         if folder not in sys.path:
             sys.path.append(folder)
 
-        hf_config_spec = metadata.get("hf_config")
-        if hf_config_spec is not None:
-            _register_extra_hf_config(folder, hf_config_spec)
+        if "hf_config" in metadata:
+            _register_extra_hf_config(folder, metadata["hf_config"])
 
         tt_arch = arch if arch.startswith("TT") else "TT" + arch
         _register_model_if_missing(ModelRegistry, tt_arch, main_class)
 
         if metadata.get("register_bare_arch") is True and arch != tt_arch:
-            _register_model_if_missing(ModelRegistry, arch, main_class)
+            _register_model_over_upstream(ModelRegistry, arch, main_class)
 
         logger.info(
             "Registered TT model %s -> %s (from EXTRA_MODELS_DIR/%s)",
