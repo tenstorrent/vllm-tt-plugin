@@ -13,7 +13,11 @@ from types import SimpleNamespace
 import pytest
 import vllm  # noqa: F401  (resolve the platform plugin before importing ours)
 
-from vllm_tt_plugin.config import get_tt_prefill_chunk_alignment
+from vllm_tt_plugin.config import (
+    get_tt_prefill_chunk_alignment,
+    get_tt_supports_prefill_resume_inside_kv_block,
+    validate_and_store_tt_supports_prefill_resume_inside_kv_block,
+)
 from vllm_tt_plugin.scheduler import (
     TTScheduler,
     _effective_prefill_step_limit,
@@ -111,6 +115,59 @@ def test_config_accessor_defaults_and_validates():
     assert get_tt_prefill_chunk_alignment(cfg) == 0
     cfg = SimpleNamespace(additional_config={"tt": {"prefill_chunk_alignment": -8}})
     with pytest.raises(ValueError):
+        get_tt_prefill_chunk_alignment(cfg)
+
+
+class _Model:
+    pass
+
+
+@pytest.mark.parametrize(
+    ("declared", "stored"), [({}, True), (None, True), (True, True), (False, False)]
+)
+def test_supports_prefill_resume_inside_kv_block_is_stored(declared, stored):
+    """The platform stores the declaration, True when absent."""
+    cfg = SimpleNamespace(additional_config={})
+    capabilities = (
+        declared
+        if not isinstance(declared, bool)
+        else {"supports_prefill_resume_inside_kv_block": declared}
+    )
+    validate_and_store_tt_supports_prefill_resume_inside_kv_block(
+        cfg, capabilities, _Model
+    )
+    assert get_tt_supports_prefill_resume_inside_kv_block(cfg) is stored
+    assert get_tt_supports_prefill_resume_inside_kv_block(SimpleNamespace()) is True
+
+
+def test_a_non_boolean_prefill_resume_declaration_is_rejected():
+    with pytest.raises(
+        ValueError,
+        match=r"supports_prefill_resume_inside_kv_block'\] as a boolean, got 0",
+    ):
+        validate_and_store_tt_supports_prefill_resume_inside_kv_block(
+            SimpleNamespace(additional_config={}),
+            {"supports_prefill_resume_inside_kv_block": 0},
+            _Model,
+        )
+
+
+def test_the_declaration_alone_aligns_chunks_to_the_kv_block():
+    """A model without MambaSpec groups that declares
+    supports_prefill_resume_inside_kv_block False gets the attention block size,
+    cache_config.block_size, as its alignment; a MambaSpec block size passed
+    by the scheduler counts only with that declaration."""
+    cfg = SimpleNamespace(
+        additional_config={"tt": {}}, cache_config=SimpleNamespace(block_size=256)
+    )
+    assert get_tt_prefill_chunk_alignment(cfg, 1024) == 128
+    validate_and_store_tt_supports_prefill_resume_inside_kv_block(
+        cfg, {"supports_prefill_resume_inside_kv_block": False}, _Model
+    )
+    assert get_tt_prefill_chunk_alignment(cfg) == 256
+    assert get_tt_prefill_chunk_alignment(cfg, 1024) == 1024
+    cfg.additional_config["tt"] = {"prefill_chunk_alignment": 128}
+    with pytest.raises(ValueError, match="not a positive multiple of the KV block"):
         get_tt_prefill_chunk_alignment(cfg)
 
 

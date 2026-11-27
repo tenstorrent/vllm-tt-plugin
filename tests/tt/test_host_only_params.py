@@ -6,12 +6,31 @@ Tests for sampling parameters which require host ("compat") sampling.
 
 import string
 
+import openai
+import pytest
+
 from tests.tt.utils import RequestConfig, run_concurrent_batch
 
 
+def _assert_refused(tt_server, tt_model_name, config):
+    """vLLM's ``SamplingParams`` validation refuses min_p and logit_bias when
+    ``speculative_config`` is set, so a speculating server must answer 400
+    rather than serve the request without them."""
+    with pytest.raises(openai.BadRequestError) as refused:
+        run_concurrent_batch(tt_server, tt_model_name, [config])
+    assert refused.value.status_code == 400
+
+
 class TestHostOnlyParameters:
-    def test_min_p(self, tt_server, tt_model_name, max_batch_size):
+    def test_min_p(self, tt_server, tt_model_name, max_batch_size, server_speculates):
         """Test min_p parameter (smoke test - verifies it doesn't error)."""
+        if server_speculates:
+            _assert_refused(
+                tt_server,
+                tt_model_name,
+                RequestConfig(prompt="Random: ", max_tokens=10, min_p=0.1),
+            )
+            return
         configs = [
             RequestConfig(prompt="Random: ", max_tokens=10, min_p=0.1),
             RequestConfig(prompt="Random: ", max_tokens=10, min_p=0.2),
@@ -65,8 +84,19 @@ class TestHostOnlyParameters:
                     f"in response {i}: {text!r}"
                 )
 
-    def test_logit_bias(self, tt_server, tt_model_name, max_batch_size):
+    def test_logit_bias(
+        self, tt_server, tt_model_name, max_batch_size, server_speculates
+    ):
         """Test logit_bias parameter (smoke test)."""
+        if server_speculates:
+            _assert_refused(
+                tt_server,
+                tt_model_name,
+                RequestConfig(
+                    prompt="Logit bias: ", max_tokens=10, logit_bias={1: 0.1}
+                ),
+            )
+            return
         configs = [
             RequestConfig(prompt="Logit bias: ", max_tokens=10, logit_bias={1: 0.1}),
             RequestConfig(prompt="Logit bias: ", max_tokens=10, logit_bias={4: 0.2}),

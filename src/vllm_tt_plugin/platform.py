@@ -25,6 +25,7 @@ from vllm_tt_plugin.config import (
     get_tt_output_tokens_per_step,
     get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
+    get_tt_supports_multimodal_prefill_resume,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
@@ -35,11 +36,14 @@ from vllm_tt_plugin.config import (
     store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
+    store_tt_prefill_over_pending_spec,
     store_tt_spec_plan,
     store_tt_supports_device_grammar,
     tt_requests_cannot_resume,
     uses_tt_lane_coordinator,
+    validate_and_store_tt_supports_multimodal_prefill_resume,
     validate_and_store_tt_supports_prefill_next_token_ids,
+    validate_and_store_tt_supports_prefill_resume_inside_kv_block,
     validate_and_store_tt_supports_stage_inputs,
     validate_tt_kv_transfer_config,
     validate_tt_lane_config,
@@ -50,6 +54,8 @@ from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.spec_admission import (
     MODEL_OWNED_DRAFT_METHOD,
     resolve_speculative_plan,
+    validate_chained_spec_verify,
+    validate_prefill_over_pending_spec,
 )
 from vllm_tt_plugin.spec_decode import ACCEPT_MODE_FUSED_SAMPLE, ACCEPT_MODE_LOGITS
 from vllm_tt_plugin.utils.dp_discovery import (
@@ -324,6 +330,38 @@ def _renormalize_mamba_cache_config(vllm_config: "VllmConfig") -> None:
         "max_model_len=%d and mamba_cache_mode to 'none'.",
         cache_config.mamba_block_size,
     )
+
+
+def _declares_mamba_spec(vllm_config: "VllmConfig", model_class: type) -> bool:
+    """Whether the model class declares ``MambaSpec`` layers.
+
+    The model class's ``get_kv_cache_spec`` runs only for an architecture for
+    which vLLM resolved a Mamba cache config (``cache_config.mamba_block_size``).
+    """
+    from vllm_tt_plugin.mamba_state import declares_mamba_spec
+
+    if getattr(vllm_config.cache_config, "mamba_block_size", None) is None:
+        return False
+    return declares_mamba_spec(model_class, vllm_config)
+
+
+def _allow_chunked_mm_input_in_mamba_align(vllm_config: "VllmConfig") -> None:
+    """Clear ``disable_chunked_mm_input`` for a ``MambaSpec`` model in mode align.
+
+    ``VllmConfig.validate_block_size`` rejects ``disable_chunked_mm_input`` in
+    ``mamba_cache_mode`` "align", because vLLM's roll-back to the start of a
+    multimodal item would undo its block-aligned split.
+    ``_apply_chunked_prefill_policy`` sets the flag for every model with
+    chunked prefill. For a model that declares
+    ``supports_multimodal_prefill_resume`` False,
+    ``TTScheduler._multimodal_prefill_grant`` keeps every multimodal item of a
+    request in its first prefill chunk instead; a model that declares True
+    must continue a prefill that starts or ends inside a multimodal item. Must
+    run after prefix caching is resolved: turning prefix caching off resets the
+    mode to "none".
+    """
+    if getattr(vllm_config.cache_config, "mamba_cache_mode", None) == "align":
+        vllm_config.scheduler_config.disable_chunked_mm_input = False
 
 
 def _galaxy_generator_version() -> str | None:
@@ -2210,10 +2248,17 @@ class TTPlatform(Platform):
             model_class, "model_capabilities", None
         )
 
+        declares_mamba_spec = _declares_mamba_spec(vllm_config, model_class)
+        validate_and_store_tt_supports_multimodal_prefill_resume(
+            vllm_config, model_capabilities, model_class
+        )
         # Rewrites scheduler_config; nothing between here and the closing
         # ``verify_max_model_len`` reads the fields it touches.
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
         _validate_and_log_decode_interleave_policy(vllm_config)
+        validate_and_store_tt_supports_prefill_resume_inside_kv_block(
+            vllm_config, model_capabilities, model_class
+        )
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
         if output_tokens_per_step > 1 and seeded_sampling_policy == "host":
             raise ValueError(
@@ -2386,6 +2431,8 @@ class TTPlatform(Platform):
             "Automatic prefix caching is %s",
             "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
         )
+        if declares_mamba_spec:
+            _allow_chunked_mm_input_in_mamba_align(vllm_config)
 
         if is_block_output_model:
             required_lifecycle_hooks = (
@@ -2619,6 +2666,14 @@ class TTPlatform(Platform):
                 model_class.__module__,
             )
             vllm_config.scheduler_config.async_scheduling = False
+
+        validate_chained_spec_verify(model_capabilities, model_class.__name__)
+        store_tt_prefill_over_pending_spec(
+            vllm_config,
+            validate_prefill_over_pending_spec(
+                model_capabilities, model_class.__name__
+            ),
+        )
 
         # Single-execute models (Galaxy generators, GPT-OSS under user-row
         # sharding) run one shared device execute on the full mesh, so
@@ -2998,6 +3053,40 @@ class TTPlatform(Platform):
         )
 
     @classmethod
+    def _reject_multimodal_prompt_longer_than_a_step(
+        cls, processed_inputs: "EngineInput"
+    ) -> None:
+        """Reject a multimodal prompt longer than one scheduler step for a
+        model that declares ``supports_multimodal_prefill_resume`` False.
+
+        ``TTScheduler._multimodal_prefill_grant`` prefills a multimodal prompt
+        of such a model in one scheduler step, so a longer prompt could never
+        be scheduled, even when each of its items fits a step.
+        """
+        from vllm.exceptions import VLLMValidationError
+
+        from vllm_tt_plugin.scheduler import multimodal_prefill_limit
+
+        if not processed_inputs.get("mm_placeholders"):
+            return
+        vllm_config = _tt_request_vllm_config.get()
+        if vllm_config is None:
+            vllm_config = cls._resolve_tt_admission_handle()
+        if vllm_config is None or get_tt_supports_multimodal_prefill_resume(
+            vllm_config
+        ):
+            return
+        prompt_len = len(processed_inputs.get("prompt_token_ids") or ())
+        limit, bound = multimodal_prefill_limit(vllm_config)
+        if prompt_len > limit:
+            raise VLLMValidationError(
+                f"This multimodal prompt has {prompt_len} tokens. This model "
+                "prefills a multimodal prompt from position 0 in one scheduler "
+                f"step, which holds at most {limit} prompt tokens ({bound}). "
+                "Send a shorter prompt, or raise that limit at launch."
+            )
+
+    @classmethod
     def validate_request(
         cls,
         processed_inputs: "EngineInput",
@@ -3017,6 +3106,8 @@ class TTPlatform(Platform):
 
         if isinstance(params, SamplingParams):
             cls._reject_unsupported_speculative_request(params)
+
+        cls._reject_multimodal_prompt_longer_than_a_step(processed_inputs)
 
         block_contract = cls._get_block_output_contract()
         if not isinstance(params, SamplingParams) or block_contract is None:

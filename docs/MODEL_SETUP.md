@@ -94,6 +94,8 @@ passed to `initialize_vllm_model`. The plugin uses `131_072` when the sizing
 call raises `AttributeError`, including when `get_max_tokens_all_users` is absent.
 The plugin adds output reservation and applicable sliding-window headroom.
 The plugin does not measure free device memory to choose this KV budget.
+A model with `MambaSpec` layers gets a different block count; see
+[Recurrent state](#recurrent-state-mambaspec).
 
 The optional class-callable `get_kv_cache_spec(vllm_config)` returns
 `dict[str, KVCacheSpec] | None`. `TTWorker.get_kv_cache_spec` uses a homogeneous
@@ -101,9 +103,10 @@ specification named `"foo"` when `get_kv_cache_spec` is absent or returns `None`
 For per-layer specifications, use names containing `layers.<index>`, such as
 `model.layers.5.self_attn`, and cover every attention-layer index.
 
-`TTModelRunner` accepts `AttentionSpec` groups and `UniformTypeKVCacheSpecs`
-groups. `UniformTypeKVCacheSpecs` can carry different per-layer shapes within
-one group. The worker advertises only the vLLM `LBNHC` cache layout.
+`TTModelRunner` accepts `AttentionSpec` groups, `UniformTypeKVCacheSpecs`
+groups, and `MambaSpec` groups next to attention groups.
+`UniformTypeKVCacheSpecs` can carry different per-layer shapes within one
+group. The worker advertises only the vLLM `LBNHC` cache layout.
 
 A stage with no token KV cache, such as an audio decoder, uses a `TTWorker`
 subclass that sets `uses_token_kv_cache = False`. That worker sizes no KV pool
@@ -120,6 +123,8 @@ Sources: `get_num_available_blocks_tt`, `TTWorker.get_kv_cache_spec`, and
 
 1. `TTModelRunner._build_per_layer_specs` translates the vLLM cache plan into
    `(shape, dtype, tensor_idx)` triples, ordered by attention-layer index.
+   With `MambaSpec` groups, the list covers every layer; see
+   [Recurrent state](#recurrent-state-mambaspec).
 2. `TTModelRunner._allocate_kv_caches` calls the instance's
    `allocate_kv_cache_per_layer(per_layer_specs)` when the adapter exposes it.
    Otherwise, `TTModelRunner._allocate_kv_caches` calls
@@ -137,7 +142,8 @@ a buffer. A single-group cache gives every attention layer a separate
 
 When vLLM creates multiple KV groups, `TTModelRunner` expands group page tables
 into `page_tables_per_layer`, ordered by attention-layer index. Prefill and
-decode receive `page_tables_per_layer` in addition to group 0's `page_table`.
+decode receive `page_tables_per_layer` in addition to group 0's `page_table`
+(with `MambaSpec` groups, `page_table` is the first attention group's table).
 Each per-layer tensor has shape
 `[tt_max_batch_size, max_num_blocks_per_req]`, with unused rows and columns
 zero-padded. The per-layer row capacity can exceed `tokens.shape[0]` during
@@ -155,3 +161,46 @@ and drafter addressing requirements in [the speculative contract](SPEC_DECODE_CO
 Sources: `_kv_cache_shape`, `_build_per_layer_specs`, `_block_tables_per_layer`,
 and `submit_prefill` in [model_runner.py](../src/vllm_tt_plugin/model_runner.py);
 `submit_decode` in [async_decode.py](../src/vllm_tt_plugin/async_decode.py).
+
+## Recurrent state (MambaSpec)
+
+A model with recurrent layers, such as gated delta network (GDN) layers, declares their state to vLLM: `get_kv_cache_spec` returns a `MambaSpec` for each recurrent layer and an attention specification for each attention layer. vLLM then owns the block ids of the recurrent state as it owns attention block ids, and the model keeps no persistent per-request recurrent state of its own. vLLM's hybrid KV cache manager puts the layers into KV cache groups of equal size, for example one attention group and three `MambaSpec` groups of 16 layers each for 16 attention and 48 GDN layers. Every group takes block ids from one pool, and vLLM overlays the groups on the same memory: block id `b` addresses the same bytes in every group, and one group owns a block id at a time. This section calls the memory that the layers at one position of each group share a **layer slot**. The plugin reports it as `tensor_idx`.
+
+The plugin identifies recurrent layers by the `MambaSpec` type of their specification, not by tensor shapes.
+
+Declaration rules:
+
+- `MambaSpec.shapes` and `MambaSpec.dtypes` describe the state of one layer on one device, convolution history included. The plugin passes them to the adapter unchanged.
+- vLLM requires one page size, in bytes per block per layer, across all groups. `unify_kv_cache_spec_page_size` pads a smaller `MambaSpec` page to the largest page. For a smaller attention page, it multiplies the attention `block_size` when the attention page divides the largest page, and pads the attention page otherwise. vLLM's `Platform.update_block_size_for_backend` returns before `_align_hybrid_block_size` on TT, because a TT model registers no vLLM attention layer for `_find_non_ssm_backends` to find, so the adapter chooses the attention `block_size` itself. Choose one that TT paged attention supports and whose page is at least the recurrent state, so that vLLM pads the `MambaSpec` page and keeps the attention `block_size`.
+- `MambaSpec.mamba_cache_mode` must equal the resolved `cache_config.mamba_cache_mode`, and the plugin supports modes `none` and `align`. vLLM's `MambaModelConfig` selects `none` when prefix caching is off and `align` when it is on. The platform turns prefix caching off for a model that does not declare `supports_prefix_caching`, so a model serves mode `align` only with that existing capability.
+- Mode `none`: a request holds one state block (plus the K speculative blocks described below) per `MambaSpec` group for its whole life, provided `MambaSpec.block_size` is at least `max_model_len`: declare `cache_config.mamba_block_size`, which vLLM resolves to `max_model_len` in mode `none`. With a smaller `block_size`, `MambaManager` allocates one block per `block_size` tokens.
+- Mode `align`: `MambaSpec.block_size` must equal the `block_size` of every attention specification, so that block-table column `p` covers the same tokens in every group, as upstream's `_align_hybrid_block_size` arranges on GPU. A request holds the block of its running state in each `MambaSpec` group, the K speculative blocks described below, and for one step also the block of its previous column; vLLM keeps some blocks for the prefix cache (see [request state](MODEL_LIFECYCLE.md#request-state)).
+- `MambaSpec.num_speculative_blocks` must equal the launch's `speculative_config.num_speculative_tokens` K, and 0 without speculative decoding, as upstream `MambaBase.get_kv_cache_spec` declares it. With K above 0, `MambaManager` gives a request K blocks past its running one in every `MambaSpec` group, and a verify writes the state after each of its `1 + K` query tokens into one of them (see [speculative verification](MODEL_EXECUTION.md#speculative-verification)).
+- Prefill chunks start and end on KV block boundaries for a model that declares `model_capabilities['supports_prefill_resume_inside_kv_block']` False (see [model capabilities](MODEL_CAPABILITIES.md)). The Qwen3.8 adapter declares False: it writes a chunk's attention keys and values only from the start of a KV block, and its attention block (512 or 1024 tokens) can be larger than the default 128-token chunk grid. For such a model `TTScheduler` defaults `additional_config['tt']['prefill_chunk_alignment']` to the attention block size (`mamba_attention_block_size`, the least common multiple of the attention groups' block sizes, or `cache_config.block_size` for a model without `MambaSpec` groups) and raises at startup, with both numbers, for an operator value that is not a positive multiple of it. Every chunk that does not finish its prompt then ends on a block boundary, in both cache modes. The scheduler's existing checks still apply: `max_num_batched_tokens` (and a positive `long_prefill_token_threshold`) must be at least the alignment. A model that declares True, or omits the key, keeps the 128-token default.
+- `MambaSpec.num_prefill_checkpoint_blocks` is 0, or in mode `align` 1 together with a positive `MambaSpec.prefill_checkpoint_alignment`, the same in every `MambaSpec` group. With 1, the model writes [prefill checkpoints](MODEL_EXECUTION.md#prefill-checkpoints) and vLLM can prefill a prompt that fits one step in one chunk; with 0, vLLM ends a chunk at the prompt's last cacheable position instead. vLLM counts the checkpoint block in `MambaSpec.max_memory_usage_bytes`.
+
+Unsupported launches fail at startup. `get_num_available_blocks_tt` runs in `TTWorker.init_device`, before the model loads, and raises `ValueError` for a model with `MambaSpec` layers when:
+
+- the launch runs single-process lane-DP.
+- the model is a block-output model (`output_tokens_per_step > 1`).
+- `mamba_cache_mode` is `all`.
+- mode `align` runs with a `prefix_cache_retention_interval` other than 0. A nonzero interval also keeps the state at block boundaries that decoding reaches, which TT has not validated. The message tells the operator to launch with `--prefix-cache-retention-interval 0`, vLLM's default.
+- mode `align` runs without chunked prefill. vLLM ends prefill chunks on block boundaries in mode `align` whether or not chunked prefill is on, so the model must declare `supports_chunked_prefill`. The message tells the operator to launch with `--no-enable-prefix-caching` otherwise.
+- a `MambaSpec` breaks a declaration rule above.
+
+A launch that accepts multimodal input keeps prefix caching and chunked prefill for text requests. A model that declares `model_capabilities['supports_multimodal_prefill_resume']` False computes a multimodal prompt only from position 0, so `TTScheduler` handles a multimodal request of such a model differently (see [Multimodal requests without prefill resume](SCHEDULING.md#multimodal-requests-without-prefill-resume)): the request never reads the prefix cache, and its first prefill chunk holds every multimodal item, the whole prompt when one step holds it. `TTPlatform.validate_request` rejects a multimodal prompt longer than one step. The Qwen3.8 adapter declares False, because it computes the M-RoPE positions and vision rows of a prefill step from that step's tokens. A model that declares True, or omits the key, keeps vLLM's multimodal rules. The platform finds `MambaSpec` layers by calling the model class's `get_kv_cache_spec`, for an architecture for which vLLM resolved a Mamba cache config (`cache_config.mamba_block_size`). For such a model in mode `align` the platform clears `scheduler_config.disable_chunked_mm_input`, which vLLM's `validate_block_size` forbids in mode `align`, so vLLM can end a prefill chunk inside a multimodal item of a model that declares True. In mode `align` `TTScheduler` refuses to start when `prefix_match_unit` is below the block size (vLLM's `mamba_partial_cache_hit`): vLLM would then end prefix-cache hits inside a block and copy that block for the hitting request, and TT copies no blocks (`MambaCacheGroups.refuse_block_copies`). So a model with `MambaSpec` groups runs mode `align` with `prefix_match_unit` unset or equal to the block size, and prefix-cache hits end on block boundaries, whatever it declares for `supports_prefill_resume_inside_kv_block`.
+
+`TTModelRunner.initialize_kv_cache` repeats the `MambaSpec` checks for the resolved KV cache groups, through `mamba_cache_groups`.
+
+Allocation:
+
+- `per_layer_specs` has one entry per layer that the groups name, in decoder-layer index order, so the list covers the recurrent layers between the attention layers. Layer names must contain `layers.<index>` with indices `0` to `len(per_layer_specs) - 1`.
+- An attention entry is `(shape, dtype, tensor_idx)`, as above. A `MambaSpec` entry is `(MambaSpec.shapes, MambaSpec.dtypes, tensor_idx)`.
+- The layer at position `j` of each group gets `tensor_idx` `j`. The adapter allocates the buffers of each `tensor_idx` from its attention entries and stores the state of each recurrent layer with that `tensor_idx` inside them, at the block ids the layer's group owns. `TTModelRunner` raises if a recurrent layer's `tensor_idx` has no attention layer.
+- The adapter must implement `allocate_kv_cache_per_layer` and `zero_kv_cache_blocks` (see [block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations)); `TTModelRunner.initialize_kv_cache` raises without `zero_kv_cache_blocks`. Prefill and decode receive `mamba_state`; see [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks).
+
+Block count: `get_num_available_blocks_tt` converts `max_tokens_all_users` to bytes per layer slot with the attention layers' bytes per token, then divides by the unified page size. A token count divided by `block_size` would ignore page padding. It then adds one block per running request in each attention group, for output, and the state blocks of every running request in each `MambaSpec` group, as `MambaSpec.max_memory_usage_bytes` counts them: one in mode `none`, two in mode `align`, one more with a prefill checkpoint block, and K more with speculative decoding. It also adds vLLM's null block 0, which `BlockPool` keeps out of every request. Blocks that vLLM keeps for the prefix cache use the remaining free blocks and are evicted when a request needs them. Each block is counted once, because all groups share it. A budget of `max_model_len` tokens therefore admits one request at `max_model_len`. Unlike the sliding-window path, the plugin does not grow this pool to upstream's admission floor: if the pool cannot admit one request at `max_model_len`, `get_num_available_blocks_tt` raises and names the two block counts. Lower `--max-model-len`, launch with `--max-model-len -1` to fit the length to the pool, or raise the model's `get_max_tokens_all_users` budget.
+
+Page tables: `page_tables_per_layer` has one entry per layer, and the entry of a recurrent layer is its group's table. vLLM orders the groups by specification, so group 0 can be a `MambaSpec` group; with `MambaSpec` groups, `page_table` is therefore the table of the first attention group, not of group 0. The table width `max_num_blocks_per_req` is the largest block-table row width over the groups, at most `num_blocks`, rounded up to a multiple of 8. A `MambaSpec` group's row width is `ceil(max_model_len / MambaSpec.block_size) + K`, as upstream `MambaSpec.max_num_blocks_per_req` computes it in mode `align`: one block in mode `none` and one per block of positions in mode `align`, plus the K speculative blocks. TT chunked SDPA requires a page-table row of a multiple of 32 bytes. `cache_config.block_size` does not set this width.
+
+Sources: `check_mamba_launch`, `mamba_cache_groups` and `MambaCacheGroups` in [mamba_state.py](../src/vllm_tt_plugin/mamba_state.py); `TTModelRunner.initialize_kv_cache` and `_build_per_layer_specs` in [model_runner.py](../src/vllm_tt_plugin/model_runner.py); `_mamba_hybrid_num_blocks` in [worker.py](../src/vllm_tt_plugin/worker.py).

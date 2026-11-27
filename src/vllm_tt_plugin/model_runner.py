@@ -20,10 +20,11 @@ from vllm.distributed.kv_transfer import has_kv_transfer_group
 from vllm.forward_context import set_forward_context
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
+    MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -40,6 +41,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunne
 
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
+    AsyncTTSpecDecodeOutput,
     CompletedDecodeStep,
     DeferredDecodeOutput,
     SubmittedStepContext,
@@ -78,6 +80,7 @@ from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.logprobs import build_device_logprobs
+from vllm_tt_plugin.mamba_state import MambaCacheGroups, mamba_cache_groups
 from vllm_tt_plugin.model_input import (
     TTModelInput,
     TTSamplingParams,
@@ -90,6 +93,14 @@ from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.pooling import execute_pooling_step, supported_pooling_tasks
 from vllm_tt_plugin.spec_accept import accept_sampled_drafts, spec_sampling_inputs
 from vllm_tt_plugin.spec_admission import method_requirements
+from vllm_tt_plugin.spec_chain import (
+    ChainPlan,
+    chained_rows,
+    check_chained_rows_certifiable,
+    fill_chained_input,
+    plan_chain,
+    prefill_over_pending,
+)
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_FUSED_SAMPLE,
@@ -465,6 +476,8 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         self.tt_data_parallel_size = get_tt_data_parallel_size(vllm_config)
         self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
         self.tt_per_lane_max_num_seqs = get_tt_per_lane_max_num_seqs(vllm_config)
+        # The KV cache config's MambaSpec groups, set by ``initialize_kv_cache``.
+        self._mamba_groups: MambaCacheGroups | None = None
 
         # req_id -> device slot holding its per-slot state (GDN recurrent/conv, seed
         # RNG, decode trace buffers). Needed because evict/re-add and condense move a
@@ -671,6 +684,17 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         """
         kv_cache_groups = kv_cache_config.kv_cache_groups
         self._validate_kv_cache_groups(kv_cache_groups)
+        self._mamba_groups = mamba_cache_groups(kv_cache_config, self.vllm_config)
+        if self._mamba_groups is not None and not callable(
+            getattr(self.model, "zero_kv_cache_blocks", None)
+        ):
+            # vLLM sends ``new_block_ids_to_zero`` for every config with Mamba
+            # layers (``KVCacheConfig.needs_kv_cache_zeroing``); see
+            # ``_zero_new_kv_cache_blocks``.
+            raise ValueError(
+                f"{type(self.model).__name__} declares MambaSpec KV cache groups "
+                "but does not implement zero_kv_cache_blocks"
+            )
 
         # Stash on the runner for downstream phases that need to walk the
         # group structure during input prep / forward.
@@ -693,6 +717,18 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
 
         max_num_reqs = self.tt_max_batch_size
         max_model_len = self.model_config.max_model_len
+        # Block-table row width per group, as upstream's
+        # ``MambaSpec.max_num_blocks_per_req``: a MambaSpec row also holds the
+        # K speculative blocks past the running one.
+        per_group_max_num_blocks = [
+            cdiv(max_model_len, g.kv_cache_spec.block_size)
+            + (
+                g.kv_cache_spec.num_speculative_blocks
+                if isinstance(g.kv_cache_spec, MambaSpec)
+                else 0
+            )
+            for g in kv_cache_groups
+        ]
         max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
         if self._is_lane_mode:
             # Lane-chunked persistent batch: rows are partitioned into
@@ -719,6 +755,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 max_num_batched_tokens=max_num_batched_tokens,
                 vocab_size=self.vocab_size,
                 block_sizes=per_group_block_sizes,
+                max_num_blocks=per_group_max_num_blocks,
                 logitsprocs=self._host_logitsprocs,
                 disable_logprobs=self._is_block_output_model,
                 output_tokens_per_step=self._output_tokens_per_step,
@@ -732,6 +769,18 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             cdiv(max_model_len, self.cache_config.block_size),
             kv_cache_config.num_blocks,
         )
+        if self._mamba_groups is not None:
+            # A MambaSpec model sets its block sizes in ``get_kv_cache_spec``
+            # (upstream's ``update_block_size_for_backend`` returns before
+            # ``_align_hybrid_block_size``: a TT model registers no vLLM
+            # attention layer for ``_find_non_ssm_backends`` to find), so
+            # ``cache_config.block_size`` need not be any group's block size:
+            # size the table from the groups. TT chunked SDPA requires a
+            # page-table row of a multiple of 32 bytes, so 8 int32 columns.
+            self.max_num_blocks_per_req = round_up(
+                min(max(per_group_max_num_blocks), kv_cache_config.num_blocks),
+                8,
+            )
 
         # Cache layer→group index mapping for hybrid models so submit_*
         # can expand ``block_tables_per_group`` into ``block_tables_per_layer``
@@ -743,13 +792,16 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         # worker loads the model.
         self._layer_to_group_idx: list[int] | None = None
         if len(kv_cache_groups) > 1:
-            num_layers = self.model_config.get_num_layers_by_block_type(
-                self.parallel_config, "attention"
-            )
+            num_layers = self._num_kv_layers(kv_cache_config)
             mapping: list[int | None] = [None] * num_layers
             for g_idx, group in enumerate(kv_cache_groups):
                 for layer_name in group.layer_names:
                     idx = _parse_layer_index(layer_name)
+                    if not 0 <= idx < num_layers:
+                        raise ValueError(
+                            f"Layer index {idx} parsed from '{layer_name}' is "
+                            f"out of range for {num_layers} KV cache layers"
+                        )
                     mapping[idx] = g_idx
             missing = [i for i, g in enumerate(mapping) if g is None]
             if missing:
@@ -775,12 +827,28 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             # full layers 1x512). We unwrap it to per-layer specs in
             # ``_build_per_layer_specs``, so accept it here too.
             if not isinstance(
-                group.kv_cache_spec, (AttentionSpec, UniformTypeKVCacheSpecs)
+                group.kv_cache_spec,
+                (AttentionSpec, UniformTypeKVCacheSpecs, MambaSpec),
             ):
                 raise TypeError(
-                    f"Expected AttentionSpec/UniformTypeKVCacheSpecs for group "
-                    f"{group.layer_names}, got {type(group.kv_cache_spec).__name__}"
+                    "Expected AttentionSpec/UniformTypeKVCacheSpecs/MambaSpec "
+                    f"for group {group.layer_names}, got "
+                    f"{type(group.kv_cache_spec).__name__}"
                 )
+
+    def _num_kv_layers(self, kv_cache_config: KVCacheConfig) -> int:
+        """Length of the per-layer lists handed to the model.
+
+        Without MambaSpec groups this is the model's attention-layer count.
+        With them, the recurrent layers sit between the attention layers in
+        decoder-layer index order, so the lists cover every layer the groups
+        name.
+        """
+        if self._mamba_groups is None:
+            return self.model_config.get_num_layers_by_block_type(
+                self.parallel_config, "attention"
+            )
+        return sum(len(g.layer_names) for g in kv_cache_config.kv_cache_groups)
 
     def _kv_cache_shape(
         self, spec: AttentionSpec, num_blocks: int
@@ -800,15 +868,13 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         """Allocate KV cache tensors, falling back to legacy uniform API.
 
         Builds a ``per_layer_specs`` list of ``(shape, dtype)`` tuples — one
-        entry per attention layer in model layer-index order. Hybrid models
-        opt in to per-layer allocation by exposing
+        entry per layer in model layer-index order (see ``_num_kv_layers``).
+        Hybrid models opt in to per-layer allocation by exposing
         ``allocate_kv_cache_per_layer(per_layer_specs)``; legacy models keep
         the older ``allocate_kv_cache(shape, dtype, num_layers)`` signature
         and we adapt to it here, asserting the per-layer specs are uniform.
         """
-        num_layers = self.model_config.get_num_layers_by_block_type(
-            self.parallel_config, "attention"
-        )
+        num_layers = self._num_kv_layers(kv_cache_config)
         per_layer_specs = self._build_per_layer_specs(kv_cache_config, num_layers)
 
         if hasattr(self.model, "allocate_kv_cache_per_layer"):
@@ -872,9 +938,10 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
 
     def _build_per_layer_specs(
         self, kv_cache_config: KVCacheConfig, num_layers: int
-    ) -> list[tuple[tuple[int, int, int, int], Any, int]]:
+    ) -> list[tuple[Any, Any, int]]:
         """Resolve ``KVCacheConfig`` → list of ``(shape, dtype, tensor_idx)``
-        per layer in model layer-index order.
+        per layer in model layer-index order. A ``MambaSpec`` layer's entry
+        is ``(MambaSpec.shapes, MambaSpec.dtypes, tensor_idx)``.
 
         ``tensor_idx`` identifies the unique DRAM buffer that each layer's
         KV cache lives in. Multiple layers from different
@@ -927,16 +994,18 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
 
         # Multi-group: every group's KVCacheTensor starts at byte 0, so layers
         # whose regions start at the same byte share one buffer -- the i-th
-        # layer of each group, as ``shared_by`` listed before vLLM 0.29.
-        spec_by_layer_name: dict[str, AttentionSpec] = {}
+        # layer of each group, as ``shared_by`` listed before vLLM 0.29. A
+        # MambaSpec layer shares the buffer of the attention layers at its
+        # position; its entry carries the spec's state shapes and dtypes
+        # instead of a KV shape.
+        spec_by_layer_name: dict[str, AttentionSpec | MambaSpec] = {}
         for group in kv_cache_groups:
-            assert isinstance(group.kv_cache_spec, AttentionSpec)
+            assert isinstance(group.kv_cache_spec, (AttentionSpec, MambaSpec))
             for layer_name in group.layer_names:
                 spec_by_layer_name[layer_name] = group.kv_cache_spec
 
-        per_layer: list[tuple[tuple[int, int, int, int], Any, int] | None] = [
-            None
-        ] * num_layers
+        per_layer: list[tuple[Any, Any, int] | None] = [None] * num_layers
+        mamba_tensor_idx: dict[int, int] = {}
         tensor_idx_by_start: dict[int, int] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             for position, layer_name in enumerate(kv_cache_tensor.layers):
@@ -962,6 +1031,10 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                         "by more than one KVCacheTensor; each layer must "
                         "map to exactly one DRAM buffer"
                     )
+                if isinstance(spec, MambaSpec):
+                    per_layer[idx] = (spec.shapes, spec.dtypes, tensor_idx)
+                    mamba_tensor_idx[idx] = tensor_idx
+                    continue
                 shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
                 per_layer[idx] = (shape, spec.dtype, tensor_idx)
 
@@ -971,6 +1044,24 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 f"No KVCacheTensor covers layer indices {missing}; "
                 "every attention layer must appear in some "
                 "kv_cache_tensors[i].layers"
+            )
+        # The model sizes each buffer from its attention entries, so a buffer
+        # holding only Mamba state would have no shape.
+        attention_tensor_idx = {
+            entry[2]
+            for i, entry in enumerate(per_layer)
+            if entry is not None and i not in mamba_tensor_idx
+        }
+        mamba_only = {
+            idx: t
+            for idx, t in mamba_tensor_idx.items()
+            if t not in attention_tensor_idx
+        }
+        if mamba_only:
+            raise ValueError(
+                "MambaSpec layers share no buffer with an attention layer "
+                f"(layer index: tensor_idx) {mamba_only}; attention layers "
+                f"use tensor_idx {sorted(attention_tensor_idx)}"
             )
         return per_layer  # type: ignore[return-value]
 
@@ -1879,6 +1970,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         row_req_ids: list[str],
         *,
         skip_req_ids: set[str] | None = None,
+        chain_successor: AsyncTTSpecDecodeOutput | None = None,
     ) -> None:
         """Ask the model's own drafter for the next step's drafts.
 
@@ -2014,6 +2106,30 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         max_model_len = int(self.model_config.max_model_len)
         skipped = set(skip_req_ids or ())
         counts_by_row = counts.tolist()
+        chained: set[str] = set()
+        if chain_successor is not None:
+            # These drafts already ran as the chained verify's: they fill its
+            # rows and are not published for another step.
+            successor = chain_successor.model_input
+            chained = set(successor.row_req_ids or ())
+            if chained & skipped:
+                raise RuntimeError(
+                    f"chained verify rows {sorted(chained & skipped)} were "
+                    "skipped at their predecessor's commit"
+                )
+            chain_successor.fill_chained(
+                fill_chained_input(
+                    successor,
+                    model_input,
+                    committed,
+                    counts,
+                    draft_token_ids,
+                    offered_by_row,
+                    max_model_len,
+                )
+            )
+            for req_id in chained:
+                self._proposed_draft_token_ids.pop(req_id, None)
         # ``row`` is the request's row of the step's block, which a lane step
         # places at the request's slot rather than at its live position.
         for row, req_id in zip(live_rows, row_req_ids, strict=True):
@@ -2025,7 +2141,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 continue
             # A row that committed nothing this step proposes nothing: there is
             # no continuation to draft from.
-            if counts_by_row[row] < 1:
+            if counts_by_row[row] < 1 or req_id in chained:
                 continue
             if declined:
                 # Erase, as ``_publish_draft`` does for an empty offer.
@@ -2247,6 +2363,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         input_positions: torch.Tensor,
         live_rows: Sequence[int] | None = None,
         device_sampled: bool = False,
+        chain: ChainPlan | None = None,
     ) -> SpecDecodeRows:
         """Turn a plain decode's rows into this step's speculative rows.
 
@@ -2303,6 +2420,28 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         scheduled_drafts = self._drafts_to_verify(scheduler_output, row_req_ids)
         self._grammar_draft_handoff = {}
         self._grammar_handed_over_req_ids = set()
+        if chain is not None:
+            # The predecessor has not proposed yet: a held proposal would be
+            # an older step's.
+            if any(scheduled_drafts.values()) or bool(padding.any()):
+                raise RuntimeError(
+                    "a chained verify carries host drafts "
+                    f"{ {r: d for r, d in scheduled_drafts.items() if d} } or "
+                    f"padding rows among {row_req_ids}"
+                )
+            check_chained_rows_certifiable(self, row_req_ids, device_sampled)
+            spec_plan = getattr(self, "_spec_plan", None)
+            cap = (
+                spec_plan.draft_cap(num_live)
+                if spec_plan is not None
+                else self._num_speculative_tokens
+            )
+            tokens, positions, drafts, num_valid, counts = chained_rows(
+                input_positions, self._num_speculative_tokens, cap
+            )
+            return SpecDecodeRows(
+                tokens, positions, drafts, num_valid, counts, ACCEPT_MODE_ARGMAX_IDS
+            )
         if (
             self._spec_supports_narrow_decode
             and not any(scheduled_drafts.values())
@@ -2402,6 +2541,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         self,
         scheduler_output: SchedulerOutput,
         grammar_output: GrammarOutput | None,
+        chain: ChainPlan | None = None,
     ) -> TTModelInput:
         """Build a ``TTModelInput`` for one prefill or decode step.
 
@@ -2479,7 +2619,8 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         # models additionally consume ``block_tables_per_group`` via the
         # ``page_tables_per_group`` kwarg in submit_prefill / submit_decode; the
         # legacy generator_vllm wrappers strip it on the way through and raise
-        # loudly if the list has more than one entry.
+        # loudly if the list has more than one entry. With MambaSpec groups,
+        # ``build_model_input`` replaces it with the first attention group's.
         block_tables = block_tables_per_group[0]
 
         # NOTE: We assume that all sequences in the group are all prompts or
@@ -2602,6 +2743,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 input_tokens,
                 input_positions,
                 device_sampled=device_sampled,
+                chain=chain,
             )
             input_tokens, input_positions = spec.input_tokens, spec.input_positions
             spec_drafts = spec.draft_token_ids
@@ -2974,6 +3116,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         self,
         scheduler_output: SchedulerOutput,
         grammar_output: GrammarOutput | None,
+        chain: ChainPlan | None = None,
     ) -> TTModelInput | None:
         """
         Update internal state with the scheduler output and build
@@ -2982,6 +3125,10 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
 
         For data parallel, this function is called by each DP rank to build
         TTModelInput from it's own scheduler output.
+
+        ``chain`` builds a chained verify over the unread verify it names
+        (``spec_chain``), whose commit is applied after the submission instead
+        of before the build.
         """
         # Update scheduler-owned state before accepting any older async result.
         # Reject late results for request IDs already reported finished. The
@@ -2989,6 +3136,9 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         # preemption or resume keeps a completed token valid for replay. Only a
         # forced prefix-cache reset marks an in-flight result for discard.
         self._update_states(scheduler_output)
+        self._zero_new_kv_cache_blocks(scheduler_output)
+        if self._mamba_groups is not None:
+            self._mamba_groups.forget(scheduler_output)
         if (
             self.async_decode.decode_input_update_contract_version() < 1
             and self._decode_layout_changed_since_last_decode
@@ -2996,13 +3146,84 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             # Preserve the legacy path's drain point: version-0 adapters still
             # own reload policy and receive reset_batch after batch mutation.
             self.async_decode.wait_for_all_pending_async_steps()
-        self.async_decode.apply_completed_decode_steps_before_build(scheduler_output)
+        if chain is None:
+            self.async_decode.apply_completed_decode_steps_before_build(
+                scheduler_output
+            )
         if not scheduler_output.total_num_scheduled_tokens:
             return None
 
         # Prepare model inputs only
-        model_input = self._prepare_model_inputs(scheduler_output, grammar_output)
+        model_input = self._prepare_model_inputs(
+            scheduler_output, grammar_output, chain=chain
+        )
+        if chain is not None:
+            # ``slot_remap`` stays: it names each row's predecessor row.
+            if model_input.spec_mode is None:
+                raise RuntimeError(
+                    "a chained verify was built as another step: spec_mode "
+                    f"{model_input.spec_mode!r}"
+                )
+            model_input = replace(
+                model_input, spec_predecessor=chain.predecessor.verify_output
+            )
+        if self._mamba_groups is not None:
+            # Group 0 can be a MambaSpec group, so ``page_table`` is the first
+            # attention group's table instead.
+            row_req_ids = model_input.row_req_ids or []
+            batch = self.input_batch
+            # A verify, and an ordinary decode after a multi-token commit,
+            # carry each row's previous count; every other step's is 1.
+            accepted_counts = model_input.accepted_counts
+            model_input = replace(
+                model_input,
+                block_tables=model_input.block_tables_per_group[
+                    self._mamba_groups.attention_group_index
+                ],
+                mamba_state=self._mamba_groups.step_state(
+                    model_input.block_tables_per_group,
+                    row_req_ids,
+                    [
+                        int(batch.num_computed_tokens_cpu[batch.req_id_to_index[r]])
+                        for r in row_req_ids
+                    ],
+                    [scheduler_output.num_scheduled_tokens[r] for r in row_req_ids],
+                    self.tt_max_batch_size,
+                    accepted_counts=(
+                        None
+                        if accepted_counts is None
+                        else accepted_counts[live_row_index(model_input)].tolist()
+                    ),
+                    intermediate_prefill_mask=(
+                        None
+                        if model_input.intermediate_prefill_mask is None
+                        else model_input.intermediate_prefill_mask.tolist()
+                    ),
+                    chained=None if chain is None else [True] * len(row_req_ids),
+                ),
+            )
         return model_input
+
+    def _zero_new_kv_cache_blocks(self, scheduler_output: SchedulerOutput) -> None:
+        """Hand the model the blocks vLLM asks to zero before this step.
+
+        With Mamba layers vLLM lists every block it newly allocated to an
+        attention group in ``new_block_ids_to_zero``: the block can still hold
+        recurrent-state bytes that read as NaN or Inf at positions attention
+        has not written yet and masks. The upstream GPU runner zeroes them
+        before the forward; the TT model owns the device buffers, so the runner
+        passes the whole list to ``zero_kv_cache_blocks``, which
+        ``initialize_kv_cache`` requires of a model with MambaSpec groups.
+        Without MambaSpec groups nothing changes.
+        """
+        if self._mamba_groups is None:
+            return
+        self._mamba_groups.refuse_block_copies(scheduler_output.kv_cache_block_copies)
+        block_ids = scheduler_output.new_block_ids_to_zero
+        if block_ids:
+            self.model.zero_kv_cache_blocks(
+                kv_cache=self.kv_caches, block_ids=list(block_ids)
+            )
 
     # All lane-specific input/output shaping lives in ``TTLaneInputBatch``
     # (``apply_step_plan`` / ``build_model_input`` / ``extract_output``) and the
@@ -3333,13 +3554,25 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         steady_decode_candidate = (
             self.async_decode.can_attempt_steady_decode_from_scheduler(scheduler_output)
         )
-        if self.async_decode.must_drain_pending_async_steps(
+        # A step that continues the one unread verify row for row is built
+        # over it rather than after it (``spec_chain``).
+        chain, reason = plan_chain(self, scheduler_output)
+        if chain is None and self.async_decode.must_drain_pending_async_steps(
             steady_decode_candidate, scheduler_output
         ):
-            self.async_decode.wait_for_all_pending_async_steps()
+            if prefill_over_pending(self, scheduler_output):
+                self.async_decode._prefills_over_pending += 1
+            else:
+                if reason != "off":
+                    self.async_decode._chain_drains[reason] += 1
+                self.async_decode.wait_for_all_pending_async_steps()
 
         # Grammar is applied at sample time, so the forward builds without it.
-        model_input = self.build_model_input(scheduler_output, None)
+        model_input = (
+            self.build_model_input(scheduler_output, None)
+            if chain is None
+            else self.build_model_input(scheduler_output, None, chain=chain)
+        )
         if model_input is None:
             if has_kv_transfer_group():
                 # The KV connector can do loads and saves even
@@ -3350,13 +3583,23 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         is_decode = model_input.prompt_lens is None
-        if model_input.defer_device_sampling and not steady_decode_candidate:
-            self.async_decode.wait_for_all_pending_async_steps()
-        if (
+        async_decode = (
             self.async_decode_scheduling
             and is_decode
             and not model_input.defer_device_sampling
-        ):
+        )
+        if chain is not None and not async_decode:
+            # Only the asynchronous decode path calls complete_chain, which
+            # commits the predecessor verify into the chained rows.
+            raise RuntimeError(
+                "plan_chain chained a step that builds for a path without "
+                f"complete_chain: async_decode_scheduling="
+                f"{self.async_decode_scheduling}, is_decode={is_decode}, "
+                f"defer_device_sampling={model_input.defer_device_sampling}"
+            )
+        if model_input.defer_device_sampling and not steady_decode_candidate:
+            self.async_decode.wait_for_all_pending_async_steps()
+        if async_decode:
             steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
                 model_input
             )
@@ -3366,6 +3609,8 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                     steady_decode_fast_path=steady_decode_fast_path,
                 )
             wrapper.kv_connector_output = kv_out
+            if chain is not None:
+                self.async_decode.complete_chain(chain, wrapper, scheduler_output)
             self._pending_samples.append(
                 partial(
                     self._finish_async_decode,
@@ -3832,6 +4077,7 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         spec_hidden: Any,
         *,
         skip_req_ids: set[str] | None = None,
+        chain_successor: AsyncTTSpecDecodeOutput | None = None,
     ) -> dict[str, list[int]]:
         """Apply the accepted prefixes and publish the next proposal.
 
@@ -3839,6 +4085,8 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         synchronous path inside the sampling tail, and on the asynchronous path
         when the next step drains this one. ``skip_req_ids`` is how a forced
         prefix-cache reset drops a frame it has already accounted for.
+        ``chain_successor`` is the chained verify that already ran this
+        step's proposal (``spec_chain``): the proposal fills its rows.
         """
         row_req_ids = model_input.row_req_ids
         live = live_row_index(model_input)
@@ -3856,7 +4104,10 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 spec_hidden,
                 row_req_ids,
                 skip_req_ids=skip_req_ids,
+                chain_successor=chain_successor,
             )
+        elif chain_successor is not None:
+            raise RuntimeError("a chained verify follows a host-drafted verify")
         else:
             self._propose_ngram_drafts(
                 committed_by_req, model_input.perform_device_sampling
@@ -4331,6 +4582,8 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         # and never see the kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
+        if model_input.mamba_state is not None:
+            kwargs["mamba_state"] = model_input.mamba_state
         kwargs.update(model_input.multi_modal_kwargs)
         if model_input.stage_inputs is not None:
             kwargs["stage_inputs"] = model_input.stage_inputs
