@@ -346,14 +346,22 @@ class SamplingInputBatch:
         # their full-vocabulary logprobs, not for a top-N.
         self.logprob_token_ids: dict[int, list[int]] = {}
 
-    def has_active_logitsprocs(self) -> bool:
-        """True if any logits processors have active per-request state."""
+    def has_active_logitsprocs(self, include_min_tokens: bool = True) -> bool:
+        """True if any logits processors have active per-request state.
+
+        ``include_min_tokens`` False leaves out ``min_tokens``, which a
+        verify's device token mask applies (``supports_spec_device_mask``).
+        """
         for proc in self.logitsprocs.all:
             if isinstance(proc, MinPLogitsProcessor) and proc.min_p_count:
                 return True
             if isinstance(proc, LogitBiasLogitsProcessor) and proc.biases:
                 return True
-            if isinstance(proc, MinTokensLogitsProcessor) and proc.min_toks:
+            if (
+                include_min_tokens
+                and isinstance(proc, MinTokensLogitsProcessor)
+                and proc.min_toks
+            ):
                 return True
         return False
 
