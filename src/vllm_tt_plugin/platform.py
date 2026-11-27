@@ -1404,16 +1404,123 @@ def _install_block_output_pause_guard_patch() -> None:
         cls.pause_scheduler = _wrap(original)
 
 
+def _register_extra_hf_config(folder: str, hf_config_spec: object) -> None:
+    """Register an out-of-tree Transformers ``AutoConfig`` entry from a bundle.
+
+    Accepts either a bare ``model_type`` string (synthesizing a plain
+    ``PretrainedConfig`` subclass, matching ``_register_kolibri1_hf_config``)
+    or a mapping ``{"model_type": "<type>", "config_class": "module:Class"}``
+    where ``config_class`` is optional. Invalid entries are logged and skipped.
+
+    Parameters
+    ----------
+    folder
+        Absolute path of the bundle directory under ``EXTRA_MODELS_DIR``.
+    hf_config_spec
+        Raw ``hf_config`` value loaded from ``vllm_metadata.json``.
+    """
+    import importlib
+
+    from transformers import AutoConfig, PretrainedConfig
+
+    if isinstance(hf_config_spec, str):
+        model_type = hf_config_spec.strip()
+        config_class_spec = None
+    elif isinstance(hf_config_spec, dict):
+        raw_type = hf_config_spec.get("model_type")
+        model_type = raw_type.strip() if isinstance(raw_type, str) else ""
+        config_class_spec = hf_config_spec.get("config_class")
+    else:
+        logger.warning(
+            "Skipping invalid hf_config in %s: expected string or mapping, got %s.",
+            folder,
+            type(hf_config_spec).__name__,
+        )
+        return
+
+    if not model_type:
+        logger.warning(
+            "Skipping invalid hf_config in %s: "
+            "'model_type' must be a non-empty string.",
+            folder,
+        )
+        return
+
+    if config_class_spec is None:
+        config_cls: type[PretrainedConfig] = type(
+            f"_ExtraBundle_{model_type}_Config",
+            (PretrainedConfig,),
+            {"model_type": model_type},
+        )
+    else:
+        if not isinstance(config_class_spec, str) or ":" not in config_class_spec:
+            logger.warning(
+                "Skipping invalid hf_config in %s: "
+                "'config_class' must be 'module:Class'.",
+                folder,
+            )
+            return
+        module_name, _, class_name = config_class_spec.partition(":")
+        if not module_name or not class_name:
+            logger.warning(
+                "Skipping invalid hf_config in %s: "
+                "'config_class' must be 'module:Class'.",
+                folder,
+            )
+            return
+        try:
+            module = importlib.import_module(module_name)
+            candidate = getattr(module, class_name)
+        except Exception as exc:
+            logger.warning(
+                "Skipping hf_config '%s' in %s: failed to import %s (%s).",
+                model_type,
+                folder,
+                config_class_spec,
+                exc,
+            )
+            return
+        if not (
+            isinstance(candidate, type) and issubclass(candidate, PretrainedConfig)
+        ):
+            logger.warning(
+                "Skipping hf_config '%s' in %s: %s is not a PretrainedConfig subclass.",
+                model_type,
+                folder,
+                config_class_spec,
+            )
+            return
+        config_cls = candidate
+
+    try:
+        AutoConfig.register(model_type, config_cls, exist_ok=True)
+    except Exception as exc:
+        logger.warning(
+            "Skipping hf_config '%s' in %s: AutoConfig.register failed (%s).",
+            model_type,
+            folder,
+            exc,
+        )
+        return
+    logger.info(
+        "Registered HF AutoConfig '%s' -> %s (from EXTRA_MODELS_DIR/%s)",
+        model_type,
+        config_class_spec or config_cls.__name__,
+        os.path.basename(folder),
+    )
+
+
 def _iter_extra_model_bundles():
-    """Yield ``(folder, arch, main_class)`` for each bundle under ``EXTRA_MODELS_DIR``.
+    """Yield ``(folder, arch, main_class, metadata)`` per ``EXTRA_MODELS_DIR`` bundle.
 
     ``EXTRA_MODELS_DIR`` is a directory of self-contained per-model bundle
     folders. Each folder holds a ``vllm_metadata.json`` (``arch`` = HF
     architecture name, ``main_class`` = ``"module:Class"`` implementing the vLLM
-    generator adapter) plus the adapter class and its dependencies. Any
-    distribution tool (e.g. tt-kernel) can drop a bundle folder here and have it
-    registered with no source edit to this plugin. Malformed / incomplete folders
-    are skipped with a warning.
+    generator adapter, plus optional ``register_bare_arch`` and ``hf_config``
+    fields) alongside the adapter class and its dependencies. Any distribution
+    tool (e.g. tt-kernel) can drop a bundle folder here and have it registered
+    with no source edit to this plugin. Malformed / incomplete folders are
+    skipped with a warning.
     """
     base = os.getenv("EXTRA_MODELS_DIR")
     if not base:
@@ -1440,6 +1547,13 @@ def _iter_extra_model_bundles():
             )
             continue
 
+        if not isinstance(data, dict):
+            logger.warning(
+                "Skipping %s: vllm_metadata.json must contain a JSON object.",
+                folder,
+            )
+            continue
+
         arch = data.get("arch")
         main_class = data.get("main_class")
         if not arch or not main_class:
@@ -1449,7 +1563,7 @@ def _iter_extra_model_bundles():
             )
             continue
 
-        yield folder, arch, main_class
+        yield folder, arch, main_class, data
 
 
 def _register_models_from_extra_dir(ModelRegistry) -> int:
@@ -1461,16 +1575,25 @@ def _register_models_from_extra_dir(ModelRegistry) -> int:
     ``insert(0)``, so an installed package of the same name always wins and
     nothing is shadowed); built-in adapters given as a full dotted path resolve
     normally and need no path entry. The arch is registered under the plugin's
-    ``TT``-prefixed convention (mirroring ``check_and_update_config``).
+    ``TT``-prefixed convention (mirroring ``check_and_update_config``). Bundles
+    may also set ``register_bare_arch: true`` to register the unprefixed arch
+    name and ``hf_config`` to register an out-of-tree Transformers ``model_type``
+    with ``AutoConfig``.
     """
     count = 0
 
-    for folder, arch, main_class in _iter_extra_model_bundles():
+    for folder, arch, main_class, metadata in _iter_extra_model_bundles():
         if folder not in sys.path:
             sys.path.append(folder)
 
+        if "hf_config" in metadata:
+            _register_extra_hf_config(folder, metadata["hf_config"])
+
         tt_arch = arch if arch.startswith("TT") else "TT" + arch
         _register_model_if_missing(ModelRegistry, tt_arch, main_class)
+
+        if metadata.get("register_bare_arch") is True and arch != tt_arch:
+            _register_model_over_upstream(ModelRegistry, arch, main_class)
 
         logger.info(
             "Registered TT model %s -> %s (from EXTRA_MODELS_DIR/%s)",

@@ -645,6 +645,14 @@ $EXTRA_MODELS_DIR/
 At import time the plugin scans `EXTRA_MODELS_DIR`, appends each folder to `sys.path`
 (so an installed package of the same name is never shadowed), and registers `arch`
 under the plugin's `TT`-prefixed convention (`TT<HFArch>`) pointing at `main_class`.
+Optional fields in `vllm_metadata.json`:
+
+- `register_bare_arch`: set to `true` to also register the unprefixed `arch` name
+  (replacing upstream `vllm.*` entries while preserving `TT_MODEL_CLASS_OVERRIDES`).
+- `hf_config`: register an out-of-tree Transformers `model_type` with `AutoConfig`
+  (either `"<model_type>"` for a plain `PretrainedConfig`, or
+  `{"model_type": "<model_type>", "config_class": "module:ConfigClass"}`).
+
 This lets a distribution tool (e.g. `tt-kernel`) deliver a ready-to-serve model with no
 source edit to the plugin. The built-in map above stays enabled by default; set
 `TT_VLLM_BUILTIN_MODELS=0` to rely solely on `EXTRA_MODELS_DIR`.
