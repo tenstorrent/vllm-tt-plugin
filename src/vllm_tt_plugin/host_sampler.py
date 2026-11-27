@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
-"""Native CPU sampling with bounded, speculative noise for seeded requests."""
+"""Native CPU sampling for the host sampler that ``create_host_sampler`` builds.
+
+``TTTopKTopPSampler`` keeps vLLM's top-k/top-p results with less host work:
+an unseeded batch whose rows all have a small ``top_k`` samples from each
+row's largest logits instead of sorting the vocabulary, and seeded rows use
+bounded, speculative noise prepared on worker threads.
+"""
 
 import os
 from collections import OrderedDict
@@ -10,13 +16,22 @@ from dataclasses import dataclass, replace
 from threading import Lock
 
 import torch
+from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.ops.topk_topp_sampler import (
     TopKTopPSampler,
     apply_top_k_top_p,
+    random_sample,
     sample_with_exponential_noise,
 )
 from vllm.v1.sample.sampler import Sampler
+
+# Candidates taken past a row's top_k, so that ties at the k-th largest logit
+# usually stay inside them.
+_TOP_K_CANDIDATE_MARGIN = 64
+# The largest top_k sampled from candidates; a batch with a larger top_k
+# sorts the vocabulary.
+_TOP_K_CANDIDATE_MAX_K = 1024
 
 
 @dataclass
@@ -53,7 +68,47 @@ class TTTopKTopPSampler(TopKTopPSampler):
             state, vocab, size, self._sampling_pool.submit(generate)
         )
 
-    def forward_native(self, logits, generators, k, p):
+    def forward_native(
+        self,
+        logits: torch.Tensor,
+        generators: dict[int, torch.Generator],
+        k: torch.Tensor | None,
+        p: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Sample one token per row under vLLM's top-k/top-p semantics.
+
+        A batch without seeded rows samples from top-k candidates when
+        ``_top_k_candidates`` accepts it, drawing its noise from the global
+        torch generator as vLLM does for unseeded rows. A batch whose rows
+        all carry distinct CPU generators samples through
+        ``_sample_seeded``. Every other batch takes vLLM's
+        ``TopKTopPSampler.forward_native``.
+
+        Parameters
+        ----------
+        logits : torch.Tensor
+            Host logits after temperature, float32 ``[B, V]``. The seeded and
+            vLLM paths may modify it in place.
+        generators : dict of int to torch.Generator
+            Generators of the seeded rows, keyed by row.
+        k : torch.Tensor or None
+            Per-row ``top_k``, integer ``[B]``, or ``None`` without top-k.
+        p : torch.Tensor or None
+            Per-row ``top_p``, float32 ``[B]``, or ``None`` without top-p.
+
+        Returns
+        -------
+        tuple
+            Sampled token ids ``[B]``, and the processed scores ``[B, V]``
+            that a ``processed_*`` ``logprobs_mode`` asks for, else ``None``.
+        """
+        if not generators:
+            candidates = self._top_k_candidates(logits, k, p)
+            if candidates is not None:
+                values, ids = candidates
+                probs = values.softmax(dim=-1, dtype=torch.float32)
+                picked = random_sample(probs, {}, self.use_fp64_gumbel)
+                return ids.gather(1, picked.unsqueeze(1)).squeeze(1), None
         batch, vocab = logits.shape
         if (
             logits.device.type != "cpu"
@@ -69,6 +124,64 @@ class TTTopKTopPSampler(TopKTopPSampler):
         # generator itself, and verify its complete state before reusing noise.
         with self._sampling_lock:
             return self._sample_seeded(logits, generators, k, p)
+
+    def _top_k_candidates(
+        self,
+        logits: torch.Tensor,
+        k: torch.Tensor | None,
+        p: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Filter each row's largest logits instead of the whole vocabulary.
+
+        Parameters
+        ----------
+        logits : torch.Tensor
+            Host logits after temperature, float32 ``[B, V]``. Not modified.
+        k : torch.Tensor or None
+            Per-row ``top_k``, integer ``[B]`` in ``[1, V]``, or ``None``
+            without top-k.
+        p : torch.Tensor or None
+            Per-row ``top_p``, float32 ``[B]``, or ``None`` without top-p.
+
+        Returns
+        -------
+        tuple of torch.Tensor or None
+            ``(values, ids)``, both ``[B, C]`` with ``C = min(V, max(k) + 64)``:
+            each row's ``C`` largest logits after vLLM's ``apply_top_k_top_p``
+            (removed tokens hold ``-inf``), and their token ids. ``None`` when
+            the batch must sort the vocabulary: no ``k``, a ``k`` above 1024,
+            a ``processed_*`` ``logprobs_mode`` (its scores cover the whole
+            vocabulary), or a row whose last candidate still reaches its k-th
+            largest logit.
+
+        Notes
+        -----
+        vLLM's top-k keeps every logit at or above the row's k-th largest
+        value. When the last candidate is below that value, so is every logit
+        outside the candidates, and vLLM's full-vocabulary path removes them
+        all. The candidates then hold the same kept tokens, and top-p and
+        softmax over them give the same probabilities, up to float32 rounding
+        of the normalization. A tie at the k-th value that reaches the last
+        candidate may continue past it, so such a batch returns ``None``.
+        """
+        if (
+            k is None
+            or logits.device.type != "cpu"
+            or logits.shape[0] == 0
+            or self.logprobs_mode in PROCESSED_LOGPROBS_MODES
+        ):
+            return None
+        top_k = int(k.max())
+        if top_k > _TOP_K_CANDIDATE_MAX_K:
+            return None
+        vocab = logits.shape[1]
+        count = min(vocab, top_k + _TOP_K_CANDIDATE_MARGIN)
+        values, ids = logits.topk(count, dim=-1)
+        if count < vocab:
+            kth = values.gather(1, k.long().sub(1).unsqueeze(1)).squeeze(1)
+            if bool((values[:, -1] >= kth).any()):
+                return None
+        return apply_top_k_top_p(values, k, p), ids
 
     def _sample_seeded(self, logits, generators, k, p):
         batch, vocab = logits.shape
