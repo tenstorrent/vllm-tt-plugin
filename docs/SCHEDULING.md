@@ -212,6 +212,15 @@ only part of the token budget. The request then moves to `running` with
 `is_prefill_chunk` set, and later prefill steps schedule the next chunk until
 the prompt is fully computed.
 
+A positive `long_prefill_token_threshold` caps each chunk. vLLM lifts that cap
+when `get_request_counts` reports a single request, because a lone prefill
+starves no other request. A TT prefill pass hides the running decodes from the
+base scheduler, but they wait for the whole step, so
+`TTScheduler.get_request_counts` still counts them during that pass. The cap
+therefore holds for a long prompt that arrives beside running decodes and for
+each later chunk of it. It is lifted only when no other request is running or
+waiting.
+
 Two things follow for the TT execution path:
 
 - The value handed to the generator as `prompt_lens` is the *end position of
