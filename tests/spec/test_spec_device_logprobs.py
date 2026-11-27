@@ -217,6 +217,7 @@ def _sampling_runner(declared: bool, asked: list[int]) -> TTModelRunner:
             seed=torch.full((rows,), -1),
             num_logprobs=torch.tensor(asked),
             bad_words_token_ids={},
+            logprob_token_ids={},
             has_active_logitsprocs=lambda: False,
         ),
     )
