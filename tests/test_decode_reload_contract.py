@@ -923,7 +923,9 @@ def test_scheduler_context_phase_distinguishes_chunked_prefill_from_decode():
     input_batch.no_penalties = True
     input_batch.no_allowed_token_ids = True
     input_batch.sampling = SimpleNamespace(
-        bad_words_token_ids={}, has_active_logitsprocs=lambda: False
+        bad_words_token_ids={},
+        logprob_token_ids={},
+        has_active_logitsprocs=lambda: False,
     )
     input_batch.max_num_logprobs = None
     runner.model_config = SimpleNamespace(logits_processors=[])
@@ -951,7 +953,9 @@ def test_scheduler_prediction_rejects_every_front_packed_layout_transition(
         no_penalties=True,
         no_allowed_token_ids=True,
         sampling=SimpleNamespace(
-            bad_words_token_ids={}, has_active_logitsprocs=lambda: False
+            bad_words_token_ids={},
+            logprob_token_ids={},
+            has_active_logitsprocs=lambda: False,
         ),
         max_num_logprobs=None,
     )
