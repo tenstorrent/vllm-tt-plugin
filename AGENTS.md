@@ -288,7 +288,7 @@ contradictory values in the error.
 Leftover identity gates still exist. Do not copy them for new work, and do
 not remove them in an unrelated pull request:
 
-- lane-DP folding: legacy Galaxy-generator and GPT-OSS identity checks
+- lane-DP folding: GPT-OSS identity check
 - GPT-OSS top-K logprobs: `hf_config.model_type == "gpt_oss"`
 
 Other contracts are methods, not dictionary keys: hybrid KV opt-in is

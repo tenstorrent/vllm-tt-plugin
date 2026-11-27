@@ -165,15 +165,6 @@ def _min_block_output_max_model_len(output_tokens_per_step: int) -> int:
 # from the platform hooks still reaches the engine core and every worker.
 _V2_MODEL_RUNNER_ENV = "VLLM_USE_V2_MODEL_RUNNER"
 
-# TT model versions backed by the single-execute Galaxy generator
-# (models.demos.llama3_70b_galaxy.tt.generator:Generator). For these,
-# --data_parallel_size folds into single-process TT lanes. Maps the selecting
-# env var to the version value that routes through that generator.
-_GALAXY_GENERATOR_VERSIONS = {
-    "TT_LLAMA_TEXT_VER": "llama3_70b_galaxy",
-    "TT_QWEN3_TEXT_VER": "qwen3_32b_galaxy",
-}
-
 
 def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
     """Disable split prefills and restore a full-prompt scheduler budget."""
@@ -324,18 +315,6 @@ def _renormalize_mamba_cache_config(vllm_config: "VllmConfig") -> None:
         "max_model_len=%d and mamba_cache_mode to 'none'.",
         cache_config.mamba_block_size,
     )
-
-
-def _galaxy_generator_version() -> str | None:
-    """Return the active Galaxy-generator model version, or None.
-
-    Both ``llama3_70b_galaxy`` (Llama3 70B) and ``qwen3_32b_galaxy`` (Qwen3-32B)
-    are served by ``models.demos.llama3_70b_galaxy.tt.generator:Generator``.
-    """
-    for env_var, version in _GALAXY_GENERATOR_VERSIONS.items():
-        if os.getenv(env_var) == version:
-            return version
-    return None
 
 
 def _uses_explicit_tt_mpi_launch(vllm_config: "VllmConfig") -> bool:
@@ -524,24 +503,26 @@ def _resolve_standard_dp_visible_device_groups(
 # GPT-OSS is served by the ttt_compat generator, which drives data
 # parallelism inside a single process -- either user-row sharding on multi-row
 # meshes or one Generator over per-DP submeshes. Multi-process DP is therefore
-# unnecessary: --data_parallel_size folds into in-process TT lanes, the same as
-# the Galaxy generators.
+# unnecessary: --data_parallel_size folds into in-process TT lanes, as for the
+# models that declare ``folds_dp_into_lanes``.
 _GPT_OSS_ARCH = "GptOssForCausalLM"
 
 
-def _model_folds_dp_into_lanes(model_class) -> bool:
+def _model_folds_dp_into_lanes(model_class: type | None) -> bool:
     """Whether the model's ``--data_parallel_size`` folds into in-process lanes.
 
-    True for the Galaxy generators and for GPT-OSS, both of which drive data
-    parallelism within a single process. Other models keep standard
-    multi-process DP.
+    Parameters
+    ----------
+    model_class
+        The resolved TT model class, or ``None`` when no class is known.
+
+    Returns
+    -------
+    bool
+        True for a class declaring ``model_capabilities["folds_dp_into_lanes"]``
+        and for GPT-OSS, which drive data parallelism within a single process.
+        False keeps standard multi-process DP.
     """
-    if _galaxy_generator_version() is not None:
-        return True
-    # A model class declares the fold itself through
-    # ``model_capabilities["folds_dp_into_lanes"]`` (e.g. gemma4's Galaxy
-    # one-instance lanes), so an env-gated rail opts in without a plugin
-    # change per model.
     if _model_capability_flag(model_class, "folds_dp_into_lanes"):
         return True
     return getattr(model_class, "__name__", None) == _GPT_OSS_ARCH
