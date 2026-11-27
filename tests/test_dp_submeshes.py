@@ -10,6 +10,7 @@ pins the shared policy so the two cannot drift apart silently.
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import ttnn
@@ -102,6 +103,7 @@ def test_discovery_needs_no_model_package(monkeypatch: pytest.MonkeyPatch):
     """Standard-DP discovery imports only ttnn and the plugin, so it works in an
     environment that has no tt-metal ``models`` tree on the path."""
     monkeypatch.setitem(sys.modules, "models", None)
+    monkeypatch.delenv("TT_VISIBLE_DEVICES", raising=False)
     opened = []
 
     class DiscoveryMesh(FakeMesh):
@@ -147,6 +149,21 @@ def test_discovery_needs_no_model_package(monkeypatch: pytest.MonkeyPatch):
     assert opened[0].calls == [("create_submeshes", (1, 2))]
 
 
+def _cluster_descriptor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, addresses: list[str]
+) -> None:
+    """Serves a cluster descriptor that gives chip ``i`` the address
+    ``addresses[i]``, written unquoted as UMD writes it."""
+    descriptor = tmp_path / "cluster_descriptor.yaml"
+    descriptor.write_text(
+        "chip_pci_bdfs:\n"
+        + "".join(f"  {chip}: {address}\n" for chip, address in enumerate(addresses))
+    )
+    monkeypatch.setattr(
+        ttnn.cluster, "serialize_cluster_descriptor", lambda: str(descriptor)
+    )
+
+
 # PCI addresses of a T3K's four N300 cards. The first is all digits, which
 # YAML 1.1 would read as a number.
 T3K_CARDS = ["0000:31:00.0", "0000:4b:00.0", "0000:b1:00.0", "0000:ca:00.0"]
@@ -157,14 +174,10 @@ def _n300_cluster(
 ) -> list:
     """N300 cards as UMD numbers them in this process: the cards' PCIe chips
     first, as chips 0 to n-1, then their remote chips, each reached through card
-    2n-1 - chip. The cluster descriptor writes the addresses unquoted, as UMD does.
+    2n-1 - chip.
     """
     num_cards = len(addresses)
-    descriptor = tmp_path / "cluster_descriptor.yaml"
-    descriptor.write_text(
-        "chip_pci_bdfs:\n"
-        + "".join(f"  {chip}: {address}\n" for chip, address in enumerate(addresses))
-    )
+    _cluster_descriptor(monkeypatch, tmp_path, addresses)
     opened = []
     monkeypatch.setattr(ttnn, "get_num_devices", lambda: 2 * num_cards, raising=False)
     monkeypatch.setattr(
@@ -172,9 +185,6 @@ def _n300_cluster(
         "GetPCIeDeviceID",
         lambda chip: chip if chip < num_cards else 2 * num_cards - 1 - chip,
         raising=False,
-    )
-    monkeypatch.setattr(
-        ttnn.cluster, "serialize_cluster_descriptor", lambda: str(descriptor)
     )
     monkeypatch.setattr(
         ttnn, "open_mesh_device", lambda shape: opened.append(shape), raising=False
@@ -220,6 +230,157 @@ def test_n300_cluster_rejects_a_split_that_is_not_one_card_per_rank(
 
     with pytest.raises(ValueError, match=r"need data_parallel_size=4, got " + str(dp)):
         dp_discovery._discover_standard_dp_visible_device_groups("T3K", dp)
+    assert opened == []
+
+
+# PCI addresses of an 8x P150 host's cards, in the order of the host's integer
+# ids: integer k in TT_VISIBLE_DEVICES names the k-th card by PCI address.
+P150X8_CARDS = [
+    "0000:01:00.0",
+    "0000:25:00.0",
+    "0000:41:00.0",
+    "0000:61:00.0",
+    "0000:81:00.0",
+    "0000:a1:00.0",
+    "0000:c1:00.0",
+    "0000:e1:00.0",
+]
+
+
+def _cards(*host_ids: int) -> str:
+    """The ``TT_VISIBLE_DEVICES`` value that names these host cards by address."""
+    return ",".join(P150X8_CARDS[host_id] for host_id in host_ids)
+
+
+def _umd_selection(visible: str | None) -> list[str]:
+    """Addresses of the cards UMD opens for ``visible``, in the order it numbers
+    them: an integer entry k is the host's k-th card, any other entry selects the
+    cards whose address contains it, and the selection is sorted by address."""
+    if visible is None:
+        return P150X8_CARDS
+    selected = set()
+    for entry in visible.split(","):
+        if entry.isdecimal():
+            selected.add(P150X8_CARDS[int(entry)])
+        else:
+            selected.update(card for card in P150X8_CARDS if entry in card)
+    return sorted(selected)
+
+
+def _pcie_cluster(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, addresses: list[str]
+) -> list:
+    """P150 cards as UMD numbers them in this process: every chip on its own PCIe
+    link, as chips 0 to n-1 at ``addresses``. Returns the meshes discovery opens.
+    """
+    num_chips = len(addresses)
+
+    class Mesh(FakeMesh):
+        def create_submeshes(self, mesh_shape):
+            super().create_submeshes(mesh_shape)
+            shape = tuple(mesh_shape)
+            size = shape[0] * shape[1]
+            return [
+                SimpleNamespace(
+                    shape=shape,
+                    get_device_ids=lambda first=first: range(first, first + size),
+                )
+                for first in range(0, num_chips, size)
+            ]
+
+    opened = []
+
+    def open_mesh_device(mesh_shape):
+        opened.append(Mesh(tuple(mesh_shape)))
+        return opened[-1]
+
+    _cluster_descriptor(monkeypatch, tmp_path, addresses)
+    monkeypatch.setattr(ttnn, "get_num_devices", lambda: num_chips, raising=False)
+    monkeypatch.setattr(ttnn, "GetPCIeDeviceID", lambda chip: chip, raising=False)
+    monkeypatch.setattr(ttnn, "open_mesh_device", open_mesh_device, raising=False)
+    monkeypatch.setattr(ttnn, "close_mesh_device", lambda mesh: None, raising=False)
+    monkeypatch.setattr(
+        ttnn.cluster, "get_cluster_type", lambda: ttnn.cluster.ClusterType.P150
+    )
+    return opened
+
+
+def _inherit(monkeypatch: pytest.MonkeyPatch, visible: str | None) -> None:
+    """Gives discovery the launcher's ``TT_VISIBLE_DEVICES``."""
+    if visible is None:
+        monkeypatch.delenv("TT_VISIBLE_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("TT_VISIBLE_DEVICES", visible)
+
+
+@pytest.mark.parametrize(
+    ("visible", "dp", "expected"),
+    [
+        pytest.param(None, 2, ["0,1,2,3", "4,5,6,7"], id="whole-host"),
+        pytest.param("2,3", 2, ["2", "3"], id="integer-subset"),
+        pytest.param("3,1", 2, ["1", "3"], id="unsorted-integers"),
+        pytest.param("0,1,4,5", 2, ["0,1", "4,5"], id="integer-gap"),
+        pytest.param(
+            _cards(*range(8)),
+            2,
+            [_cards(0, 1, 2, 3), _cards(4, 5, 6, 7)],
+            id="pci-host",
+        ),
+        pytest.param(_cards(2, 3), 2, [_cards(2), _cards(3)], id="pci-subset"),
+        pytest.param("1,61:00.0", 2, [_cards(1), _cards(3)], id="mixed-partial-pci"),
+    ],
+)
+def test_pcie_groups_keep_the_operators_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    visible: str | None,
+    dp: int,
+    expected: list[str],
+):
+    """Chip ids of the discovery process are local to its inherited
+    TT_VISIBLE_DEVICES: under "2,3" its chips 0 and 1 are the host's cards 2 and
+    3, while a worker given "0" or "1" would open the host's first two cards.
+    Each rank gets its cards in the form the launcher's selection uses: host
+    integer ids for a list of integers, PCI addresses for any other list.
+    """
+    _inherit(monkeypatch, visible)
+    _pcie_cluster(monkeypatch, tmp_path, _umd_selection(visible))
+
+    groups = dp_discovery._discover_standard_dp_visible_device_groups("P150", dp)
+
+    assert groups == [(group, (1, len(group.split(",")))) for group in expected]
+
+
+@pytest.mark.parametrize(
+    ("visible", "num_chips", "descriptor", "error"),
+    [
+        pytest.param(
+            "2,3,4", 2, _umd_selection("2,3"), "selects chips", id="count-mismatch"
+        ),
+        pytest.param(
+            _cards(2, 3), 2, _umd_selection("2"), r"no PCI address", id="no-address"
+        ),
+    ],
+)
+def test_pcie_groups_reject_an_unmappable_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    visible: str,
+    num_chips: int,
+    descriptor: list[str],
+    error: str,
+):
+    """Without a name for every chip of this process there is no way to name a
+    rank's chips for its worker, so discovery fails before opening any device:
+    an integer list must select exactly the chips this process sees, and an
+    address list needs the cluster descriptor's address of each chip.
+    """
+    _inherit(monkeypatch, visible)
+    opened = _pcie_cluster(monkeypatch, tmp_path, P150X8_CARDS[:num_chips])
+    _cluster_descriptor(monkeypatch, tmp_path, descriptor)
+
+    with pytest.raises(RuntimeError, match=error):
+        dp_discovery._discover_standard_dp_visible_device_groups("P150", 2)
     assert opened == []
 
 
