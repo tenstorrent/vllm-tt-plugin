@@ -1,8 +1,9 @@
 # Model capabilities
 
 The TT plugin selects scheduling, sampling, device setup, and speculative
-decoding behavior from the model class that tt-metal provides. Model authors
-declare supported behavior in the class-level `model_capabilities` dictionary.
+decoding behavior from the model class that tt-metal or tt-transformers
+provides. Model authors declare supported behavior in the class-level
+`model_capabilities` dictionary.
 `TTPlatform.check_and_update_config` validates launch requests against
 `model_capabilities`, and runtime consumers select the supported execution
 path. This reference describes every `model_capabilities` key the plugin reads
@@ -10,8 +11,8 @@ and the separate `SpecPlan` that a speculative model returns.
 
 Capability declarations describe an interface promise. A declaration does not
 establish numerical correctness, device execution, or performance for every
-model, mesh, prompt length, and batch size. Use the selected tt-metal model
-class and the corresponding model guide to determine model-specific support.
+model, mesh, prompt length, and batch size. Use the selected model class and
+the corresponding model guide to determine model-specific support.
 See [README.md](../README.md) for launch instructions and
 [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md) for speculative execution,
 request restrictions, and lifecycle requirements.
