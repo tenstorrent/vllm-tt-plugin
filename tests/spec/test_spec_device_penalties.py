@@ -75,7 +75,9 @@ def _sampling_runner(capabilities, has_penalties=True, num_speculative_tokens=3)
             no_allowed_token_ids=True,
             max_num_logprobs=None,
             sampling=SimpleNamespace(
-                bad_words_token_ids={}, has_active_logitsprocs=lambda: False
+                bad_words_token_ids={},
+                logprob_token_ids={},
+                has_active_logitsprocs=lambda: False,
             ),
         ),
     )
