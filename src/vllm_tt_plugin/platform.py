@@ -22,7 +22,9 @@ from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_decode_interleave_config,
     get_tt_max_batch_size,
+    get_tt_max_concurrent_partial_prefills,
     get_tt_output_tokens_per_step,
+    get_tt_prefill_chunk_cap_table,
     get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
     get_tt_supports_multimodal_prefill_resume,
@@ -256,6 +258,36 @@ def _validate_and_log_decode_interleave_policy(vllm_config: "VllmConfig") -> Non
         prefill_steps,
         decode_steps,
     )
+
+
+def _validate_long_prompt_scheduling(vllm_config: "VllmConfig") -> None:
+    """Refuse a long-prompt scheduling key on a launch without chunked prefill.
+
+    ``max_concurrent_partial_prefills`` limits partial prefills and
+    ``prefill_chunk_cap_table`` splits prompts into chunks, so both need the
+    chunked prefill that ``_apply_chunked_prefill_policy`` keeps only for a
+    model that declares ``supports_chunked_prefill``. Reading the keys here
+    also rejects a malformed value before the model loads; ``TTScheduler``
+    logs the active rules and checks the caps against the chunk alignment.
+    """
+    keys = [
+        name
+        for name, value in (
+            (
+                "max_concurrent_partial_prefills",
+                get_tt_max_concurrent_partial_prefills(vllm_config),
+            ),
+            ("prefill_chunk_cap_table", get_tt_prefill_chunk_cap_table(vllm_config)),
+        )
+        if value
+    ]
+    if keys and not vllm_config.scheduler_config.enable_chunked_prefill:
+        raise ValueError(
+            f"additional_config['tt'] keys {keys} need chunked prefill, which is "
+            "off for this launch. Enable chunked prefill for a model that "
+            "declares model_capabilities['supports_chunked_prefill'], or remove "
+            "the keys."
+        )
 
 
 def _apply_chunked_prefill_policy(
@@ -2227,6 +2259,7 @@ class TTPlatform(Platform):
         # ``verify_max_model_len`` reads the fields it touches.
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
         _validate_and_log_decode_interleave_policy(vllm_config)
+        _validate_long_prompt_scheduling(vllm_config)
         validate_and_store_tt_supports_prefill_resume_inside_kv_block(
             vllm_config, model_capabilities, model_class
         )

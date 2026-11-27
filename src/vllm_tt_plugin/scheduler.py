@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import bisect
 import inspect
+import math
 import sys
 import weakref
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from enum import Enum
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
@@ -22,8 +24,10 @@ from vllm_tt_plugin.config import (
     get_tt_adaptive_block_max_prompt_tokens,
     get_tt_block_kv_extent_tokens,
     get_tt_decode_interleave_config,
+    get_tt_max_concurrent_partial_prefills,
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
+    get_tt_prefill_chunk_cap_table,
     get_tt_prefill_over_pending_spec,
     get_tt_spec_plan,
     get_tt_supports_multimodal_prefill_resume,
@@ -34,6 +38,11 @@ from vllm_tt_plugin.config import (
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.mamba_state import mamba_attention_block_size
+from vllm_tt_plugin.partial_prefill_limit import (
+    SHORT_FIRST_MAX_STEPS,
+    HeldPrefills,
+    PartialPrefillLimit,
+)
 from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD
 from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
 
@@ -342,6 +351,31 @@ def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
         )
 
 
+def _validate_prefill_chunk_cap_table(
+    table: Sequence[tuple[int, int]], align: int, kv_block: int
+) -> None:
+    """Reject a ``prefill_chunk_cap_table`` cap that a capped chunk cannot end on.
+
+    ``TTScheduler._cap_prefill_chunk`` cuts a chunk to ``start + cap``, and
+    ``_align_prefill_chunk_end`` then rounds the end of a partial chunk down to
+    the alignment grid, so a cap must be a multiple of ``align`` (when it is
+    above 1) for a capped chunk to keep its whole cap. vLLM's
+    ``_mamba_block_aligned_split``, which runs before the cap for
+    ``MambaSpec`` groups in mode ``align``, ends every partial chunk on a KV
+    block boundary, where the GDN state is written; ``kv_block`` is that block
+    size then, and 1 otherwise. A cap must keep that boundary too.
+    """
+    unit = math.lcm(max(align, 1), kv_block)
+    for start, cap in table:
+        if cap % unit:
+            raise ValueError(
+                f"additional_config['tt']['prefill_chunk_cap_table'] entry "
+                f"[{start}, {cap}]: max_chunk_tokens must be a multiple of "
+                f"{unit} (prefill_chunk_alignment={align}, KV block size of the "
+                f"Mamba block-aligned split={kv_block})"
+            )
+
+
 def _require_kv_for_every_sequence(vllm_config, kv_cache_config) -> None:
     """Refuse a KV pool that could make vLLM preempt a stage-output request.
 
@@ -532,6 +566,13 @@ class TTScheduler(AsyncScheduler):
             )
         self._take_published_prefix_hit_confirmer()
         self._forced_mode = TTSchedulingMode.DEFAULT
+        # Running decodes _schedule_prefill_only removes from ``running`` for
+        # its base pass, and 0 outside it; see get_request_counts.
+        self._num_hidden_decodes = 0
+        # Requests _schedule_prefill_only holds back for
+        # max_concurrent_partial_prefills during its base pass, and none
+        # outside it; see get_request_counts.
+        self._held_prefills = HeldPrefills()
         # Read only in DEFAULT mode. A lane coordinator sets a forced mode
         # before every one of its lanes' schedule() calls and owns the one
         # policy instance for the whole step, so this one stays dormant there.
@@ -598,6 +639,32 @@ class TTScheduler(AsyncScheduler):
             logger.info(
                 "TT scheduler: partial prefill chunks end on %d-token boundaries",
                 self._prefill_chunk_alignment,
+            )
+        # Read here, not by the platform: the cap check needs the alignment,
+        # which for a model with MambaSpec groups depends on the KV cache groups.
+        self._prefill_chunk_cap_table = get_tt_prefill_chunk_cap_table(self.vllm_config)
+        if self._prefill_chunk_cap_table:
+            _validate_prefill_chunk_cap_table(
+                self._prefill_chunk_cap_table,
+                self._prefill_chunk_alignment,
+                int(self.cache_config.block_size)
+                if getattr(self, "_base_need_mamba_split", False)
+                else 1,
+            )
+            logger.info(
+                "TT scheduler: a text prefill chunk starting at depth "
+                "[start_tokens] holds at most [max_chunk_tokens] tokens: %s",
+                [list(pair) for pair in self._prefill_chunk_cap_table],
+            )
+        limit = get_tt_max_concurrent_partial_prefills(self.vllm_config)
+        self._partial_prefill_limit = PartialPrefillLimit(limit) if limit else None
+        if limit:
+            logger.info(
+                "TT scheduler: at most %d prefill(s) that need more than one "
+                "chunk advance per prefill step, oldest first; waiting "
+                "single-chunk prompts go ahead of them for at most %d steps",
+                limit,
+                SHORT_FIRST_MAX_STEPS,
             )
         # vLLM sets mamba_partial_cache_hit for MambaSpec groups in mode align
         # with a prefix_match_unit below the block size. It then makes
@@ -1074,14 +1141,16 @@ class TTScheduler(AsyncScheduler):
 
     # vLLM runs ``_mamba_block_aligned_split`` on every prefill chunk when
     # ``need_mamba_block_aligned_split`` is set; the TT scheduler reuses that
-    # hook so chunk ends can be aligned, and the first chunk of a multimodal
-    # request sized (_multimodal_prefill_grant), before any block is allocated.
+    # hook so chunks can be capped by depth and their ends aligned, and the
+    # first chunk of a multimodal request sized (_multimodal_prefill_grant),
+    # before any block is allocated.
     @property
     def need_mamba_block_aligned_split(self) -> bool:
         return (
             bool(getattr(self, "_base_need_mamba_split", False))
             or getattr(self, "_prefill_chunk_alignment", 0) > 1
             or getattr(self, "_multimodal_prefill_block_size", 0) > 0
+            or bool(getattr(self, "_prefill_chunk_cap_table", ()))
         )
 
     @need_mamba_block_aligned_split.setter
@@ -1109,6 +1178,7 @@ class TTScheduler(AsyncScheduler):
                     num_new_local_computed_tokens,
                     num_external_computed_tokens,
                 )
+            num_new_tokens = self._cap_prefill_chunk(request, start, num_new_tokens)
             grant = self._align_prefill_chunk_end(request, start, num_new_tokens)
         if grant > 0:
             self._step_granted_tokens = getattr(self, "_step_granted_tokens", 0) + grant
@@ -1226,6 +1296,43 @@ class TTScheduler(AsyncScheduler):
         ):
             return [], 0, encoder_compute_budget, [], []
         return scheduled
+
+    def _cap_prefill_chunk(
+        self, request: Request, start: int, num_new_tokens: int
+    ) -> int:
+        """Cut a prefill chunk to the ``prefill_chunk_cap_table`` cap of its
+        start depth.
+
+        The cap is the ``max_chunk_tokens`` of the pair with the largest
+        ``start_tokens <= start``; no cap applies before the first pair. Unlike
+        vLLM's ``long_prefill_token_threshold``, it also holds for a request
+        that runs alone. Decode steps are left alone, and so are the chunks
+        that ``_align_prefill_chunk_end`` leaves alone as multimodal: every
+        chunk of a multimodal request of a model that declares
+        ``supports_multimodal_prefill_resume`` True. The multimodal part of a
+        prompt of a model that declares False never reaches here
+        (``_multimodal_prefill_grant``); its later text chunks are capped.
+        """
+        cap = self._prefill_chunk_cap_at(start)
+        if cap is None or num_new_tokens <= cap:
+            return num_new_tokens
+        # vLLM's own bound on the prefill, past the prompt for a request that
+        # replays its output after preemption.
+        if start >= max(request.num_prompt_tokens, request.num_tokens - 1):
+            return num_new_tokens
+        if not getattr(self, "_multimodal_prefill_block_size", 0) and (
+            getattr(request, "mm_features", None)
+            or getattr(request, "has_encoder_inputs", False)
+        ):
+            return num_new_tokens
+        return cap
+
+    def _prefill_chunk_cap_at(self, start: int) -> int | None:
+        """The ``prefill_chunk_cap_table`` cap of a chunk that starts at
+        ``start``, or None when no pair starts at or before it."""
+        table = getattr(self, "_prefill_chunk_cap_table", ())
+        index = bisect.bisect_right(table, start, key=lambda pair: pair[0])
+        return table[index - 1][1] if index else None
 
     def _align_prefill_chunk_end(
         self, request: Request, start: int, num_new_tokens: int
@@ -1502,26 +1609,146 @@ class TTScheduler(AsyncScheduler):
 
         Temporarily hides the running *decode* requests so the base scheduler's
         running loop only advances partial prefills, and its waiting loop
-        admits new ones.  Lowers both running caps by the hidden decodes so the
-        waiting loop respects the true capacity: the loop admits against
-        ``max_num_active_reqs``, and the end-of-step check asserts
-        ``max_num_running_reqs``.
+        admits new ones. With ``max_concurrent_partial_prefills`` set, it also
+        hides the partial prefills and waiting requests that
+        ``PartialPrefillLimit`` holds back for this step. The hidden requests
+        still hold their slots or still wait for this step, so the pass keeps
+        two counts true for them:
+
+        - Both running caps are lowered by the hidden decodes and hidden
+          partial prefills, so the waiting loop respects the true capacity:
+          the loop admits against ``max_num_active_reqs``, and the end-of-step
+          check asserts ``max_num_running_reqs``.
+        - ``_num_hidden_decodes`` and ``_held_prefills`` hold them, so
+          ``get_request_counts`` still reports them and the base pass keeps
+          ``long_prefill_token_threshold`` on a prompt they wait for.
+
+        Every hidden request is back in its queue, in its place, when this
+        returns, so a prefill kept in ``_deferred_prefill`` and
+        ``prefill_qualifies_behind_verify`` see only what the pass scheduled.
         """
         pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
+        held = self._select_held_prefills(partial_prefills)
+        waiting_order = list(self.waiting) if held.waiting else []
 
         saved_max = self.max_num_running_reqs
         saved_active = self.max_num_active_reqs
-        self.running = cast(list[Request], partial_prefills)
-        self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
-        self.max_num_active_reqs = max(0, saved_active - len(pure_decodes))
+        num_hidden_running = len(pure_decodes) + len(held.running)
+        self.running = [r for r in partial_prefills if r not in held.running]
+        if held.waiting:
+            self.waiting.remove_requests(held.waiting)
+        self.max_num_running_reqs = max(0, saved_max - num_hidden_running)
+        self.max_num_active_reqs = max(0, saved_active - num_hidden_running)
+        self._num_hidden_decodes = len(pure_decodes)
+        self._held_prefills = held
         try:
             result = super().schedule()
         finally:
+            self._restore_held_prefills(held, partial_prefills, waiting_order)
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
             self.max_num_active_reqs = saved_active
+            self._num_hidden_decodes = 0
+            self._held_prefills = HeldPrefills()
         return result
+
+    def _select_held_prefills(self, partial_prefills: list[Request]) -> HeldPrefills:
+        """The requests ``max_concurrent_partial_prefills`` holds back from this
+        prefill pass; none when the key is absent."""
+        limit = getattr(self, "_partial_prefill_limit", None)
+        if limit is None:
+            return HeldPrefills()
+        return limit.select(partial_prefills, list(self.waiting), self._is_multi_chunk)
+
+    def _restore_held_prefills(
+        self,
+        held: HeldPrefills,
+        partial_prefills: list[Request],
+        waiting_order: list[Request],
+    ) -> None:
+        """Put the requests a prefill pass held back in their places again.
+
+        A held partial prefill goes back to its place among the partial
+        prefills, ahead of the requests the pass admitted. A held waiting
+        request goes back to its place in ``waiting``: requests the pass put
+        into ``waiting`` (preempted ones) stay in front, and requests it
+        admitted stay out.
+        """
+        if held.running:
+            kept = {r.request_id for r in self.running}
+            known = {r.request_id for r in partial_prefills}
+            self.running = [
+                r for r in partial_prefills if r in held.running or r.request_id in kept
+            ] + [r for r in self.running if r.request_id not in known]
+        if held.waiting:
+            remaining = list(self.waiting)
+            present = {r.request_id for r in remaining}
+            known = {r.request_id for r in waiting_order}
+            order = [r for r in remaining if r.request_id not in known] + [
+                r for r in waiting_order if r in held.waiting or r.request_id in present
+            ]
+            self.waiting.remove_requests(remaining)
+            for request in order:
+                self.waiting.add_request(request)
+
+    def _is_multi_chunk(self, request: Request) -> bool:
+        """Whether the uncached remainder of ``request`` needs more than one
+        prefill chunk.
+
+        A request that has computed nothing yet starts where its prefix-cache
+        hit would end (``_estimated_cache_hit``).
+        """
+        start = request.num_computed_tokens or self._estimated_cache_hit(request)
+        return request.num_tokens - start > self._prefill_chunk_limit(request, start)
+
+    def _prefill_chunk_limit(self, request: Request, start: int) -> int:
+        """Most tokens one prefill step gives ``request`` from ``start``.
+
+        As ``Scheduler.schedule`` sizes a chunk: at most
+        ``max_num_scheduled_tokens``, and ``max_num_batched_tokens`` less the
+        draft slots; then a positive ``long_prefill_token_threshold`` (vLLM's
+        lift for a lone request and its adaptive floor are not modelled), and
+        the ``prefill_chunk_cap_table`` cap. The multimodal part of a prompt of
+        a model that declares ``supports_multimodal_prefill_resume`` False
+        takes a whole step instead (``_multimodal_prefill_grant``).
+        """
+        limit = min(
+            self.max_num_scheduled_tokens,
+            self.scheduler_config.max_num_batched_tokens - self._draft_slots(),
+        )
+        if getattr(self, "_multimodal_prefill_block_size", 0) and request.mm_features:
+            items_end = max(
+                f.mm_position.offset + f.mm_position.length for f in request.mm_features
+            )
+            if start < items_end:
+                return limit
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if 0 < threshold < limit:
+            limit = threshold
+        return self._cap_prefill_chunk(request, start, limit)
+
+    def _estimated_cache_hit(self, request: Request) -> int:
+        """Prompt tokens vLLM would take from the prefix cache if it admitted
+        ``request`` now.
+
+        Asks the KV cache coordinator's ``find_longest_cache_hit`` with the
+        bound ``get_computed_blocks`` uses (``num_tokens - 1``). For a hybrid
+        model the hit must hold in every KV cache group, so a full-attention
+        hit counts only up to a block boundary where each ``MambaSpec`` group
+        also has a cached GDN state block. The lookup only reads the block
+        pool: unlike ``get_computed_blocks``, it records no prefix-cache
+        statistics and emits no KV cache events. A model's
+        ``confirm_prefix_cache_hit`` and a KV connector's external tokens are
+        not asked, so for such a launch the hit vLLM schedules can differ.
+        """
+        manager = self.kv_cache_manager
+        if not manager.prefix_cache_lookup_enabled(request):
+            return 0
+        _, hit, _ = manager.coordinator.find_longest_cache_hit(
+            request.block_hashes, request.num_tokens - 1
+        )
+        return hit
 
     def _schedule_decode_only(self) -> SchedulerOutput:
         """Schedule only running decode requests.
@@ -1939,6 +2166,44 @@ class TTScheduler(AsyncScheduler):
             elif not solo or first_id != owner:
                 owner = None
         self._spec_session_owner = owner
+
+    def get_request_counts(self) -> tuple[int, int]:
+        """Count the running and waiting requests, hidden ones included.
+
+        Returns
+        -------
+        tuple[int, int]
+            ``(num_running_reqs, num_waiting_reqs)`` as vLLM's
+            ``Scheduler.get_request_counts`` counts the queues, plus the
+            requests ``_schedule_prefill_only`` removes from them for its base
+            pass: in the running count the decodes and the held partial
+            prefills, in the waiting count the held waiting requests. Outside
+            that pass no request is hidden and the counts are vLLM's.
+
+        Notes
+        -----
+        vLLM's ``Scheduler.schedule`` applies ``long_prefill_token_threshold``
+        only when these counts add up to more than one request: the cap stops a
+        long prefill from starving the other requests, and a lone request has
+        none to starve. A TT step cannot mix prefill and decode rows, so every
+        decode hidden from a prefill pass waits for the whole step. Without
+        them, a long prompt that arrives beside running decodes, and the only
+        continuing partial prefill, count as one request and take the whole
+        token budget in one step. The same sum sets the fair share at which
+        ``long_prefill_token_threshold_adaptive`` floors the cap.
+
+        A request ``max_concurrent_partial_prefills`` holds back from the pass
+        waits for the whole step too.
+
+        ``TTLaneCoordinator`` lane routing and ``make_stats`` call this between
+        scheduling passes, when no request is hidden.
+        """
+        num_running, num_waiting = super().get_request_counts()
+        held = self._held_prefills
+        return (
+            num_running + self._num_hidden_decodes + len(held.running),
+            num_waiting + len(held.waiting),
+        )
 
     def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
         """None on a lane: TTLaneCoordinator.make_stats makes the step's one
