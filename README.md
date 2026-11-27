@@ -494,6 +494,13 @@ worst-case block allocation and for sliding-window groups on hybrid models.
 latter is what reaches the engine-side KV planner, which in standard DP runs in
 a different process from the worker that set the override.
 
+`--num-gpu-blocks-override N` replaces the derived count with exactly `N`
+blocks in every launch mode, for example to give a model less KV cache than its
+budget when several models share a device. Block-output models validate `N`
+like a derived count, and vLLM still rejects a pool that cannot hold one
+`max_model_len` request. TT does not check that a pool larger than the budget
+fits device memory; KV allocation fails at startup if it does not.
+
 That pool is the budget shared by *all* concurrent requests. It is set
 independently of `max_model_len`, the *per-request* context limit, except that
 eligible hybrid models raise it to admit one `max_model_len` request (see

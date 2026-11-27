@@ -806,7 +806,9 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     cannot hold an explicitly configured ``max_model_len`` plus one canvas) but
     never mutates the config; the ``--max-model-len -1`` fit, and the
     servability check on the length it writes, live in
-    ``_fit_block_output_max_model_len``.
+    ``_fit_block_output_max_model_len``. A set
+    ``cache_config.num_gpu_blocks_override`` is the result, validated the same
+    way.
 
     ``num_devices`` is the runtime-discovered physical device count.
     """
@@ -937,6 +939,20 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
                 output_reservation_blocks,
             )
             num_tt_blocks = admission_floor
+    # --num-gpu-blocks-override replaces the derived count, so a launch can
+    # give a model less (or more) KV cache than its budget. Applied here, not
+    # left to the engine: determine_available_memory publishes this count as
+    # the override, and with the uniproc executor the worker's cache_config is
+    # the engine's, so the operator's value would otherwise be overwritten.
+    override = cache_config.num_gpu_blocks_override
+    if override is not None:
+        logger.info(
+            "Using num_gpu_blocks_override=%d TT KV blocks instead of the %d "
+            "derived from the model's budget.",
+            override,
+            num_tt_blocks,
+        )
+        num_tt_blocks = override
     if is_tt_block_output_model(vllm_config):
         resolved_kv_tokens = num_tt_blocks * cache_config.block_size
         required_kv_tokens = model_config.max_model_len + output_tokens_per_step
@@ -952,8 +968,12 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
                 f"{resolved_kv_tokens} tokens, but max_model_len="
                 f"{model_config.max_model_len} plus output_tokens_per_step="
                 f"{output_tokens_per_step} requires at least "
-                f"{required_kv_tokens}. Fix the model's "
-                "get_max_tokens_all_users budget."
+                f"{required_kv_tokens}. "
+                + (
+                    "Raise --num-gpu-blocks-override."
+                    if override is not None
+                    else "Fix the model's get_max_tokens_all_users budget."
+                )
             )
 
     return num_tt_blocks
@@ -994,8 +1014,12 @@ def _fit_block_output_max_model_len(
             f"max_model_len={fitted_max_model_len} after reserving one "
             f"{output_tokens_per_step}-token output canvas, but serving a "
             f"request also needs a {_TT_TOKEN_TILE_SIZE}-token prompt tile, so "
-            f"max_model_len must be at least {min_max_model_len}. Raise the "
-            "model's get_max_tokens_all_users budget."
+            f"max_model_len must be at least {min_max_model_len}. "
+            + (
+                "Raise --num-gpu-blocks-override."
+                if vllm_config.cache_config.num_gpu_blocks_override is not None
+                else "Raise the model's get_max_tokens_all_users budget."
+            )
         )
     logger.info(
         "Auto-fitting block-output max_model_len from %d to %d so "
