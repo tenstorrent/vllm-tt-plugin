@@ -691,6 +691,45 @@ family and are unrelated to the above. `TT_LLAMA_TEXT_VER` and
 deprecated and will be removed in a future release: it still selects
 `ttt_compat` but logs a warning. Unset these variables instead.
 
+### Serving tt-transformers models (experimental)
+
+[tt-transformers](https://github.com/tenstorrent/tt-transformers) is a
+standalone package of TT model implementations. The built-in map does not
+register it. Select its class for an architecture with
+`TT_MODEL_CLASS_OVERRIDES`:
+
+```bash
+export TT_MODEL_CLASS_OVERRIDES="TTLlamaForCausalLM=tt_transformers.vllm_registry:LlamaForCausalLM"
+```
+
+Each entry has the form `TT<Arch>=tt_transformers.vllm_registry:<Arch>`, for an
+architecture that `tt_transformers.vllm_registry` exports. The class selects its
+generator by the `--model` Hugging Face id, given directly or as a Hugging Face
+cache snapshot of it; it ignores the snapshot's revision.
+
+Every tt-transformers model is experimental, and its
+[support matrix](https://github.com/tenstorrent/tt-transformers/blob/main/SUPPORT.md)
+does not qualify vLLM serving. Before launching:
+
+- Use a tt-transformers environment, not the tt-metal one: the package pins
+  exact `ttnn`, `torch`, and `transformers` versions. Create it with the
+  [tt-transformers install guide](https://github.com/tenstorrent/tt-transformers#install),
+  then run `source docs/install-vllm-tt.sh` from this repository. The script
+  replaces the `transformers` pin with the range vLLM requires; tt-transformers
+  does not qualify that combination.
+- Serve only the checkpoints, pinned revisions, and device geometries that the
+  support matrix lists, and pass the pinned revision with `--revision`. An
+  unlisted checkpoint fails with `UnsupportedModelError` after the device mesh
+  opens. Neither the plugin nor tt-transformers checks the revision or the
+  geometry.
+
+The plugin applies the selected class's `model_capabilities` as for any model;
+see [Model capabilities](docs/MODEL_CAPABILITIES.md). A launch option that the
+class does not declare is rejected or turned off at startup: for example,
+`--speculative-config` without `supports_spec_decode` fails. A request that
+needs an undeclared device-sampling feature, such as structured output without
+`supports_device_grammar`, is sampled on the host.
+
 ## Speculative Decoding
 
 The plugin supports speculative decoding through a runner-model contract.
