@@ -687,6 +687,7 @@ class _AsyncHarness:
         prefill_over_pending: bool = False,
         device_logprobs: bool = False,
         token_masks: bool = False,
+        device_top_p: bool = False,
     ):
         cfg = _vllm_config(mode)
         cfg.model_config.max_model_len = MAX_MODEL_LEN
@@ -747,6 +748,8 @@ class _AsyncHarness:
         if token_masks:
             # A model drawing its verifies under the plugin's token mask.
             self.device.model_capabilities["supports_spec_device_mask"] = True
+        if device_top_p:
+            self.device.model_capabilities["supports_spec_device_top_p"] = True
         if prefill_over_pending:
             # As TTPlatform stores the validated declaration for the scheduler.
             self.device.model_capabilities["supports_prefill_over_pending_spec"] = True
@@ -2022,3 +2025,131 @@ def test_a_token_masked_verify_carries_penalised_rows_and_not_a_penalised_logpro
         "a deferred verify lacked a penalised row's prompt"
     )
     assert device.masked_verifies >= len(masked)
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_a_top_p_row_with_top_k_off_stays_on_device_verifies_that_never_chain(
+    declared,
+):
+    """On a device declaring ``supports_spec_device_top_p`` a sampled request
+    with top-k off and top_p 0.9 is certifiable on a device-sampled step: its
+    steps are device-sampled verifies (its ids are draws), although its top-k
+    exceeds ``max_device_top_k``. The device may draw its rows again when the
+    verify is read, so no step chains on such a verify (reason ``top_p``), no
+    prefill runs behind it, and an ordinary decode carrying it samples on the
+    host. Without the declaration it samples on the host: no verify, no draw."""
+    h = _AsyncHarness(
+        SAMPLED_BLOCKS,
+        mode="align",
+        asynchronous=True,
+        chained=True,
+        sampled_ids=True,
+        prefill_over_pending=True,
+        device_top_p=declared,
+    )
+    h.add("g0", 1019, max_tokens=40)
+    h.add("t0", 1022, max_tokens=40, temperature=0.9, top_p=0.9, seed=3)
+    device = h.device
+    verify, narrow, prefill = device._verify, device._narrow, device.prefill_forward
+    verified: list[tuple[bool, bool]] = []
+    narrow_sampling: list[bool] = []
+    behind: list[list[str]] = []
+
+    def record_verify(live, tokens, start_pos, mamba_state, kwargs):
+        if "t0" in live:
+            verified.append(("spec_predecessor" in kwargs, "sampling_params" in kwargs))
+        return verify(live, tokens, start_pos, mamba_state, kwargs)
+
+    def record_narrow(live, tokens, start_pos, mamba_state, sampling=None):
+        if "t0" in live:
+            narrow_sampling.append(sampling is not None)
+        return narrow(live, tokens, start_pos, mamba_state, sampling)
+
+    def record_prefill(*args, **kwargs):
+        for step in h.runner._pending_async_steps:
+            unread = isinstance(getattr(step, "verify_output", None), VerifyOutput)
+            if unread and not step.is_resolved():
+                behind.append(list(step.model_input.row_req_ids))
+        return prefill(*args, **kwargs)
+
+    device._verify, device._narrow = record_verify, record_narrow
+    device.prefill_forward = record_prefill
+    update, updates = h._update, []
+
+    def arrive(scheduler_output, output):
+        update(scheduler_output, output)
+        updates.append(scheduler_output)
+        if len(updates) in (10, 20):
+            h.add(f"j{len(updates)}", 700, max_tokens=6)
+
+    h._update = arrive
+    h.run()
+
+    assert len(h.outputs["t0"]) == 40
+    assert not any(sampling for sampling in narrow_sampling)
+    if not declared:
+        assert not verified
+        return
+    assert len(verified) > 5 and all(sampled for _, sampled in verified)
+    assert not any(chained for chained, _ in verified)
+    assert h.runner.async_decode._chain_drains["top_p"] > 0
+    assert not any("t0" in rows for rows in behind)
+
+
+def test_top_p_rows_with_a_mask_or_a_penalty_verify_on_the_device_and_never_chain(
+    monkeypatch,
+):
+    """A row with top-k off and top_p 0.9 that also carries an allowlist, and
+    one that carries a presence penalty, on a model declaring
+    ``supports_spec_device_top_p`` with ``supports_spec_device_mask`` and
+    ``supports_spec_device_penalties``: their steps are device-sampled
+    verifies, token-masked where the allowlist asks for it, and no step chains
+    on a verify holding them (reason ``top_p``). The allowlisted row's tokens
+    stay allowlisted."""
+    monkeypatch.setitem(globals(), "_prompt", _vocab_prompt)
+    h = _AsyncHarness(
+        SAMPLED_BLOCKS,
+        mode="align",
+        asynchronous=True,
+        chained=True,
+        sampled_ids=True,
+        token_masks=True,
+        device_top_p=True,
+    )
+    h.device.model_capabilities["supports_spec_device_penalties"] = True
+    h.add("g0", 1019, max_tokens=32)
+    h.add(
+        "tm",
+        1100,
+        max_tokens=32,
+        temperature=0.9,
+        top_p=0.9,
+        seed=5,
+        allowed_token_ids=list(ALLOWED),
+    )
+    h.add("tp", 900, max_tokens=32, temperature=0.9, top_p=0.9, presence_penalty=0.5)
+    device = h.device
+    verify = device._verify
+    verified: list[tuple[list[str], bool, bool, bool]] = []
+
+    def record_verify(live, tokens, start_pos, mamba_state, kwargs):
+        verified.append(
+            (
+                list(live),
+                "spec_predecessor" in kwargs,
+                kwargs.get("sampling_params") is not None,
+                device.mask is not None,
+            )
+        )
+        return verify(live, tokens, start_pos, mamba_state, kwargs)
+
+    device._verify = record_verify
+    h.run()
+
+    holding = [v for v in verified if {"tm", "tp"} & set(v[0])]
+    assert len(holding) > 5 and all(sampled for _, _, sampled, _ in holding)
+    assert any(masked for rows, _, _, masked in holding if "tm" in rows)
+    assert not any(chained for _, chained, _, _ in holding)
+    assert h.runner.async_decode._chain_drains["top_p"] > 0
+    assert set(h.outputs["tm"]) <= set(ALLOWED) and len(h.outputs["tm"]) == 32
+    assert len(h.outputs["tp"]) == 32

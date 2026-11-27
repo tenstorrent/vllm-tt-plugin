@@ -346,6 +346,26 @@ def spec_verify_num_logprobs(model_input: TTModelInput) -> torch.Tensor | None:
     return counts if bool((counts >= 0).any()) else None
 
 
+def spec_verify_holds_top_p_rows(model_input: TTModelInput, vocab_size: int) -> bool:
+    """Whether a device-sampled ``argmax_ids`` verify carries a live row with
+    top-k off and ``top_p`` below 1, which a model declaring
+    ``supports_spec_device_top_p`` may draw again when its verify is read.
+
+    ``tt_sampling_params`` stores a top-k that is off as ``vocab_size``.
+    """
+    if model_input.spec_mode != ACCEPT_MODE_ARGMAX_IDS or not (
+        model_input.perform_device_sampling
+    ):
+        return False
+    params = model_input.tt_sampling_params
+    live = live_row_index(model_input)
+    temperature = torch.as_tensor(params.temperature).reshape(-1)[live]
+    top_k = torch.as_tensor(params.top_k).reshape(-1)[live]
+    top_p = torch.as_tensor(params.top_p).reshape(-1)[live]
+    rows = (temperature > 0) & ((top_k < 1) | (top_k >= vocab_size)) & (top_p < 1)
+    return bool(rows.any())
+
+
 def penalty_history(output_tokens: torch.Tensor) -> list[list[int]]:
     """Each row's committed output, with TT's -1 padding removed."""
     return [[token for token in row.tolist() if token != -1] for row in output_tokens]

@@ -35,6 +35,11 @@ that also declares ``supports_spec_device_penalties`` a penalised row chains
 the same way; the model adds step n's commit to the row's penalty history. Either way
 the runner's walk of step n's ids gives the count the device used, and the
 model raises from that propose when the runner's commit differs from its own.
+
+A verify holding a row with top-k off and ``top_p`` below 1 on a model
+declaring ``supports_spec_device_top_p`` may have rows drawn again from its
+device logits when it is read, so no step chains on it (reason ``top_p``) and
+no prefill runs behind it.
 """
 
 from __future__ import annotations
@@ -44,6 +49,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm_tt_plugin.model_input import spec_verify_holds_top_p_rows
 from vllm_tt_plugin.scheduler import (
     get_tt_forced_reset_discard_counts,
     prefill_qualifies_behind_verify,
@@ -52,6 +58,7 @@ from vllm_tt_plugin.scheduler import (
 from vllm_tt_plugin.spec_admission import (
     SUPPORTS_CHAINED_SPEC_VERIFY,
     SUPPORTS_PREFILL_OVER_PENDING_SPEC,
+    SUPPORTS_SPEC_DEVICE_TOP_P,
 )
 from vllm_tt_plugin.spec_decode import ACCEPT_MODE_ARGMAX_IDS, PLACEHOLDER_TOKEN_ID
 from vllm_tt_plugin.spec_token_mask import chains_token_masks
@@ -106,6 +113,8 @@ def plan_chain(
     previous = predecessor.model_input
     if previous.spec_mode != ACCEPT_MODE_ARGMAX_IDS or previous.live_rows is not None:
         return None, "mode"
+    if _redraws_on_read(capabilities, previous, runner):
+        return None, "top_p"
     if (
         scheduler_output.scheduled_new_reqs
         or scheduler_output.scheduled_cached_reqs.resumed_req_ids
@@ -217,7 +226,20 @@ def prefill_over_pending(runner: Any, scheduler_output: SchedulerOutput) -> bool
         and verify.model_input.spec_mode == ACCEPT_MODE_ARGMAX_IDS
         and verify.model_input.live_rows is None
         and verify.verify_output is not None
+        and not _redraws_on_read(capabilities, verify.model_input, runner)
     )
+
+
+def _redraws_on_read(
+    capabilities: dict[str, Any], model_input: TTModelInput, runner: Any
+) -> bool:
+    """Whether the model may draw rows of this unread verify again when it is
+    read (``supports_spec_device_top_p``: a row with top-k off and ``top_p``
+    below 1 whose nucleus reaches past the device's candidates), from device
+    logits that a chained verify or a prefill behind it would overwrite."""
+    return capabilities.get(
+        SUPPORTS_SPEC_DEVICE_TOP_P, False
+    ) is True and spec_verify_holds_top_p_rows(model_input, int(runner.vocab_size))
 
 
 def _samples_on_device(
